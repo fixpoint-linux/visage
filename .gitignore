@@ -1,0 +1,7 @@
+*.com
+*.com.dbg
+*.aarch64.elf
+.ape-1.10
+var/
+*.o
+__pycache__/

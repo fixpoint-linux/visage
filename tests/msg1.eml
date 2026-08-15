@@ -1,0 +1,12 @@
+From: sender@foo.org
+To: jane@example.com
+Subject: Visage e2e test
+
+Hello Jane,
+
+This is a sample RFC5322 message body used by the visage S8 e2e
+integration harness. It has a few lines of text so that we can
+assert that the forwarded body arrives verbatim at the fake relay.
+
+Regards,
+The Test Suite
