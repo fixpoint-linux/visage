@@ -6,21 +6,35 @@ SMTP in C, CLI + minimal HTTP admin, single cosmocc APE.
 
 Legend: **P** = privacy/security, **R** = reliability, **F** = feature/interop, **A** = architecture.
 
+> Status (2026-08-16): the two original "## Next up" items (durable outbound
+> retry queue + STARTTLS relay) are **DONE** (commit 5963187). Their
+> remaining follow-ups (`starttls-verify`) are listed below.
+
 ---
 
 ## Next up
 
-- **[R] Durable outbound retry queue.** The relay client retries in-memory only;
-  a crash during a 4xx/relay outage loses the message. Queue spooled
-  messages to disk (the `log`/spool layer already writes `<msgid>.eml`) and
-  re-drive them on restart with bounded retries + backoff.
-- **[P] STARTTLS on the outbound relay.** `relay.tls` is currently
-  `"none"`-only; `tls != "none"` returns a hard "tls not supported" error.
-  Implement STARTTLS (opportunistic) so the relay leg isn't plaintext when
-  the relay supports it. Requires a TLS client in the cosmocc build.
+- ~~**[R] Durable outbound retry queue.**~~ **DONE (2026-08-16, commit 5963187).**
+  At-least-once durable queue: sanitize-once + spool `<msgid>.<k>.out.eml`
+  (fsync) before `store_queue_add`; re-drive at startup + in-loop poll
+  deadline; backoff 1s..1h, `relay.max_attempts`; crash-safe add-first
+  transitions (no loss window); `250 OK: queued` on durable accept, `451`
+  on enqueue failure. Host e2e covers outage→re-drive + restart persistence.
+- ~~**[P] STARTTLS on the outbound relay.**~~ **DONE (2026-08-16, commit 5963187).**
+  Vendored mbedTLS 3.6.7 (`vendor/mbedtls`, custom
+  `src/mbedtls_visage_config.h`, TLS1.2 subset); `relay.tls` in
+  `{none, starttls}`; opportunistic `VERIFY_NONE` + SNI; never sends AUTH
+  over plaintext (D2 rule); `tests/tls_selfcheck.com` in-sandbox gate.
+  Follow-up: `starttls-verify` (real CA verification) = S-B4 below.
 
 ## Security / correctness hardening
 
+- **[P] `starttls-verify` (real relay cert verification).** `starttls` is
+  currently opportunistic `VERIFY_NONE` (protects against passive snooping
+  only; an active MITM can strip STARTTLS or impersonate the relay). Add a
+  `relay.tls = "starttls-verify"` mode with `VERIFY_REQUIRED` + chain +
+  hostname check + a CA bundle (embed Mozilla list vs `relay.tls_ca` file
+  path — separate decision), plus a real-CA e2e.
 - **[F] Validate the MAIL FROM reverse-path as an addr-spec** (currently only
   `path_clean`'d). An embedded `"` breaks out of the quoted display-name into a
   malformed `From:`. No CR/LF injection today, but reject `"` `<` `>` (or run
