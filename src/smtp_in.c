@@ -1163,6 +1163,16 @@ static void process_commands(Server *srv, Conn *c, time_t now) {
             }
             return;
         }
+        /* Hard-enforce the cap on newline-terminated lines too: a command
+         * line can otherwise grow past SMTP_MAX_LINE if its \n arrives in a
+         * later recv() chunk (the no-newline branch above only fires when the
+         * buffer holds no terminator yet).  i is the index of the '\n', so
+         * i bytes precede it. */
+        if (i > (size_t)srv->max_line) {
+            conn_reply(c, "500 5.5.2 Line too long\r\n");
+            c->closed = true;
+            return;
+        }
         linelen = i;
         if (linelen > 0 && c->in[linelen - 1] == '\r') linelen--;
         c->in[linelen] = '\0';
