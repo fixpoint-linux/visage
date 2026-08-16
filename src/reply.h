@@ -1,6 +1,6 @@
 /* reply.h — reverse-alias reply routing (slice S6).
  *
- * SimpleLogin-style reverse aliases: when an inbound message is forwarded
+ * Reverse aliases: when an inbound message is forwarded
  * through an alias, the forwarder mints a token and writes a "reverse alias"
  * (reply+<token>@domain) into the rewritten From/Reply-To.  When the alias
  * owner replies, the reply lands back at that reverse alias, and this module

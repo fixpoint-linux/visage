@@ -1,10 +1,10 @@
 # visage
 
-A **SimpleLogin-style email alias & forwarding service** written in C11 — give out disposable
-`alias@domain` addresses that forward to your real inbox, and reply through them too. Configured in
-[typechecked Dhall](https://dhall-lang.org/), compiled with [cosmocc](https://github.com/jart/cosmopolitan)
-into a single portable APE binary. The same core also builds to **WebAssembly** and runs fully
-client-side in your browser.
+A **compact email alias & forwarding server** written in C11 — give out disposable
+`alias@domain` addresses that forward to your real inbox, and reply through them too. The whole
+service — daemon *and* alias store — fits in a single small, portable [APE](https://github.com/jart/cosmopolitan)
+binary, configured in [typechecked Dhall](https://dhall-lang.org/). The same C core also builds to
+**WebAssembly** and runs fully client-side in your browser.
 
 > ▶ **Try it live — https://jmars.github.io/visage/** (edit a Dhall config and resolve aliases in the
 > browser, powered by the real C pipeline compiled to wasm)
@@ -12,17 +12,46 @@ client-side in your browser.
 ## What it is
 
 A single self-contained SMTP daemon that accepts mail for the domains it serves, resolves each
-recipient against an alias store, and forwards accepted mail to your mailbox provider. You never give
-out your real address — only disposable aliases, and replies are routed back through a
+recipient against a **DAFSA alias store**, and forwards accepted mail to your mailbox provider. You
+never give out your real address — only disposable aliases, and replies are routed back through a
 `reply+<token>@yourdomain` reverse alias.
+
+## Compact by design
+
+Two things stay small as you grow.
+
+**The server.** One C codebase → one `visage.com` APE binary (≈2.6&nbsp;MB) that runs on many OSes
+with no VM, runtime, or database process. No framework, no interpreter for the hot path — just the
+mail router and its store.
+
+**The data store.** Aliases live in a [datalog-dafsa](https://github.com/jmars/datalog-dafsa) store
+built on a *minimal acyclic DAFSA* — a graph that shares common prefixes **and** suffixes across every
+key, so the store stays tiny even as you add thousands of aliases. Strings are interned to 32-bit
+symbol ids; each relation is one on-disk DAFSA that is mmap'd for read-only serving and durably
+WAL'd (single-writer, `flock`).
+
+## Prefix search, not indexes
+
+Email routing needs exactly two lookups, and both are native DAFSA primitives — so visage carries
+**no separate index**, and lookup cost scales with the address length, not the alias count:
+
+- Every fact is one fixed-width big-endian key; *bind the leading columns to constants and enumerate
+  the rest* is exactly a byte-prefix walk on the DAFSA.
+- **Forward routing** — resolving `alias@domain` → its destinations is a prefix walk binding the
+  `(domain, local)` columns of the `alias` relation.
+- **Reverse reply routing** — `reply+<token>@domain` → (original sender, alias) is a prefix walk
+  binding the `token` column of the `revmap` relation.
+
+Prefix enumeration is the DAFSA's second-strongest primitive (after exact-key lookup), so alias
+resolution and reply-token routing are O(prefix length) regardless of how many aliases exist.
 
 ## Stack
 
 | Piece | Role |
 | --- | --- |
-| [cosmocc](https://github.com/jart/cosmopolitan) | one `visage.com` APE binary, many OSes |
+| [cosmocc](https://github.com/jart/cosmopolitan) | one small `visage.com` APE binary, many OSes |
 | [dhall-c](https://github.com/jmars/dhall-c) | **typechecked** Dhall config, evaluated at startup |
-| [datalog-dafsa](https://github.com/jmars/datalog-dafsa) | persistent, fast-lookup DAFSA alias store (WAL/flock) |
+| [datalog-dafsa](https://github.com/jmars/datalog-dafsa) | compact minimal-DAFSA store: prefix-search lookups, WAL/flock + mmap reads |
 | SMTP-in-C (`src/smtp_in.c`, `src/smtp_out.c`) | RFC 5321 state machine, receiver + relay |
 | STARTTLS / STARTTLS-verify (`vendor/mbedtls`) | relay to your mailbox provider, optionally cert-verified |
 | DKIM (`src/dkim.c`) | sign outbound mail from C |

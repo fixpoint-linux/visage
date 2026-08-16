@@ -1,4 +1,4 @@
-/* visage.h — shared project header for the visage SimpleLogin-clone.
+/* visage.h — shared project header for the visage email alias & forwarding daemon.
    Common types, limits, and error codes for every translation unit.
    Module-specific structs/functions live in their own headers (or here,
    added by the slice implementers); keep this header lean. */

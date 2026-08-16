@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>visage — a SimpleLogin-style email alias &amp; forwarding service in C, configured by Dhall</title>
-  <meta name="description" content="visage is a small, self-contained SMTP email alias/forwarding service — a SimpleLogin-style reverse-alias mail gateway — configured in typechecked Dhall and compiled with cosmocc into a single portable APE binary. One C source, two targets: a native APE binary and a WebAssembly build that runs 100% in your browser.">
+  <title>visage — a compact email alias &amp; forwarding server in C, with a DAFSA store</title>
+  <meta name="description" content="visage is a compact, self-contained SMTP email alias/forwarding server — daemon and DAFSA alias store in one small APE binary. Forward and reply-token routing run on datalog-dafsa's prefix search, so lookups scale with address length, not alias count. One C source, two targets: a native APE binary and a WebAssembly build that runs 100% in your browser.">
   <meta name="theme-color" content="#0a0f0d">
-  <meta property="og:title" content="visage — a SimpleLogin-style email alias &amp; forwarding service in C, configured by Dhall">
+  <meta property="og:title" content="visage — a compact email alias &amp; forwarding server in C, with a DAFSA store">
   <meta property="og:description" content="An SMTP email alias/forward service — typechecked Dhall config, SMTP-in-C state machine, STARTTLS/STARTTLS-verify relay + DKIM signing, durable outbound retry queue. One C source to a native APE binary and a browser wasm build.">
   <meta property="og:type" content="website">
   <link rel="stylesheet" href="style.css">
@@ -25,6 +25,7 @@
         <a href="#targets">Two targets</a>
         <a href="#demo">Live demo</a>
         <a href="#features">Features</a>
+        <a href="#compact">Small &amp; fast</a>
         <a href="#how">How it works</a>
         <a href="#quickstart">Build</a>
       </nav>
@@ -36,11 +37,13 @@
       <p class="eyebrow">email alias/forward · C11 · Dhall · cosmocc</p>
       <h1>Email aliases that<br>hide your <span class="grad">real address</span>.</h1>
       <p class="lead">
-        A small, self-contained <strong>SimpleLogin-style email alias &amp; forwarding service</strong>.
-        Give out disposable <strong>alias@domain</strong> addresses that forward to your real inbox — and
-        reply through them too. Describe every alias in <strong>typechecked Dhall</strong>; the
-        <strong>same C source</strong> ships two ways: a single portable <strong>APE binary</strong> and a
-        <strong>WebAssembly</strong> build that runs right here in your browser.
+        A compact, self-contained <strong>email alias &amp; forwarding server</strong> — daemon and DAFSA
+        store in one small binary. Give out disposable <strong>alias@domain</strong> addresses that forward to
+        your real inbox — and reply through them too. Alias and reply-token routing run on
+        <strong>datalog-dafsa's prefix search</strong>, so lookups scale with address length, not alias count.
+        Describe every alias in <strong>typechecked Dhall</strong>; the <strong>same C source</strong> ships two
+        ways: a single portable <strong>APE binary</strong> and a <strong>WebAssembly</strong> build that runs right
+        here in your browser.
       </p>
       <div class="hero-cta">
         <a class="btn btn-primary" href="#demo">
@@ -197,7 +200,7 @@ $ node tests/wasm-smoke.js</code></pre></div>
     <div class="wrap">
       <p class="eyebrow">What it does</p>
       <h2>Email aliasing, done in C</h2>
-      <p class="sub">A SimpleLogin-style service — disposable aliases, real forwarding, no lock-in.</p>
+      <p class="sub">Disposable aliases, real forwarding, no lock-in — in a compact single-binary daemon.</p>
       <div class="grid">
         <div class="card">
           <span class="icon" aria-hidden="true">λ</span>
@@ -211,8 +214,8 @@ $ node tests/wasm-smoke.js</code></pre></div>
         </div>
         <div class="card">
           <span class="icon" aria-hidden="true">▤</span>
-          <h3>datalog-dafsa storage</h3>
-          <p>Aliases live in a <strong>datalog-dafsa</strong> store: a persistent, fast-lookup DAFSA index seeded from the config, with WAL/flock durability.</p>
+          <h3>Compact DAFSA store</h3>
+          <p>Aliases live in a <strong>datalog-dafsa</strong> store: a minimal DAFSA sharing prefixes &amp; suffixes across every key, so it stays tiny. Lookups are byte-prefix walks — WAL/flock durable.</p>
         </div>
         <div class="card">
           <span class="icon" aria-hidden="true">⟳</span>
@@ -228,6 +231,35 @@ $ node tests/wasm-smoke.js</code></pre></div>
           <span class="icon" aria-hidden="true">↩</span>
           <h3>Reverse-alias reply routing</h3>
           <p>Reply to forwarded mail through a <code>reply+&lt;token&gt;@yourdomain</code> reverse alias, so your real address stays hidden.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section alt reveal" id="compact">
+    <div class="wrap">
+      <p class="eyebrow">Small footprint · prefix-fast lookups</p>
+      <h2>Compact server, compact store</h2>
+      <p class="sub">
+        The whole service is one ≈2.6&nbsp;MB APE binary — and its alias store is a
+        <strong>minimal DAFSA</strong> that shares prefixes <em>and</em> suffixes across every key, so it
+        stays tiny as aliases grow.
+      </p>
+      <div class="grid">
+        <div class="card">
+          <span class="icon" aria-hidden="true">▤</span>
+          <h3>DAFSA prefix search</h3>
+          <p>Every fact is a fixed-width big-endian key, so <em>bind the leading columns and enumerate the rest</em> is a byte-prefix walk. That is exactly the two lookups email routing needs.</p>
+        </div>
+        <div class="card">
+          <span class="icon" aria-hidden="true">λ</span>
+          <h3>O(prefix), not O(aliases)</h3>
+          <p><code>alias@domain</code> → destinations and <code>reply+&lt;token&gt;</code> → sender are prefix walks over the DAFSA — cost scales with address length, not alias count. No separate index.</p>
+        </div>
+        <div class="card">
+          <span class="icon" aria-hidden="true">≈</span>
+          <h3>mmap + WAL</h3>
+          <p>Relations are served from mmap'd read-only snapshots and durably WAL'd (single-writer, <code>flock</code>) — fast reads, crash-safe writes, no database server.</p>
         </div>
       </div>
     </div>

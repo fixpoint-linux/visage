@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run.sh — host e2e integration driver for visage (S8).
 #
-# Mirrors config.example.dhall and drives the full SimpleLogin-style scenario
+# Mirrors config.example.dhall and drives the full end-to-end forwarding scenario
 # against a live `visage daemon`:
 #
 #   (a) build all binaries
