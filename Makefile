@@ -15,7 +15,7 @@ CORE_DATALOG = $(DATALOG)/vendor/dafsa.c $(DATALOG)/vendor/dafsa_state.c \
              $(DATALOG)/src/vrelation.c $(DATALOG)/src/tupleset.c $(DATALOG)/src/parser.c \
              $(DATALOG)/src/compiler.c $(DATALOG)/src/vm.c $(DATALOG)/src/snapshot.c \
              $(DATALOG)/src/regexwalk.c $(DATALOG)/src/permindex.c $(DATALOG)/src/util.c \
-             $(DATALOG)/src/dl.c $(DATALOG)/src/magic.c
+             $(DATALOG)/src/dl.c $(DATALOG)/src/magic.c $(DATALOG)/src/topdown.c
 
 # --- vendored mbedTLS (relay STARTTLS) ---------------------------------------
 MBEDTLS_DIR   = vendor/mbedtls

@@ -108,6 +108,10 @@ int config_load(const char *path, Config *cfg, char *err, size_t errsz);
    (case-insensitive); NULL when there is no match. */
 ConfigDkim *config_dkim_find(const Config *cfg, const char *domain);
 
+/* Nonzero if `alias` matches any config-declared alias (case-insensitive);
+   such aliases are read-only through the admin API. */
+int config_alias_read_only(const Config *cfg, const char *alias);
+
 /* Free every heap allocation owned by cfg. */
 void config_free(Config *cfg);
 

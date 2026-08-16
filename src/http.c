@@ -273,6 +273,12 @@ static void handle_alias(HttpServer *srv, HttpConn *c, int rm) {
         return;
     }
 
+    if (config_alias_read_only(srv->cfg, alias)) {
+        http_respond_err(c, 403, "Forbidden",
+                         "alias is declared in config (read-only)");
+        return;
+    }
+
     rc = rm ? store_alias_rm(srv->store, alias, dest)
             : store_alias_add(srv->store, alias, dest);
     if (rc != VISAGE_OK) {

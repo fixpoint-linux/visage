@@ -248,6 +248,36 @@ static void auth_class_test(void) {
     EXPECT(smtp_auth_class(600) == SMTP_ERROR, "auth_class 600 -> ERROR");
 }
 
+static void alias_read_only_test(void) {
+    /* Build a Config with two config-declared aliases; config_alias_read_only
+       must flag exact and case-insensitive matches and reject non-matches. */
+    ConfigAlias aliases[2];
+    char *d0[] = {"dest0@example.com"};
+    char *d1[] = {"dest1@example.com"};
+    aliases[0].alias = "info@example.com";
+    aliases[0].destinations = d0;
+    aliases[0].ndestinations = 1;
+    aliases[1].alias = "Sales@Example.COM";
+    aliases[1].destinations = d1;
+    aliases[1].ndestinations = 1;
+
+    Config cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.aliases = aliases;
+    cfg.naliases = 2;
+
+    EXPECT(config_alias_read_only(&cfg, "info@example.com") != 0,
+           "alias_read_only exact match");
+    EXPECT(config_alias_read_only(&cfg, "sales@example.com") != 0,
+           "alias_read_only case-insensitive match");
+    EXPECT(config_alias_read_only(&cfg, "nope@example.com") == 0,
+           "alias_read_only non-match");
+    EXPECT(config_alias_read_only(&cfg, NULL) == 0,
+           "alias_read_only NULL alias");
+    EXPECT(config_alias_read_only(NULL, "info@example.com") == 0,
+           "alias_read_only NULL cfg");
+}
+
 int main(void) {
     /* base64 known vectors (RFC 4648) */
     b64_test("", 0, "", "base64 empty");
@@ -316,6 +346,9 @@ int main(void) {
 
     /* outbound AUTH PLAIN classification (R3) */
     auth_class_test();
+
+    /* config-declared aliases are read-only (admin lock) */
+    alias_read_only_test();
 
     printf("\n%d checks, %d failed\n", nchecks, nfails);
     return nfails ? 1 : 0;

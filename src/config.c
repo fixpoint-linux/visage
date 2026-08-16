@@ -247,6 +247,16 @@ ConfigDkim *config_dkim_find(const Config *cfg, const char *domain) {
     return NULL;
 }
 
+int config_alias_read_only(const Config *cfg, const char *alias) {
+    if (!cfg || !alias) return 0;
+    for (size_t i = 0; i < cfg->naliases; i++) {
+        if (cfg->aliases[i].alias &&
+            strcasecmp(cfg->aliases[i].alias, alias) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 static char *read_all(FILE *f) {
     size_t cap = 65536, len = 0;
     char *buf = malloc(cap);
