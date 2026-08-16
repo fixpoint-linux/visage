@@ -80,4 +80,9 @@ tests/relay_fake.com: tests/relay_fake.c $(MBEDTLS_OBJ) src/mbedtls_visage_confi
 e2e: visage.com config_check.com tests/smtptest.com tests/relay_fake.com
 	./tests/run.sh
 
-.PHONY: all e2e
+# --- browser wasm build (host: requires emscripten clang lld llvm nodejs) ----
+wasm:
+	./scripts/build-wasm.sh
+	@node tests/wasm-smoke.js
+
+.PHONY: all e2e wasm

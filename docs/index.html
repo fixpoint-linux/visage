@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>visage — a SimpleLogin-style email alias &amp; forwarding service in C, configured by Dhall</title>
+  <meta name="description" content="visage is a small, self-contained SMTP email alias/forwarding service — a SimpleLogin-style reverse-alias mail gateway — configured in typechecked Dhall and compiled with cosmocc into a single portable APE binary. One C source, two targets: a native APE binary and a WebAssembly build that runs 100% in your browser.">
+  <meta name="theme-color" content="#0a0f0d">
+  <meta property="og:title" content="visage — a SimpleLogin-style email alias &amp; forwarding service in C, configured by Dhall">
+  <meta property="og:description" content="An SMTP email alias/forward service — typechecked Dhall config, SMTP-in-C state machine, STARTTLS/STARTTLS-verify relay + DKIM signing, durable outbound retry queue. One C source to a native APE binary and a browser wasm build.">
+  <meta property="og:type" content="website">
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="vendor/codemirror.css?v=2">
+  <script>document.documentElement.classList.add('js');</script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a class="logo" href="#top">
+        <span class="logo-mark" aria-hidden="true">v</span>
+        <span>visage</span>
+        <span class="logo-ver">v0.1</span>
+      </a>
+      <nav aria-label="Primary">
+        <a href="#targets">Two targets</a>
+        <a href="#demo">Live demo</a>
+        <a href="#features">Features</a>
+        <a href="#how">How it works</a>
+        <a href="#quickstart">Build</a>
+      </nav>
+    </div>
+  </header>
+
+  <section class="hero" id="top">
+    <div class="wrap">
+      <p class="eyebrow">email alias/forward · C11 · Dhall · cosmocc</p>
+      <h1>Email aliases that<br>hide your <span class="grad">real address</span>.</h1>
+      <p class="lead">
+        A small, self-contained <strong>SimpleLogin-style email alias &amp; forwarding service</strong>.
+        Give out disposable <strong>alias@domain</strong> addresses that forward to your real inbox — and
+        reply through them too. Describe every alias in <strong>typechecked Dhall</strong>; the
+        <strong>same C source</strong> ships two ways: a single portable <strong>APE binary</strong> and a
+        <strong>WebAssembly</strong> build that runs right here in your browser.
+      </p>
+      <div class="hero-cta">
+        <a class="btn btn-primary" href="#demo">
+          <span class="btn-glyph" aria-hidden="true">▶</span> Resolve an alias in your browser
+        </a>
+        <a class="btn btn-ghost" href="#targets">
+          <span class="btn-glyph" aria-hidden="true">↓</span> Get the native binary
+        </a>
+      </div>
+      <ul class="badges">
+        <li><b>visage.com</b> · one APE binary, many platforms</li>
+        <li><b>visage.wasm</b> · 100% client-side, no server</li>
+        <li>SMTP-in-C · DKIM · STARTTLS</li>
+      </ul>
+      <div class="terminal" role="img" aria-label="A terminal session running visage.com and make wasm">
+        <div class="term-bar">
+          <span class="dot dot-r"></span><span class="dot dot-y"></span><span class="dot dot-g"></span>
+          <span class="term-title">visage — terminal</span>
+        </div>
+        <div class="term-body">
+          <div class="term-line"><span class="prompt">$</span> ./visage.com daemon -c config.example.dhall</div>
+          <div class="term-line out">config ok · 2 alias(es) seeded · SMTP on 0.0.0.0:2525 · admin on 127.0.0.1:8080</div>
+          <div class="term-line"><span class="prompt">$</span> ./visage.com add-alias -c config.example.dhall --alias dev@example.com --dest me@real.example</div>
+          <div class="term-line out">ok · alias added</div>
+          <div class="term-line"><span class="prompt">$</span> make wasm <span class="term-comment"># same C core → WebAssembly</span></div>
+          <div class="term-line out">docs/visage.js + docs/visage.wasm <span class="cursor" aria-hidden="true">▌</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section reveal" id="targets">
+    <div class="wrap">
+      <p class="eyebrow">One source · two targets</p>
+      <h2>Compiled once for C.<br>Delivered two ways.</h2>
+      <p class="sub">
+        The same lexer, parser, typechecker, and SMTP/address pipeline (<code>src/*.c</code>) build into two
+        artifacts — from your terminal to a browser tab.
+      </p>
+
+      <div class="flow" role="img" aria-label="How the C source splits into a native APE and WebAssembly">
+        <pre><code><span class="f-src">src/*.c</span>  <span class="f-mut">— config · smtp_in/out · mail parsing · reply · dhall-c core</span>
+
+        <span class="f-tree">├─</span> <span class="f-main">src/main.c</span>  <span class="f-mut">→ cosmocc    →</span> <span class="f-main">visage.com</span>  <span class="f-mut">one binary, many OSes</span>
+        <span class="f-tree">└─</span> <span class="f-wasm">src/visage-wasm.c</span> <span class="f-mut">→ emscripten →</span> <span class="f-wasm">visage.wasm</span>  <span class="f-mut">zero-install, in your browser</span></code></pre>
+      </div>
+
+      <div class="targets">
+        <article class="target target-native">
+          <div class="target-head">
+            <span class="target-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 9.5l3 2.5-3 2.5"/><path d="M12 15h5"/></svg>
+            </span>
+            <div>
+              <h3>Native binary — <code>visage.com</code></h3>
+              <span class="chip chip-native">APE · cosmocc</span>
+            </div>
+          </div>
+          <p class="target-desc">
+            A single self-contained <strong>~2.6&nbsp;MB</strong> polyglot binary — an
+            <em>Actually Portable Executable</em> built with <code>cosmocc</code> (Cosmopolitan libc).
+            The same file runs natively, no VM, no runtime, no recompile:
+          </p>
+          <ul class="os-list">
+            <li>Linux</li><li>macOS</li><li>Windows</li><li>FreeBSD</li><li>NetBSD</li><li>OpenBSD</li>
+          </ul>
+          <p class="target-note">…and any other <code>x86-64</code> platform cosmocc targets.</p>
+          <p class="target-desc">
+            An SMTP receiver with a typechecked Dhall config, alias + reverse-alias forwarding, and a durable
+            outbound retry queue. Relay to your mailbox provider over STARTTLS (optionally cert-verified),
+            signing outbound mail with DKIM.
+          </p>
+          <div class="target-code"><pre><code>$ ./visage.com daemon -c config.example.dhall
+$ make          <span class="term-comment"># builds visage.com</span></code></pre></div>
+          <a class="btn btn-ghost btn-sm" href="#quickstart">Build &amp; usage</a>
+        </article>
+
+        <article class="target target-wasm">
+          <div class="target-head">
+            <span class="target-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3c2.6 2.6 2.6 15 0 18"/><path d="M12 3c-2.6 2.6-2.6 15 0 18"/></svg>
+            </span>
+            <div>
+              <h3>In the browser — <code>visage.wasm</code></h3>
+              <span class="chip chip-wasm">WebAssembly</span>
+            </div>
+          </div>
+          <p class="target-desc">
+            The real C config + alias pipeline compiled to a small <code>.wasm</code> module
+            (<code>visage.js</code> + <code>visage.wasm</code>). It runs <strong>100% client-side</strong> —
+            the actual <code>config_load</code> + address resolution, no server, no build step.
+            Your config and addresses never leave the tab.
+          </p>
+          <p class="target-note">
+            The demo below loads the exact <code>config.example.dhall</code> and resolves alias@domain
+            addresses against it — accept/reject, via alias or catch-all, exactly like
+            <code>smtp_in_rcpt_ok()</code> in the daemon.
+          </p>
+          <div class="target-code"><pre><code>$ make wasm     <span class="term-comment"># → docs/visage.js + visage.wasm</span>
+$ node tests/wasm-smoke.js</code></pre></div>
+          <a class="btn btn-primary btn-sm" href="#demo">Try the live demo ↓</a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section class="section alt" id="demo">
+    <div class="wrap">
+      <p class="eyebrow">WebAssembly · runs in this tab</p>
+      <h2>Live demo — resolve an alias</h2>
+      <p class="sub">
+        Edit the Dhall config (a real <code>CodeMirror</code> editor with Dhall highlighting), then type an
+        <code>alias@domain</code> address. Press <kbd>Run</kbd>, <kbd>Enter</kbd>, or <kbd>Ctrl/⌘</kbd>+<kbd>Enter</kbd>.
+        The <strong>actual C pipeline</strong> (<code>src/config.c</code> + <code>src/mail.c</code>, compiled to wasm)
+        parses the config, typechecks it, and resolves the address — accept/reject, via alias or catch-all.
+      </p>
+
+      <div class="demo">
+        <div class="window-bar">
+          <span class="dot dot-r"></span><span class="dot dot-y"></span><span class="dot dot-g"></span>
+          <span class="window-title">visage — in your browser</span>
+          <span class="window-badge">wasm</span>
+        </div>
+
+        <div class="query-bar">
+          <label for="addr">Alias</label>
+          <input type="text" id="addr" placeholder="shopping@example.com" spellcheck="false" autocomplete="off" autocapitalize="off">
+          <button class="btn btn-primary run" id="runBtn">Run</button>
+        </div>
+
+        <div class="panes">
+          <div class="pane">
+            <label for="source">Dhall config</label>
+            <div class="editor-wrap">
+              <textarea id="source" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
+            </div>
+          </div>
+          <div class="pane">
+            <label>Parsed config</label>
+            <div class="summary" id="summary"><div class="ans-empty">loading wasm…</div></div>
+            <label style="margin-top:14px;">Resolution result</label>
+            <div class="result" id="result"><div class="ans-empty">—</div></div>
+          </div>
+        </div>
+
+        <div class="demo-foot">
+          <span class="status" id="status">loading wasm…</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section reveal" id="features">
+    <div class="wrap">
+      <p class="eyebrow">What it does</p>
+      <h2>Email aliasing, done in C</h2>
+      <p class="sub">A SimpleLogin-style service — disposable aliases, real forwarding, no lock-in.</p>
+      <div class="grid">
+        <div class="card">
+          <span class="icon" aria-hidden="true">λ</span>
+          <h3>Typechecked Dhall config</h3>
+          <p>Aliases, domains, relay, and limits are described in Dhall, <strong>typechecked against their schema</strong> and evaluated at startup.</p>
+        </div>
+        <div class="card">
+          <span class="icon" aria-hidden="true">⇆</span>
+          <h3>SMTP-in-C state machine</h3>
+          <p>A hand-rolled RFC&nbsp;5321 state machine for the receiver and relay — HELO/EHLO, MAIL, RCPT, DATA, with full bounds-checking on the wire path.</p>
+        </div>
+        <div class="card">
+          <span class="icon" aria-hidden="true">▤</span>
+          <h3>datalog-dafsa storage</h3>
+          <p>Aliases live in a <strong>datalog-dafsa</strong> store: a persistent, fast-lookup DAFSA index seeded from the config, with WAL/flock durability.</p>
+        </div>
+        <div class="card">
+          <span class="icon" aria-hidden="true">⟳</span>
+          <h3>Durable outbound retry queue</h3>
+          <p>Messages spool to disk and are delivered with <strong>bounded retries</strong> — a relay outage or temporary error never loses mail.</p>
+        </div>
+        <div class="card">
+          <span class="icon" aria-hidden="true">🔒</span>
+          <h3>STARTTLS + DKIM</h3>
+          <p>Relay over STARTTLS (optionally <code>starttls-verify</code> against a CA bundle) and <strong>sign outbound mail with DKIM</strong>, straight from C.</p>
+        </div>
+        <div class="card">
+          <span class="icon" aria-hidden="true">↩</span>
+          <h3>Reverse-alias reply routing</h3>
+          <p>Reply to forwarded mail through a <code>reply+&lt;token&gt;@yourdomain</code> reverse alias, so your real address stays hidden.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section alt reveal" id="how">
+    <div class="wrap">
+      <p class="eyebrow">How it works</p>
+      <h2>One daemon, end to end</h2>
+      <p class="sub">
+        visage is a single process: it accepts SMTP for the domains it serves, resolves each recipient
+        against the DAFSA store, and forwards accepted mail to your mailbox provider.
+      </p>
+      <div class="how-list">
+        <div class="how-item">
+          <span class="how-num">1</span>
+          <div>
+            <h3>Accept</h3>
+            <p>The SMTP receiver (<code>src/smtp_in.c</code>) parses the envelope with the real
+            <code>mail_addr_parse()</code>, gates on served domains, and resolves each <code>alias@domain</code> —
+            matching the DAFSA store case-insensitively, then falling back to catch-all.</p>
+          </div>
+        </div>
+        <div class="how-item">
+          <span class="how-num">2</span>
+          <div>
+            <h3>Forward</h3>
+            <p>Accepted mail is spooled to disk and handed to the outbound queue (<code>src/smtp_out.c</code>).
+            Each message is delivered to its destinations with bounded retries, STARTTLS to the relay, and
+            DKIM-signed before it goes out.</p>
+          </div>
+        </div>
+        <div class="how-item">
+          <span class="how-num">3</span>
+          <div>
+            <h3>Reply privately</h3>
+            <p>When you reply, the <code>reply+&lt;token&gt;@yourdomain</code> reverse alias (<code>src/reply.c</code>)
+            is routed back to the original sender — so the sender only ever sees your alias.</p>
+          </div>
+        </div>
+      </div>
+      <p class="sub"><em>The demo above runs step 1 — the actual config-load + recipient-resolution decision — compiled to wasm.</em></p>
+    </div>
+  </section>
+
+  <section class="section reveal" id="quickstart">
+    <div class="wrap">
+      <p class="eyebrow">Build &amp; run</p>
+      <h2>Quickstart</h2>
+      <p class="sub">
+        Requires <code>cosmocc</code> (Cosmopolitan toolchain). The <code>dhall-c</code> interpreter core and
+        <code>datalog-dafsa</code> store are siblings at <code>../dhall-c</code> and <code>../datalog-dafsa</code>;
+        mbedTLS is vendored under <code>vendor/</code>.
+      </p>
+
+      <div class="code-cols">
+        <div class="code-col">
+          <h3>Native — <code>make</code></h3>
+          <pre><code>make            <span class="term-comment"># builds visage.com (APE) + visage.com.dbg (ELF)</span>
+./visage.com daemon -c config.example.dhall</code></pre>
+        </div>
+        <div class="code-col">
+          <h3>Browser — <code>make wasm</code></h3>
+          <pre><code>make wasm                <span class="term-comment"># → docs/visage.js + visage.wasm</span>
+node tests/wasm-smoke.js <span class="term-comment"># headless smoke test</span></code></pre>
+          <p class="col-note">Needs <code>emscripten clang lld llvm nodejs</code>.</p>
+        </div>
+      </div>
+
+      <h3 class="usage-h">Usage</h3>
+      <pre><code>./visage.com &lt;command&gt; [options]
+
+  daemon -c FILE          run the SMTP + admin HTTP daemon
+  config-check -c FILE    validate the config file and exit
+  add-alias -c FILE --alias A@D --dest X@Y
+                          add an alias via the running daemon
+  rm-alias  -c FILE --alias A@D --dest X@Y
+                          remove an alias via the running daemon
+  log -c FILE [-n N]      print recent log entries via the daemon
+  --help · --version</code></pre>
+
+      <h3 class="usage-h" style="margin-top:28px;">Config format</h3>
+      <pre><code>let Auth = { enabled : Bool, username : Text, password : Text }
+in  let Config =
+      { hostname : Text
+      , domains : List Text
+      , listen : { address : Text, port : Natural }
+      , limits : { message : Natural, line : Natural, rcpts : Natural
+                 , cmd_timeout : Natural, data_timeout : Natural }
+      , relay : { host : Text, port : Natural, auth : Auth, retries : Natural
+                , tls : Text, tls_ca : Text, max_attempts : Natural }
+      , storage : { path : Text, spool : Text }
+      , reply : { prefix : Text, separator : Text }
+      , catch_all : Text
+      , aliases : List { alias : Text, destinations : List Text }
+      , http : { address : Text, port : Natural }
+      , admin : { token : Text }
+      , dkim : List { domain : Text, selector : Text, private_key : Text }
+      }
+in  { hostname = "mx.example.com"
+   , domains = [ "example.com" ]
+   , listen = { address = "0.0.0.0", port = 2525 }
+   , relay = { host = "127.0.0.1", port = 2526, tls = "none", max_attempts = 100, … }
+   , catch_all = ""
+   , aliases = [ { alias = "jane@example.com", destinations = [ "jane@realmail.example" ] }
+               , { alias = "shopping@example.com", destinations = [ "jane@realmail.example", "bob@realmail.example" ] }
+               ]
+   , …
+   } : Config</code></pre>
+      <p class="col-note"><code>relay.tls</code> is <code>none</code>, <code>starttls</code>, or <code>starttls-verify</code>
+      (an empty <code>tls_ca</code> uses the embedded Mozilla bundle). See <code>config.example.dhall</code> for the full example.</p>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <div class="wrap footer-inner">
+      <div>
+        <p class="footer-logo">v <span class="logo-accent">visage</span></p>
+        <p>A small, self-contained email alias &amp; forwarding service, configured in
+          <a href="https://dhall-lang.org/">Dhall</a> and compiled into a single portable APE binary with
+          <code>cosmocc</code>. This page runs the alias-resolution pipeline compiled to WebAssembly, served
+          statically from <code>docs/</code>.</p>
+      </div>
+      <div class="footer-meta">
+        <span>built with <code>cosmocc</code></span>
+        <span>·</span>
+        <span>runs in your browser via <code>emscripten</code></span>
+        <span>·</span>
+        <span>interpreter core: <code>dhall-c</code></span>
+        <span>·</span>
+        <span>store: <code>datalog-dafsa</code></span>
+      </div>
+    </div>
+  </footer>
+
+  <script src="visage.js"></script>
+  <script src="vendor/codemirror.min.js?v=3"></script>
+  <script src="vendor/codemirror-simple.js?v=3"></script>
+  <script src="vendor/dhall-mode.js?v=3"></script>
+  <script src="app.js"></script>
+  <script>
+    /* Progressive enhancement: scroll-reveal. Safe to drop — content is visible
+     * without JS (no `.js` class) and always revealed under reduced-motion/no-IO. */
+    (function () {
+      var els = Array.prototype.slice.call(document.querySelectorAll('.reveal'));
+      if (!els.length) return;
+      var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (reduce || !('IntersectionObserver' in window)) {
+        els.forEach(function (el) { el.classList.add('in'); });
+        return;
+      }
+      var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) {
+          if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+        });
+      }, { threshold: 0.08, rootMargin: '0px 0px -40px 0px' });
+      els.forEach(function (el) { io.observe(el); });
+    })();
+  </script>
+</body>
+</html>
