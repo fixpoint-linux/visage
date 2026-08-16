@@ -159,10 +159,10 @@ static void rcpt_decision_test(void) {
            "rcpt: foreign domain rejected");
     EXPECT(smtp_in_rcpt_ok(s, &cfg, "not-an-address") == RCPT_NOROUTE,
            "rcpt: malformed address rejected");
-    EXPECT(smtp_in_rcpt_ok(s, &cfg, "JANE@EXAMPLE.COM") == RCPT_NOROUTE,
-           "rcpt: exact alias match is case-sensitive");
-    EXPECT(smtp_in_rcpt_ok(s, &cfg, "jane@EXAMPLE.COM") == RCPT_NOROUTE,
-           "rcpt: domain gate is case-insensitive (routes, not BAD_DOMAIN)");
+    EXPECT(smtp_in_rcpt_ok(s, &cfg, "JANE@EXAMPLE.COM") == RCPT_OK,
+           "rcpt: alias match is case-insensitive");
+    EXPECT(smtp_in_rcpt_ok(s, &cfg, "jane@EXAMPLE.COM") == RCPT_OK,
+           "rcpt: domain gate is case-insensitive (resolves to alias)");
 
     (void)store_revmap_add(s, "deadbeefdeadbeefdeadbeefdeadbeef",
                            "orig@foo.org", "jane@example.com");

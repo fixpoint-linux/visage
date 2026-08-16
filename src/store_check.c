@@ -117,6 +117,21 @@ int main(void) {
     check(ndests == 1, "mixed-case add + lowercase resolve == 1 dest");
     store_free_strvec(dests, ndests);
 
+    /* R7: a quoted-string local part round-trips through split_addr (which
+       keeps the quotes and only lowercases, and does NOT validate dot-atom).
+       add and resolve both use split_addr, so the alias is stored and resolved
+       under the same key — quoted-local aliases work end-to-end. */
+    check(store_alias_add(s, "\"John Doe\"@example.com", "jd@realmail.example")
+              == VISAGE_OK, "alias_add quoted-local");
+    dests = NULL;
+    ndests = 0;
+    check(store_resolve(s, "\"John Doe\"@example.com", &dests, &ndests) == VISAGE_OK,
+          "resolve quoted-local alias returns OK");
+    check(ndests == 1 && dests && dests[0] &&
+          strcmp(dests[0], "jd@realmail.example") == 0,
+          "resolve quoted-local alias finds the destination");
+    store_free_strvec(dests, ndests);
+
     /* alias remove drops exactly one destination. */
     check(store_alias_rm(s, "jane@example.com", "bob@realmail.example") == VISAGE_OK,
           "alias_rm dest2");

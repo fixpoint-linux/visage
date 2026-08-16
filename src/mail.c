@@ -110,6 +110,64 @@ static bool contains_crlf(const char *s) {
 /* Address parsing                                                    */
 /* ------------------------------------------------------------------ */
 
+/* Printable ASCII (space through tilde).  Anything outside this — control
+   chars, CR/LF, DEL, non-ASCII — is rejected so header/SMTP injection stays
+   structurally impossible. */
+static bool is_printable(unsigned char c) {
+    return c >= 0x20 && c <= 0x7E;
+}
+
+/* Validate a domain: a dot-atom (the common case) or a domain-literal
+   "[...]" (RFC 5321 address-literal).  Rejects empty, a second '@', CR/LF
+   and control chars, and unbalanced brackets. */
+static bool domain_ok(const char *s, size_t len) {
+    if (len == 0) return false;
+    if (s[0] == '[') {
+        if (len < 3) return false;           /* "[]" too short / no closing ] */
+        if (s[len - 1] != ']') return false; /* unbalanced '[' without ']' */
+        for (size_t i = 1; i + 1 < len; i++) {
+            unsigned char c = (unsigned char)s[i];
+            if (c < 0x21 || c > 0x7E) return false;      /* space/ctl/CR/LF/non-ASCII */
+            if (c == '[' || c == ']' || c == '@') return false;
+        }
+        return true;
+    }
+    if (memchr(s, '@', len)) return false;   /* double '@' */
+    return dot_atom_ok(s, len);
+}
+
+/* Scan a quoted-string local part starting at start (which must be '"').
+   Validates content per RFC 5322 qtext/quoted-pair and requires the closing
+   quote to be immediately followed by the '@' separator.  On success stores
+   the separator pointer in *at_out and returns true. */
+static bool quoted_local_ok(const char *start, const char *end,
+                            const char **at_out) {
+    const char *p = start + 1;
+    bool saw_content = false;
+    for (;;) {
+        unsigned char c;
+        if (p >= end) return false;          /* unclosed quote */
+        c = (unsigned char)*p;
+        if (c == '\\') {
+            /* quoted-pair: '\' + one printable char (rejects CR/LF + ctl) */
+            if (p + 1 >= end) return false;
+            if (!is_printable((unsigned char)p[1])) return false;
+            saw_content = true;
+            p += 2;
+            continue;
+        }
+        if (c == '"') break;                 /* closing quote */
+        if (!is_printable(c)) return false;  /* ctl / CR / LF / non-ASCII */
+        saw_content = true;
+        p++;
+    }
+    if (!saw_content) return false;          /* empty quoted local part */
+    if (p + 1 >= end) return false;          /* nothing after the quote */
+    if (p[1] != '@') return false;           /* '@' must follow the quote */
+    *at_out = p + 1;
+    return true;
+}
+
 int mail_addr_parse(const char *s, char **local, char **domain) {
     if (local) *local = NULL;
     if (domain) *domain = NULL;
@@ -128,18 +186,36 @@ int mail_addr_parse(const char *s, char **local, char **domain) {
         start++;
         end--;
         if (end <= start) return -1;   /* "<>" */
-    } else {
-        for (const char *q = start; q < end; q++)
-            if (*q == '<' || *q == '>') return -1; /* stray angle bracket */
+    }
+    /* Reject stray '<'/'>' outside a quoted-string (valid only as the outer
+       angle wrapper above, or inside a quoted-string local part). */
+    for (const char *q = start; q < end;) {
+        if (*q == '"') {
+            q++;
+            while (q < end && *q != '"') {
+                if (*q == '\\' && q + 1 < end) q++;
+                q++;
+            }
+            if (q < end) q++; /* past the closing quote */
+        } else {
+            if (*q == '<' || *q == '>') return -1;
+            q++;
+        }
     }
 
-    const char *at = memchr(start, '@', (size_t)(end - start));
-    if (!at) return -1;                                    /* missing @ */
-    if (memchr(at + 1, '@', (size_t)(end - (at + 1)))) return -1; /* extra @ */
+    const char *at;
+    if (*start == '"') {
+        if (!quoted_local_ok(start, end, &at)) return -1;
+    } else {
+        at = memchr(start, '@', (size_t)(end - start));
+        if (!at) return -1;                                    /* missing @ */
+        if (memchr(at + 1, '@', (size_t)(end - (at + 1)))) return -1; /* extra @ */
+        if (!dot_atom_ok(start, (size_t)(at - start))) return -1;
+    }
 
     size_t ll = (size_t)(at - start);
     size_t dl = (size_t)(end - (at + 1));
-    if (!dot_atom_ok(start, ll) || !dot_atom_ok(at + 1, dl)) return -1;
+    if (!domain_ok(at + 1, dl)) return -1;
 
     char *l = malloc(ll + 1);
     if (!l) return -1;

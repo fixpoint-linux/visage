@@ -286,6 +286,16 @@ int main(void) {
     addr_ok("  bob@sub.example.org  ", "bob", "sub.example.org", "addr trims ws");
     addr_ok("user+tag@example.com", "user+tag", "example.com", "addr plus-tag");
     addr_ok("a.b.c@d.e.f", "a.b.c", "d.e.f", "addr dotted");
+    addr_ok("\"alice\"@example.com", "\"alice\"", "example.com", "addr quoted local");
+    addr_ok("\"a b\"@example.com", "\"a b\"", "example.com", "addr quoted local with space");
+    addr_ok("\"john..doe\"@x.com", "\"john..doe\"", "x.com", "addr quoted local with doubled dots");
+    addr_ok("\"a@b\"@example.com", "\"a@b\"", "example.com", "addr inner @ inside quotes");
+    addr_ok("\"a>b\"@x.com", "\"a>b\"", "x.com", "addr angle brackets inside quotes");
+    addr_ok("\"a\\\"b\"@example.com", "\"a\\\"b\"", "example.com", "addr escaped quote in local");
+    addr_ok("\"a\\\\b\"@x.com", "\"a\\\\b\"", "x.com", "addr escaped backslash in local");
+    addr_ok("alice@[127.0.0.1]", "alice", "[127.0.0.1]", "addr IPv4 address-literal");
+    addr_ok("alice@[IPv6:2001:db8::1]", "alice", "[IPv6:2001:db8::1]", "addr IPv6 address-literal");
+    addr_ok("\"a b\"@[127.0.0.1]", "\"a b\"", "[127.0.0.1]", "addr quoted local + address-literal");
 
     /* address parsing: invalid */
     addr_bad(NULL, "addr NULL rejected");
@@ -303,8 +313,11 @@ int main(void) {
     addr_bad("alice..b@example.com", "addr doubled dot rejected");
     addr_bad("alice@example..com", "addr doubled dot domain rejected");
     addr_bad("alice@example.com\n", "addr control char rejected");
-    addr_bad("\"alice\"@example.com", "addr quoted local rejected");
-    addr_bad("alice@[127.0.0.1]", "addr address-literal rejected");
+    addr_bad("\"unclosed@example.com", "addr unclosed quote rejected");
+    addr_bad("\"\"@x.com", "addr empty quoted local rejected");
+    addr_bad("alice@[127.0.0.1", "addr unbalanced domain literal rejected");
+    addr_bad("alice@[]", "addr empty domain literal rejected");
+    addr_bad("\"a\r\nb\"@x", "addr CRLF inside quotes rejected");
     addr_bad("<>", "addr empty angle-brackets rejected");
 
     /* CRLF normalization */

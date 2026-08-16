@@ -24,11 +24,15 @@ typedef struct {
 
 /* Parse an RFC5321 addr-spec, accepting either the bare "local@domain" form or
    the "<local@domain>" path form (surrounding SP/HT whitespace is tolerated).
-   Rejects control chars, any whitespace inside the address (including the
-   quoted-string-with-spaces form), a missing or extra '@', empty local or
-   domain, leading/trailing/doubled dots, and non-ASCII bytes. On success
-   heap-allocates *local and *domain (NUL-terminated) and returns 0; on any
-   invalid input returns -1 and leaves *local and *domain NULL. */
+   The local part may be a dot-atom or a quoted-string ("a b", with \" and \\
+   quoted-pair escapes, kept verbatim including the quotes); the domain may be
+   a dot-atom or a domain-literal ([127.0.0.1], [IPv6:...], kept verbatim
+   including the brackets). Rejects control chars (CR/LF), unbalanced '<'/'>'
+   and stray '<'/'>' outside a quoted-string, a missing or extra '@', empty
+   local or domain, leading/trailing/doubled dots in a dot-atom, and non-ASCII
+   bytes. On success heap-allocates *local and *domain (NUL-terminated) and
+   returns 0; on any invalid input returns -1 and leaves *local and *domain
+   NULL. */
 int mail_addr_parse(const char *s, char **local, char **domain);
 
 /* Normalize line endings to CRLF in place: every bare LF or bare CR becomes
