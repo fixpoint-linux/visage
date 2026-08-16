@@ -194,6 +194,73 @@ static int write_file(const char *path, const char *data, size_t len) {
     return 0;
 }
 
+/* Write len bytes to a file and fsync it before returning.  Used for the
+   durable outbound spool so a queue row can never reference a body whose
+   bytes have not reached stable storage (spool-commit-before-send).  Returns
+   0 on success. */
+static int write_file_fsync(const char *path, const char *data, size_t len) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    size_t off = 0;
+    if (fd < 0) return -1;
+    while (off < len) {
+        ssize_t w = write(fd, data + off, len - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            return -1;
+        }
+        if (w == 0) { close(fd); return -1; }
+        off += (size_t)w;
+    }
+    if (fsync(fd) != 0) { close(fd); return -1; }
+    if (close(fd) != 0) return -1;
+    return 0;
+}
+
+/* Read a whole file into a freshly-malloc'd, NUL-terminated buffer (*out/
+   *outlen).  Returns 0 on success, -1 on error (missing file, I/O, alloc). */
+static int read_file(const char *path, char **out, size_t *outlen) {
+    struct stat st;
+    int fd;
+    char *buf;
+    size_t off = 0;
+
+    if (!path || !out || !outlen) return -1;
+    *out = NULL;
+    *outlen = 0;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    if (fstat(fd, &st) != 0 || st.st_size < 0) { close(fd); return -1; }
+    buf = malloc((size_t)st.st_size + 1);
+    if (!buf) { close(fd); return -1; }
+    while (off < (size_t)st.st_size) {
+        ssize_t r = read(fd, buf + off, (size_t)st.st_size - off);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            free(buf);
+            close(fd);
+            return -1;
+        }
+        if (r == 0) break;   /* file shrank: return what was read */
+        off += (size_t)r;
+    }
+    close(fd);
+    buf[off] = '\0';
+    *out = buf;
+    *outlen = off;
+    return 0;
+}
+
+/* Build the durable outbound spool path "<spool>/<msgid>.<k>.out.eml". */
+static int spool_out_path(const Config *cfg, uint32_t msgid, uint32_t k,
+                          char *buf, size_t bufsz) {
+    int n = snprintf(buf, bufsz, "%s/%u.%u.out.eml", cfg->storage.spool,
+                     msgid, k);
+    if (n < 0 || (size_t)n >= bufsz) return -1;
+    return 0;
+}
+
 /* True if every byte is printable ASCII (no control chars, no space). */
 static bool path_clean(const char *p) {
     const unsigned char *q = (const unsigned char *)p;
@@ -380,15 +447,232 @@ RcptDecision smtp_in_rcpt_ok(Store *s, const Config *cfg, const char *rcpt) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Durable outbound delivery queue (S-A2)                             */
+/* ------------------------------------------------------------------ */
+
+/* Bump attempts and either requeue (next_ts = now + backoff) or, once
+   max_attempts is exceeded, mark permfail and drop the spool body. */
+static void queue_requeue(Server *srv, uint32_t msgid, uint32_t k,
+                          const char *from, const char *to, uint32_t attempts,
+                          uint32_t now, uint32_t max_attempts,
+                          const char *spoolpath) {
+    Store *s = srv->store;
+    attempts++;
+    if (attempts > max_attempts) {
+        if (store_queue_set_status(s, msgid, k, "permfail", attempts, 0)
+                != VISAGE_OK)
+            fprintf(stderr, "visage: queue: set_status(permfail) failed "
+                    "msgid=%u k=%u; row left in prior status\n", msgid, k);
+        (void)unlink(spoolpath);
+        (void)store_log_add(s, msgid, now, LOG_DIR_OUT, from, to, "permfail");
+    } else {
+        if (store_queue_set_status(s, msgid, k, "queued", attempts,
+                                   now + smtp_backoff_sec(attempts))
+                != VISAGE_OK)
+            fprintf(stderr, "visage: queue: set_status(queued) failed "
+                    "msgid=%u k=%u; row left in prior status (recovered at "
+                    "restart)\n", msgid, k);
+        (void)store_log_add(s, msgid, now, LOG_DIR_OUT, from, to, "tempfail");
+    }
+}
+
+/* Attempt one delivery of a due tuple: flip to "delivering", read the
+   durably-spooled body, smtp_out_send (its in-attempt retries are the inner
+   loop), then transition to delivered / permfail / queued. */
+static void queue_deliver_one(Server *srv, uint32_t msgid, uint32_t k,
+                              const char *from, const char *to,
+                              uint32_t attempts) {
+    Store *s = srv->store;
+    const Config *cfg = srv->cfg;
+    char spoolpath[4096];
+    char *body = NULL;
+    size_t bodylen = 0;
+    char status[128];
+    uint32_t now = (uint32_t)time(NULL);
+    uint32_t max_attempts =
+        cfg->relay.max_attempts ? cfg->relay.max_attempts : 100u;
+    int sres;
+
+    /* Flip to delivering (narrows the double-send crash window; startup
+       recovery resets a delivering-left-by-crash back to queued). */
+    if (store_queue_set_status(s, msgid, k, "delivering", attempts, 0)
+            != VISAGE_OK) {
+        /* First flip failed: the row is still "queued" with next_ts 0, so it
+           would be re-picked immediately -> hot loop.  Log loudly and push its
+           next_ts into the future (best effort) to break the spin without
+           losing the delivery. */
+        fprintf(stderr, "visage: queue: set_status(delivering) failed "
+                "msgid=%u k=%u; deferring\n", msgid, k);
+        (void)store_queue_set_status(s, msgid, k, "queued", attempts,
+                                     now + smtp_backoff_sec(attempts + 1));
+        return;
+    }
+
+    if (spool_out_path(cfg, msgid, k, spoolpath, sizeof spoolpath) != 0) {
+        /* Path too long (would have failed at enqueue too).  Do not loop. */
+        if (store_queue_set_status(s, msgid, k, "permfail", attempts, 0)
+                != VISAGE_OK)
+            fprintf(stderr, "visage: queue: set_status(permfail) failed "
+                    "msgid=%u k=%u (spool path too long)\n", msgid, k);
+        (void)store_log_add(s, msgid, now, LOG_DIR_OUT, from, to, "permfail");
+        return;
+    }
+
+    if (read_file(spoolpath, &body, &bodylen) != 0) {
+        /* Cannot read the body (transient I/O/alloc, or external deletion):
+           requeue rather than lose the message; bounded by max_attempts. */
+        queue_requeue(srv, msgid, k, from, to, attempts, now, max_attempts,
+                      spoolpath);
+        return;
+    }
+
+    sres = smtp_out_send(s, cfg, from, to, body, bodylen, status, sizeof status);
+    free(body);
+
+    switch (sres) {
+    case SMTP_OK:
+        if (store_queue_set_status(s, msgid, k, "delivered", attempts, 0)
+                != VISAGE_OK)
+            fprintf(stderr, "visage: queue: set_status(delivered) failed "
+                    "msgid=%u k=%u\n", msgid, k);
+        (void)unlink(spoolpath);
+        (void)store_log_add(s, msgid, now, LOG_DIR_OUT, from, to, "delivered");
+        break;
+    case SMTP_PERMFAIL:
+        if (store_queue_set_status(s, msgid, k, "permfail", attempts, 0)
+                != VISAGE_OK)
+            fprintf(stderr, "visage: queue: set_status(permfail) failed "
+                    "msgid=%u k=%u\n", msgid, k);
+        (void)unlink(spoolpath);
+        (void)store_log_add(s, msgid, now, LOG_DIR_OUT, from, to, "permfail");
+        break;
+    default:   /* SMTP_TEMPFAIL and SMTP_ERROR: retry across attempts */
+        queue_requeue(srv, msgid, k, from, to, attempts, now, max_attempts,
+                      spoolpath);
+        break;
+    }
+}
+
+/* --- re-drive collection ------------------------------------------- */
+
+typedef struct {
+    uint32_t msgid;
+    uint32_t k;
+    char    *from;
+    char    *to;
+    uint32_t attempts;
+} QueueItem;
+
+typedef struct {
+    QueueItem *items;
+    size_t     n, cap;
+    int        oom;
+} QueueCollect;
+
+static int queue_collect_cb(uint32_t msgid, uint32_t k, const char *from,
+                            const char *to, uint32_t attempts, void *user) {
+    QueueCollect *qc = (QueueCollect *)user;
+    QueueItem *it;
+
+    if (qc->n == qc->cap) {
+        size_t nc = qc->cap ? qc->cap * 2 : 16;
+        QueueItem *na = realloc(qc->items, nc * sizeof *na);
+        if (!na) { qc->oom = 1; return 1; }
+        qc->items = na;
+        qc->cap = nc;
+    }
+    it = &qc->items[qc->n];
+    it->msgid = msgid;
+    it->k = k;
+    it->from = strdup(from);
+    it->to = strdup(to);
+    it->attempts = attempts;
+    if (!it->from || !it->to) { qc->oom = 1; return 1; }
+    qc->n++;
+    return 0;
+}
+
+/* Re-drive every delivery whose status is "queued" and next_ts <= now.
+   Collect-then-mutate is load-bearing: the due-walk is read-only, and each
+   delivery's transition happens AFTER the walk returns, because dafsa
+   add/delete realloc the states array mid-walk (mutating inside the callback
+   would be a use-after-free). */
+static void queue_redrive(Server *srv) {
+    Store *s = srv->store;
+    QueueCollect qc;
+    size_t i;
+    uint32_t now = (uint32_t)time(NULL);
+
+    memset(&qc, 0, sizeof qc);
+    if (store_queue_due(s, now, queue_collect_cb, &qc) != VISAGE_OK || qc.oom) {
+        for (i = 0; i < qc.n; i++) {
+            free(qc.items[i].from);
+            free(qc.items[i].to);
+        }
+        free(qc.items);
+        return;   /* items stay queued; the next tick retries */
+    }
+
+    for (i = 0; i < qc.n; i++) {
+        queue_deliver_one(srv, qc.items[i].msgid, qc.items[i].k,
+                          qc.items[i].from, qc.items[i].to,
+                          qc.items[i].attempts);
+        free(qc.items[i].from);
+        free(qc.items[i].to);
+    }
+    free(qc.items);
+}
+
+/* Durably enqueue one outbound delivery and attempt it immediately via the
+   shared re-drive path (low-latency first attempt).  `sanitized` is the
+   ALREADY-sanitized outbound body produced by the caller (From/Reply-To
+   headers already carry the reverse token; the revmap fact is already
+   persisted) — do NOT re-sanitize or re-mint a token here.  Returns 0 when the
+   delivery is durably accepted (spool fsync + queue row), -1 on any hard
+   failure (mkdir/spool write/fsync/store_queue_add) so the caller can refuse
+   acceptance (451). */
+static int queue_enqueue(Server *srv, uint32_t msgid, uint32_t k,
+                         const char *from, const char *to,
+                         const char *sanitized, size_t slen) {
+    Store *s = srv->store;
+    const Config *cfg = srv->cfg;
+    char spoolpath[4096];
+    uint32_t now = (uint32_t)time(NULL);
+
+    /* 1. Durably spool the sanitized body BEFORE the queue row, so a queue row
+       can never reference a body that has not reached stable storage. */
+    if (mkdir_p(cfg->storage.spool) != 0 ||
+        spool_out_path(cfg, msgid, k, spoolpath, sizeof spoolpath) != 0 ||
+        write_file_fsync(spoolpath, sanitized, slen) != 0) {
+        store_log_add(s, msgid, now, LOG_DIR_OUT, from, to, "error");
+        return -1;
+    }
+
+    /* 2. Commit the queue row (WAL-append + fsync inside store_queue_add). */
+    if (store_queue_add(s, msgid, k, from, to) != VISAGE_OK) {
+        (void)unlink(spoolpath);   /* orphaned body: nothing references it */
+        store_log_add(s, msgid, now, LOG_DIR_OUT, from, to, "error");
+        return -1;
+    }
+    store_log_add(s, msgid, now, LOG_DIR_OUT, from, to, "queued");
+
+    /* 3. Low-latency first attempt via the shared re-drive path. */
+    queue_redrive(srv);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Forwarding                                                         */
 /* ------------------------------------------------------------------ */
 
 /* Forward one sanitized copy of the message through `alias` to `dest`.
    Mints a reverse-alias token (or a plain rewrite for a null reverse-path)
-   and hands the sanitized message to smtp_out_send, logging the result. */
-static void forward_one(Server *srv, const char *msg, size_t msglen,
-                        const char *sender, const char *alias, const char *dest,
-                        uint32_t msgid, uint32_t ts) {
+   and durably enqueues the sanitized message for outbound delivery.  Returns
+   0 when `dest` was durably enqueued, -1 when it could not be (token/revmap/
+   sanitize/enqueue failure) so the caller can refuse acceptance (451). */
+static int forward_one(Server *srv, const char *msg, size_t msglen,
+                       const char *sender, const char *alias, const char *dest,
+                       uint32_t msgid, uint32_t ts, uint32_t k) {
     Store *s = srv->store;
     const Config *cfg = srv->cfg;
     MailRewrite rw;
@@ -396,8 +680,7 @@ static void forward_one(Server *srv, const char *msg, size_t msglen,
     char token[64], reverse[384], received[512];
     char *sanitized = NULL;
     size_t slen = 0;
-    char status[128];
-    int rc, sres;
+    int rc;
 
     memset(&rw, 0, sizeof rw);
 
@@ -406,7 +689,7 @@ static void forward_one(Server *srv, const char *msg, size_t msglen,
             reply_make_reverse(cfg, token, alias, reverse, sizeof reverse) != VISAGE_OK ||
             reply_rewrite_build(sender, alias, reverse, &rw) != VISAGE_OK) {
             store_log_add(s, msgid, ts, LOG_DIR_OUT, alias, dest, "error");
-            return;
+            return -1;
         }
         /* Persist the reply token -> (original sender, alias) mapping so an
            inbound reply to reply+<token>@domain can be routed back. Without
@@ -415,7 +698,7 @@ static void forward_one(Server *srv, const char *msg, size_t msglen,
         if (store_revmap_add(s, token, sender, alias) != VISAGE_OK) {
             reply_rewrite_free(&rw);
             store_log_add(s, msgid, ts, LOG_DIR_OUT, alias, dest, "error");
-            return;
+            return -1;
         }
         rw_owned = true;
     } else {
@@ -435,59 +718,69 @@ static void forward_one(Server *srv, const char *msg, size_t msglen,
     if (rw_owned) reply_rewrite_free(&rw);
     if (rc != 0) {
         store_log_add(s, msgid, ts, LOG_DIR_OUT, alias, dest, "error");
-        return;
+        return -1;
     }
 
-    sres = smtp_out_send(s, cfg, alias, dest, sanitized, slen,
-                         status, sizeof status);
-    store_log_add(s, msgid, ts, LOG_DIR_OUT, alias, dest, smtp_status_str(sres));
+    rc = queue_enqueue(srv, msgid, k, alias, dest, sanitized, slen);
     mail_free(sanitized);
+    return (rc == 0) ? 0 : -1;
 }
 
 /* Forward a message to every destination of a normal alias, or to the
-   catch-all when the alias is unknown and a catch-all is configured. */
-static void forward_alias(Server *srv, const char *msg, size_t msglen,
-                          const char *sender, const char *rcpt,
-                          uint32_t msgid, uint32_t ts) {
+   catch-all when the alias is unknown and a catch-all is configured.  Returns
+   0 when every required destination was durably enqueued (or no enqueue was
+   required), -1 when resolve failed or any destination could not be enqueued. */
+static int forward_alias(Server *srv, const char *msg, size_t msglen,
+                         const char *sender, const char *rcpt,
+                         uint32_t msgid, uint32_t ts, uint32_t *k) {
     Store *s = srv->store;
     char **dests = NULL;
     size_t ndests = 0, i;
+    int failed = 0;
     const char *remote = sender[0] ? sender : "<>";
 
     if (store_resolve(s, rcpt, &dests, &ndests) != VISAGE_OK) {
         store_log_add(s, msgid, ts, LOG_DIR_IN, rcpt, remote, "error");
-        return;
+        return -1;
     }
     if (ndests == 0) {
         if (srv->cfg->catch_all && srv->cfg->catch_all[0]) {
-            forward_one(srv, msg, msglen, sender, rcpt, srv->cfg->catch_all,
-                        msgid, ts);
+            if (forward_one(srv, msg, msglen, sender, rcpt, srv->cfg->catch_all,
+                            msgid, ts, (*k)++) != 0)
+                failed = 1;
         } else {
             store_log_add(s, msgid, ts, LOG_DIR_IN, rcpt, remote, "rejected");
         }
         store_free_strvec(dests, ndests);
-        return;
+        return failed ? -1 : 0;
     }
     for (i = 0; i < ndests; i++)
-        forward_one(srv, msg, msglen, sender, rcpt, dests[i], msgid, ts);
+        if (forward_one(srv, msg, msglen, sender, rcpt, dests[i], msgid, ts,
+                        (*k)++) != 0)
+            failed = 1;
     store_free_strvec(dests, ndests);
+    return failed ? -1 : 0;
 }
 
 /* Forward an inbound reply (a reply-token recipient) back to the original
    sender: envelope MAIL FROM=alias, RCPT TO=sender; headers From=alias,
    To=sender (the reverse alias is stripped from To/Cc). */
-static void forward_reply(Server *srv, const char *msg, size_t msglen,
-                          const char *alias_addr, const char *dest,
-                          const char *reverse, const char *owner,
-                          uint32_t msgid, uint32_t ts) {
+/* Forward an inbound reply (a reply-token recipient) back to the original
+   sender: envelope MAIL FROM=alias, RCPT TO=sender; headers From=alias,
+   To=sender (the reverse alias is stripped from To/Cc).  Returns 0 when the
+   reply was durably enqueued, -1 when it could not be (sanitize/header/enqueue
+   failure) so the caller can refuse acceptance (451). */
+static int forward_reply(Server *srv, const char *msg, size_t msglen,
+                         const char *alias_addr, const char *dest,
+                         const char *reverse, const char *owner,
+                         uint32_t msgid, uint32_t ts, uint32_t k) {
     Store *s = srv->store;
     const Config *cfg = srv->cfg;
     MailRewrite rw;
     char received[512];
     char *sanitized = NULL;
     size_t slen = 0;
-    char status[128];
-    int sres;
+    int rc;
 
     memset(&rw, 0, sizeof rw);
     rw.from = alias_addr;
@@ -502,21 +795,19 @@ static void forward_reply(Server *srv, const char *msg, size_t msglen,
 
     if (mail_sanitize_for_forward(msg, msglen, &rw, &sanitized, &slen) != 0) {
         store_log_add(s, msgid, ts, LOG_DIR_OUT, alias_addr, dest, "error");
-        return;
+        return -1;
     }
 
     (void)reply_strip_reverse(&sanitized, &slen, reverse);
     if (mail_header_set(&sanitized, &slen, "To", dest) != 0) {
         store_log_add(s, msgid, ts, LOG_DIR_OUT, alias_addr, dest, "error");
         mail_free(sanitized);
-        return;
+        return -1;
     }
 
-    sres = smtp_out_send(s, cfg, alias_addr, dest, sanitized, slen,
-                         status, sizeof status);
-    store_log_add(s, msgid, ts, LOG_DIR_OUT, alias_addr, dest,
-                  smtp_status_str(sres));
+    rc = queue_enqueue(srv, msgid, k, alias_addr, dest, sanitized, slen);
     mail_free(sanitized);
+    return (rc == 0) ? 0 : -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -529,7 +820,9 @@ static void deliver_message(Server *srv, Conn *c, time_t now) {
     char *msg = c->data;
     size_t msglen = c->data_len;
     uint32_t msgid, ts;
+    uint32_t k = 0;   /* per-msgid destination ordinal (0-based, stable) */
     size_t i;
+    int failed = 0;   /* any destination not durably enqueued -> 451 */
 
     if (mail_unstuff_dots(msg, &msglen) != 0) {
         conn_reply(c, "451 4.3.0 Temporary processing error\r\n");
@@ -558,8 +851,9 @@ static void deliver_message(Server *srv, Conn *c, time_t now) {
         char *rep_sender = NULL, *rep_alias = NULL;
         int r = reply_route_inbound(s, cfg, rcpt, &rep_sender, &rep_alias);
         if (r == 1) {
-            forward_reply(srv, msg, msglen, rep_alias, rep_sender, rcpt,
-                          c->from, msgid, ts);
+            if (forward_reply(srv, msg, msglen, rep_alias, rep_sender, rcpt,
+                              c->from, msgid, ts, k++) != 0)
+                failed = 1;
             free(rep_sender);
             free(rep_alias);
             continue;
@@ -569,12 +863,21 @@ static void deliver_message(Server *srv, Conn *c, time_t now) {
         if (r < 0) {
             store_log_add(s, msgid, ts, LOG_DIR_IN, rcpt,
                           c->from && c->from[0] ? c->from : "<>", "error");
+            failed = 1;   /* routing error: not durably accepted */
             continue;
         }
-        forward_alias(srv, msg, msglen, c->from ? c->from : "", rcpt, msgid, ts);
+        if (forward_alias(srv, msg, msglen, c->from ? c->from : "", rcpt,
+                          msgid, ts, &k) != 0)
+            failed = 1;
     }
 
-    conn_reply(c, "250 2.0.0 OK: queued\r\n");
+    /* Refuse acceptance (451) when any destination was not durably enqueued;
+       a partial failure is at-least-once-safe: the client resends, and the
+       already-delivered destinations may be re-delivered (a duplicate, which
+       is within the accepted at-least-once tolerance — the resend gets a fresh
+       msgid, so (msgid,k) does not de-dup across a 451 resend). */
+    conn_reply(c, failed ? "451 4.3.0 Temporary queue failure\r\n"
+                         : "250 2.0.0 OK: queued\r\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -925,6 +1228,22 @@ static int poll_timeout_ms(const Server *srv, time_t now) {
         if (rms > 2147483647) rms = 2147483647;
         if (ms < 0 || rms < ms) ms = rms;
     }
+
+    /* Queue re-drive deadline: wake poll() when the soonest queued next_ts is
+       reached so an otherwise-idle daemon still re-drives on schedule.  A
+       due-now item (next_ts <= now) yields 0 ms -> poll returns immediately.
+       Capped at 30 s (matches the backoff cap). */
+    {
+        uint32_t next_due = store_queue_next_due(srv->store);
+        if (next_due != UINT32_MAX) {
+            uint32_t now32 = (uint32_t)now;
+            uint32_t delta = (next_due > now32) ? (next_due - now32) : 0;
+            int qms;
+            if (delta > 30) delta = 30;
+            qms = (int)(delta * 1000);
+            if (ms < 0 || qms < ms) ms = qms;
+        }
+    }
     return ms;
 }
 
@@ -984,6 +1303,10 @@ static void server_poll(Server *srv) {
                 c->closed = true;
             }
         }
+
+        /* Re-drive any due durable-queue deliveries.  Idempotent and a no-op
+           when nothing is due (full walk, filtered). */
+        queue_redrive(srv);
 
         /* build pollfd array */
         nfds = srv->nconns + 1 + s_nextra;
@@ -1116,6 +1439,12 @@ int smtp_in_main(const Config *c, const Store *s) {
     server_init(&srv, c, (Store *)s);
     srv.listen_fd = make_listener(c);
     if (srv.listen_fd < 0) return VISAGE_ERR;
+
+    /* Startup recovery: reset any delivery left "delivering" by a crash, then
+       drain everything due before serving (at-least-once). */
+    (void)store_queue_reset_delivering((Store *)s);
+    queue_redrive(&srv);
+
     server_poll(&srv);
     close(srv.listen_fd);
     return VISAGE_OK;

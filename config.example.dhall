@@ -5,7 +5,8 @@ in  let Config =
       , listen : { address : Text, port : Natural }
       , limits : { message : Natural, line : Natural, rcpts : Natural
                  , cmd_timeout : Natural, data_timeout : Natural }
-      , relay : { host : Text, port : Natural, auth : Auth, retries : Natural, tls : Text }
+      , relay : { host : Text, port : Natural, auth : Auth, retries : Natural
+                , tls : Text, max_attempts : Natural }
       , storage : { path : Text, spool : Text }
       , reply : { prefix : Text, separator : Text }
       , catch_all : Text
@@ -20,7 +21,7 @@ in  { hostname = "mx.example.com"
               , cmd_timeout = 300, data_timeout = 600 }
    , relay = { host = "127.0.0.1", port = 2526
              , auth = { enabled = False, username = "", password = "" }
-             , retries = 3, tls = "none" }
+             , retries = 3, tls = "none", max_attempts = 100 }
    , storage = { path = "./var/db", spool = "./var/spool" }
    , reply = { prefix = "reply", separator = "+" }
    , catch_all = ""

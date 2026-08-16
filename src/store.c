@@ -20,15 +20,24 @@ struct Store {
 #define REL_REVMAP "revmap"
 #define REL_LOG    "log"
 #define REL_META   "meta"
+#define REL_QUEUE  "queue"
 
 #define AR_DOMAIN 1u
 #define AR_ALIAS  3u
 #define AR_REVMAP 4u
 #define AR_LOG    6u
 #define AR_META   2u
+#define AR_QUEUE  7u
 
 /* meta key that holds the monotonic next-msgid counter (raw u32 value). */
 #define META_KEY_NEXT_MSGID "next_msgid"
+
+/* Queue status strings (interned; they join ok/tempfail/error/rejected as the
+ * shared string table already holds those from the log relation). */
+#define QUEUE_STATUS_QUEUED     "queued"
+#define QUEUE_STATUS_DELIVERING "delivering"
+#define QUEUE_STATUS_DELIVERED  "delivered"
+#define QUEUE_STATUS_PERMFAIL   "permfail"
 
 /* --- small helpers ---------------------------------------------------- */
 
@@ -111,14 +120,17 @@ static int revmap_cb(const uint32_t *cols, uint8_t arity, void *user) {
     return 0;
 }
 
-/* meta read: capture the raw-u32 value (col 1). */
-typedef struct { uint32_t val; int found; } MetaReadCtx;
+/* meta read: collect every raw-u32 value (col 1) for the key.  Normally
+ * exactly 1; 2+ is a recoverable duplicate left by a crash in the
+ * add-first window (self-healed by taking the max in store_next_msgid). */
+enum { META_MAX_ROWS = 16 };
+typedef struct { uint32_t vals[META_MAX_ROWS]; size_t n; } MetaReadCtx;
 static int meta_read_cb(const uint32_t *cols, uint8_t arity, void *user) {
     MetaReadCtx *c = (MetaReadCtx *)user;
     (void)arity;
-    if (!c->found) {
-        c->val = cols[1];   /* raw u32, NOT a sym_id */
-        c->found = 1;
+    if (c->n < META_MAX_ROWS) {
+        c->vals[c->n] = cols[1];   /* raw u32, NOT a sym_id */
+        c->n++;
     }
     return 0;
 }
@@ -139,6 +151,7 @@ Store *store_open(const char *path) {
     if (dl_declare_relation(db, REL_REVMAP, AR_REVMAP) != 0) goto fail;
     if (dl_declare_relation(db, REL_LOG,    AR_LOG)    != 0) goto fail;
     if (dl_declare_relation(db, REL_META,   AR_META)   != 0) goto fail;
+    if (dl_declare_relation(db, REL_QUEUE,  AR_QUEUE)  != 0) goto fail;
 
     s = calloc(1, sizeof *s);
     if (!s) { dl_close(db); return NULL; }
@@ -364,8 +377,9 @@ int store_revmap_resolve(Store *s, const char *token, char **sender,
 uint32_t store_next_msgid(Store *s) {
     uint32_t key, cur = 0, next;
     uint32_t leading[1], cols[2];
-    MetaReadCtx mc = {0, 0};
+    MetaReadCtx mc;
     long n;
+    size_t i;
     int rc;
 
     if (!s || !s->db) return 0;
@@ -374,23 +388,30 @@ uint32_t store_next_msgid(Store *s) {
     if (!key) return 0;
 
     leading[0] = key;
+    memset(&mc, 0, sizeof mc);
     n = dl_prefix(s->db, REL_META, leading, 1, meta_read_cb, &mc);
-    if (n < 0 || n > 1) return 0;   /* >1 => corrupt meta */
-    if (n == 1) cur = mc.val;
+    if (n < 0) return 0;
+
+    /* Self-heal post-crash duplicates by taking the max: the counter skips
+     * ahead monotonically and never reuses a msgid. */
+    for (i = 0; i < mc.n; i++)
+        if (mc.vals[i] > cur) cur = mc.vals[i];
 
     next = cur + 1;
     if (next == 0) return 0;        /* 32-bit counter wrapped */
 
-    if (n == 1) {
-        cols[0] = key;
-        cols[1] = cur;
-        rc = dl_delete_fact(s->db, REL_META, cols, AR_META);
-        if (rc < 0) return 0;
-    }
     cols[0] = key;
     cols[1] = next;
+    /* ADD first (durable), THEN delete the old rows.  A crash between the add
+     * and the deletes leaves a duplicate (new + old), never a loss; the next
+     * call self-heals via the max above. */
     rc = dl_add_fact(s->db, REL_META, cols, AR_META);
     if (rc < 0) return 0;
+    for (i = 0; i < mc.n; i++) {
+        cols[0] = key;
+        cols[1] = mc.vals[i];
+        (void)dl_delete_fact(s->db, REL_META, cols, AR_META);
+    }
 
     return next;
 }
@@ -514,4 +535,259 @@ void store_log_entries_free(StoreLogEntry *e, size_t n) {
         free(e[i].status);
     }
     free(e);
+}
+
+/* --- durable outbound delivery queue ----------------------------------- */
+
+/* Collect every queue tuple matching (msgid,k) for the set_status
+ * transition.  Normally exactly 1; 2+ is a recoverable duplicate left by a
+ * crash in the add-first window (self-healed below). */
+enum { QUEUE_SET_MAX_ROWS = 16 };
+typedef struct { uint32_t rows[QUEUE_SET_MAX_ROWS][7]; size_t n; } QueueReadCtx;
+static int queue_read_cb(const uint32_t *cols, uint8_t arity, void *user) {
+    QueueReadCtx *c = (QueueReadCtx *)user;
+    (void)arity;
+    if (c->n < QUEUE_SET_MAX_ROWS) {
+        memcpy(c->rows[c->n], cols, sizeof(uint32_t) * 7);
+        c->n++;
+    }
+    return 0;
+}
+
+int store_queue_add(Store *s, uint32_t msgid, uint32_t k,
+                    const char *from, const char *to) {
+    uint32_t cols[7];
+    int rc;
+
+    if (!s || !s->db || !from || !from[0] || !to || !to[0])
+        return VISAGE_EPARAM;
+
+    cols[0] = msgid;                                   /* raw u32 */
+    cols[1] = k;                                       /* raw u32 */
+    cols[2] = dl_intern_str(s->db, from);              /* sym */
+    cols[3] = dl_intern_str(s->db, to);                /* sym */
+    cols[4] = 0;                                       /* attempts */
+    cols[5] = 0;                                       /* next_ts  */
+    cols[6] = dl_intern_str(s->db, QUEUE_STATUS_QUEUED); /* sym    */
+    if (!cols[2] || !cols[3] || !cols[6]) return VISAGE_ENOMEM;
+
+    rc = dl_add_fact(s->db, REL_QUEUE, cols, AR_QUEUE);
+    if (rc < 0) return VISAGE_ESTORE;
+    return VISAGE_OK;
+}
+
+int store_queue_set_status(Store *s, uint32_t msgid, uint32_t k,
+                           const char *status, uint32_t attempts,
+                           uint32_t next_ts) {
+    uint32_t leading[2], next[7];
+    QueueReadCtx qc;
+    long n;
+    size_t i, match;
+    int rc;
+
+    if (!s || !s->db || !status || !status[0]) return VISAGE_EPARAM;
+
+    /* Intern the new status BEFORE mutating, so an OOM cannot strand the
+     * delivery in a half-deleted state. */
+    next[6] = dl_intern_str(s->db, status);
+    if (!next[6]) return VISAGE_ENOMEM;
+
+    leading[0] = msgid;
+    leading[1] = k;
+    memset(&qc, 0, sizeof qc);
+    n = dl_prefix(s->db, REL_QUEUE, leading, 2, queue_read_cb, &qc);
+    if (n < 0) return VISAGE_ESTORE;
+    if (qc.n == 0) return VISAGE_ESTORE;   /* no such delivery */
+    /* (qc.n > 1 is a recoverable post-crash duplicate; self-heal below.) */
+
+    next[0] = msgid;
+    next[1] = k;
+    next[2] = qc.rows[0][2];   /* from (preserved sym) */
+    next[3] = qc.rows[0][3];   /* to   (preserved sym) */
+    next[4] = attempts;
+    next[5] = next_ts;
+
+    /* CRASH-SAFETY (at-least-once): each dl_add_fact / dl_delete_fact is
+     * independently WAL-appended + fsync'd, so a delete-then-add sequence
+     * has a window in which a crash LOSES the row (delete persists, add
+     * does not) -> silent message drop, violating at-least-once.  If the
+     * desired `next` row already exists (idempotent transition, or a
+     * crash-dup already holding the target state), keep that one and drop
+     * the rest; otherwise ADD `next` FIRST, THEN delete every old row.
+     * A crash between the add and the deletes now leaves a duplicate
+     * (new + old), which is at-least-once-safe and is collapsed back to a
+     * single row by the next set_status call (self-heal).  No window loses
+     * the delivery. */
+    match = qc.n;
+    for (i = 0; i < qc.n; i++)
+        if (memcmp(next, qc.rows[i], sizeof next) == 0) { match = i; break; }
+    if (match < qc.n) {
+        for (i = 0; i < qc.n; i++)
+            if (i != match)
+                (void)dl_delete_fact(s->db, REL_QUEUE, qc.rows[i], AR_QUEUE);
+        return VISAGE_OK;
+    }
+
+    rc = dl_add_fact(s->db, REL_QUEUE, next, AR_QUEUE);
+    if (rc < 0) return VISAGE_ESTORE;
+    for (i = 0; i < qc.n; i++)
+        (void)dl_delete_fact(s->db, REL_QUEUE, qc.rows[i], AR_QUEUE);
+    return VISAGE_OK;
+}
+
+/* due-walk: filter status == 'queued' && next_ts <= now, then hand
+ * (msgid, k, from, to, attempts) to the caller's callback. */
+typedef struct {
+    Store   *s;
+    uint32_t now;
+    uint32_t queued_id;
+    int    (*cb)(uint32_t msgid, uint32_t k, const char *from, const char *to,
+                 uint32_t attempts, void *user);
+    void   *user;
+    int      err;
+} QueueDueCtx;
+
+static int queue_due_cb(const uint32_t *cols, uint8_t arity, void *user) {
+    QueueDueCtx *c = (QueueDueCtx *)user;
+    const char *from, *to;
+    (void)arity;
+
+    if (cols[6] != c->queued_id) return 0;   /* status != queued */
+    if (cols[5] > c->now) return 0;          /* not yet due */
+
+    from = dl_intern_str_of(c->s->db, cols[2]);
+    to   = dl_intern_str_of(c->s->db, cols[3]);
+    if (!from || !to) { c->err = 1; return 1; }
+
+    if (c->cb(cols[0], cols[1], from, to, cols[4], c->user) != 0) return 1;
+    return 0;
+}
+
+int store_queue_due(Store *s, uint32_t now,
+                    int (*cb)(uint32_t msgid, uint32_t k, const char *from,
+                              const char *to, uint32_t attempts, void *user),
+                    void *user) {
+    QueueDueCtx c;
+    long n;
+
+    if (!s || !s->db || !cb) return VISAGE_EPARAM;
+
+    memset(&c, 0, sizeof c);
+    c.s = s;
+    c.now = now;
+    c.queued_id = dl_intern_str(s->db, QUEUE_STATUS_QUEUED);
+    if (!c.queued_id) return VISAGE_ENOMEM;
+    c.cb = cb;
+    c.user = user;
+
+    n = dl_prefix(s->db, REL_QUEUE, NULL, 0, queue_due_cb, &c);
+    if (n < 0 || c.err) return VISAGE_ESTORE;
+    return VISAGE_OK;
+}
+
+/* count_by_status: full walk, count tuples whose status column matches. */
+typedef struct { uint32_t status_id; long count; } QueueCountCtx;
+static int queue_count_cb(const uint32_t *cols, uint8_t arity, void *user) {
+    QueueCountCtx *c = (QueueCountCtx *)user;
+    (void)arity;
+    if (cols[6] == c->status_id) c->count++;
+    return 0;
+}
+
+long store_queue_count_by_status(Store *s, const char *status) {
+    QueueCountCtx c;
+    long n;
+
+    if (!s || !s->db || !status || !status[0]) return -1;
+
+    c.status_id = dl_intern_str(s->db, status);
+    if (!c.status_id) return -1;
+    c.count = 0;
+
+    n = dl_prefix(s->db, REL_QUEUE, NULL, 0, queue_count_cb, &c);
+    if (n < 0) return -1;
+    return c.count;
+}
+
+/* reset_delivering: full walk collecting (msgid, k, attempts) for status ==
+ * "delivering", then (AFTER the walk returns) reset each back to "queued".
+ * Collect-then-mutate is load-bearing: dafsa add/delete realloc the states
+ * array, so mutating the relation inside a dl_prefix walk is a use-after-free.
+ */
+typedef struct { uint32_t msgid, k, attempts; } DeliveringItem;
+typedef struct {
+    uint32_t        delivering_id;
+    DeliveringItem *items;
+    size_t          n, cap;
+    int             err;
+} DeliveringCtx;
+
+static int delivering_collect_cb(const uint32_t *cols, uint8_t arity,
+                                 void *user) {
+    DeliveringCtx *c = (DeliveringCtx *)user;
+    (void)arity;
+    if (cols[6] != c->delivering_id) return 0;
+    if (c->n == c->cap) {
+        size_t nc = c->cap ? c->cap * 2 : 8;
+        DeliveringItem *na = realloc(c->items, nc * sizeof *na);
+        if (!na) { c->err = 1; return 1; }
+        c->items = na;
+        c->cap = nc;
+    }
+    c->items[c->n].msgid = cols[0];
+    c->items[c->n].k = cols[1];
+    c->items[c->n].attempts = cols[4];
+    c->n++;
+    return 0;
+}
+
+int store_queue_reset_delivering(Store *s) {
+    DeliveringCtx c;
+    long n;
+    size_t i;
+
+    if (!s || !s->db) return VISAGE_EPARAM;
+
+    memset(&c, 0, sizeof c);
+    c.delivering_id = dl_intern_str(s->db, QUEUE_STATUS_DELIVERING);
+    if (!c.delivering_id) return VISAGE_ENOMEM;
+
+    n = dl_prefix(s->db, REL_QUEUE, NULL, 0, delivering_collect_cb, &c);
+    if (n < 0 || c.err) {
+        free(c.items);
+        return c.err ? VISAGE_ENOMEM : VISAGE_ESTORE;
+    }
+
+    for (i = 0; i < c.n; i++) {
+        int rc = store_queue_set_status(s, c.items[i].msgid, c.items[i].k,
+                                        QUEUE_STATUS_QUEUED,
+                                        c.items[i].attempts, 0);
+        if (rc != VISAGE_OK) { free(c.items); return rc; }
+    }
+    free(c.items);
+    return VISAGE_OK;
+}
+
+/* next_due: full walk tracking the minimum next_ts among status == "queued".
+ * Read-only — never mutates the relation. */
+typedef struct { uint32_t queued_id, min_next; } NextDueCtx;
+static int next_due_cb(const uint32_t *cols, uint8_t arity, void *user) {
+    NextDueCtx *c = (NextDueCtx *)user;
+    (void)arity;
+    if (cols[6] == c->queued_id && cols[5] < c->min_next)
+        c->min_next = cols[5];
+    return 0;
+}
+
+uint32_t store_queue_next_due(Store *s) {
+    NextDueCtx c;
+
+    if (!s || !s->db) return UINT32_MAX;
+    c.queued_id = dl_intern_str(s->db, QUEUE_STATUS_QUEUED);
+    if (!c.queued_id) return UINT32_MAX;
+    c.min_next = UINT32_MAX;
+
+    if (dl_prefix(s->db, REL_QUEUE, NULL, 0, next_due_cb, &c) < 0)
+        return UINT32_MAX;
+    return c.min_next;
 }

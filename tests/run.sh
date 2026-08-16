@@ -30,6 +30,10 @@ RELAY_PORT="${RELAY_PORT:-2526}"
 HTTP_PORT="${HTTP_PORT:-8080}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Run from the project root so the TLS relay's relative cert/key paths
+# ("tests/visage-test-*.pem") resolve deterministically regardless of how the
+# harness is invoked.
+cd "$ROOT"
 WORK="$(mktemp -d /tmp/visage-e2e.XXXXXX)"
 DBDIR="$WORK/db"
 SPOOLDIR="$WORK/spool"
@@ -107,6 +111,398 @@ http_ok() {
 body_of() {
     awk 'BEGIN{s=0} /^\r?$/{if(!s){s=1;next}} s==1{print}' "$1" \
         | sed -e '/^[[:space:]]*$/d' | sed -e :a -e '/^\n*$/{$d;N;ba}'
+}
+
+# --- TLS e2e scenarios (S-B3) -----------------------------------------------
+# gen_config emits a full config.dhall with the given SMTP/relay/HTTP ports, the
+# relay TLS mode and auth.enabled, and throwaway absolute storage dirs.
+#   gen_config <outfile> <smtp_port> <relay_port> <relay_tls> <auth_enabled> <http_port> <db> <spool>
+gen_config() {
+    local out="$1" smtp="$2" rport="$3" rtls="$4" authen="$5" hport="$6" db="$7" spool="$8"
+    cat > "$out" <<DHALL
+let Auth = { enabled : Bool, username : Text, password : Text }
+in  let Config =
+      { hostname : Text
+      , domains : List Text
+      , listen : { address : Text, port : Natural }
+      , limits : { message : Natural, line : Natural, rcpts : Natural
+                 , cmd_timeout : Natural, data_timeout : Natural }
+      , relay : { host : Text, port : Natural, auth : Auth, retries : Natural
+                , tls : Text, max_attempts : Natural }
+      , storage : { path : Text, spool : Text }
+      , reply : { prefix : Text, separator : Text }
+      , catch_all : Text
+      , aliases : List { alias : Text, destinations : List Text }
+      , http : { address : Text, port : Natural }
+      , admin : { token : Text }
+      }
+in  { hostname = "mx.example.com"
+   , domains = [ "example.com" ]
+   , listen = { address = "127.0.0.1", port = $smtp }
+   , limits = { message = 26214400, line = 1000, rcpts = 100
+              , cmd_timeout = 300, data_timeout = 600 }
+   , relay = { host = "127.0.0.1", port = $rport
+             , auth = { enabled = $authen, username = "u", password = "p" }
+             , retries = 3, tls = "$rtls", max_attempts = 100 }
+   , storage = { path = "$db", spool = "$spool" }
+   , reply = { prefix = "reply", separator = "+" }
+   , catch_all = ""
+   , aliases = [ { alias = "jane@example.com", destinations = [ "jane@realmail.example" ] }
+               , { alias = "shopping@example.com", destinations = [ "jane@realmail.example", "bob@realmail.example" ] }
+               ]
+   , http = { address = "127.0.0.1", port = $hport }
+   , admin = { token = "change-me" }
+   } : Config
+DHALL
+}
+
+# wait_health <http_port> <daemon_pid> <logfile>; returns 0 when GET /health
+# returns 200 {"ok":true} within ~10s.
+wait_health() {
+    local port="$1" dpid="$2" logf="$3"
+    local i RESP
+    for i in $(seq 1 100); do
+        RESP="$(http_get "$port" /health || true)"
+        if http_ok "$RESP" '"ok":true'; then return 0; fi
+        if ! kill -0 "$dpid" 2>/dev/null; then
+            echo "daemon died (see $logf):"; cat "$logf"
+            return 1
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
+# Scenario: relay.tls='starttls' + a TLS relay_fake.  The daemon must upgrade
+# the connection with STARTTLS and forward the message over the encrypted
+# channel.  Because relay_fake --tls only records traffic it can READ (mbedTLS
+# reads fail on plaintext bytes if the client never upgrades), a non-empty,
+# readable msg-<n>.eml + dialogue-<n>.txt is itself proof TLS was used.
+tls_forward_scenario() {
+    echo
+    echo "== scenario: TLS forward (relay.tls=starttls, relay_fake --tls)"
+    local d="$WORK/tls" db="$WORK/tls/db" spool="$WORK/tls/spool" relay="$WORK/tls/relay"
+    local conf="$WORK/tls/config.dhall" rpid="" dpid=""
+    local SMTP=2535 RELAY=2536 HTTP=8090
+    mkdir -p "$d" "$relay" "$db" "$spool"
+    gen_config "$conf" "$SMTP" "$RELAY" starttls False "$HTTP" "$db" "$spool"
+
+    # Start the TLS relay.  Cert/key paths are relative to ROOT (we cd'd there).
+    "$ROOT/tests/relay_fake.com" --tls "$RELAY" "$relay" >"$d/relay.log" 2>&1 &
+    rpid=$!
+    sleep 0.3
+    if ! kill -0 "$rpid" 2>/dev/null; then
+        fail "TLS: relay_fake --tls failed to start (see $d/relay.log)"
+        return
+    fi
+    "$ROOT/visage.com" daemon -c "$conf" >"$d/daemon.log" 2>&1 &
+    dpid=$!
+    if wait_health "$HTTP" "$dpid" "$d/daemon.log"; then
+        pass "TLS: daemon up (GET /health ok)"
+    else
+        fail "TLS: daemon failed to become healthy"
+        [ -n "$rpid" ] && kill "$rpid" 2>/dev/null
+        return
+    fi
+
+    if "$ROOT/tests/smtptest.com" 127.0.0.1 "$SMTP" sender@foo.org jane@example.com "$WORK/msg1.eml" >"$d/fwd.log" 2>&1; then
+        pass "TLS: smtptest forward accepted"
+    else
+        fail "TLS: smtptest forward failed (see $d/fwd.log)"
+    fi
+
+    local FW="$relay/msg-1.eml" DL="$relay/dialogue-1.txt"
+    if wait_for_file "$FW"; then
+        pass "TLS: relay_fake --tls recorded the decrypted forwarded message"
+        if grep -q '^Received:' "$FW"; then
+            pass "TLS: forwarded message has a Received header"
+        else
+            fail "TLS: forwarded message missing Received header"
+        fi
+        if grep -q 'reply+[0-9a-f]\{32\}@example.com' "$FW"; then
+            pass "TLS: forwarded From/Reply-To use a reverse alias"
+        else
+            fail "TLS: forwarded From/Reply-To are NOT a reverse alias"
+        fi
+        if diff -u <(body_of "$WORK/msg1.eml") <(body_of "$FW") >"$d/body.diff" 2>&1; then
+            pass "TLS: forwarded body matches msg1.eml"
+        else
+            fail "TLS: forwarded body differs from msg1.eml (see $d/body.diff)"
+        fi
+        # The relay_fake only records decrypted traffic: a readable MAIL line +
+        # the STARTTLS-upgrade reply prove the daemon actually used TLS.  (Had it
+        # not upgraded, mbedTLS reads would fail on the plaintext MAIL and no
+        # readable dialogue/body would exist.)
+        if wait_for_file "$DL" && grep -q 'Ready to start TLS' "$DL" \
+           && grep -q 'MAIL FROM:<jane@example.com>' "$DL"; then
+            pass "TLS: dialogue shows STARTTLS upgrade + decrypted MAIL exchange"
+        else
+            fail "TLS: dialogue does not prove TLS was used (see $DL)"
+        fi
+    else
+        fail "TLS: relay_fake --tls did not record a decrypted forwarded message"
+    fi
+
+    [ -n "$dpid" ] && kill "$dpid" 2>/dev/null
+    [ -n "$rpid" ] && kill "$rpid" 2>/dev/null
+    wait "$dpid" 2>/dev/null || true
+    wait "$rpid" 2>/dev/null || true
+}
+
+# Scenario: D2 hard rule.  relay.tls='starttls' + relay.auth.enabled=true, but
+# the relay is a PLAINTEXT relay_fake that advertises no STARTTLS.  The daemon
+# must REFUSE the forward (never send AUTH PLAIN credentials in the clear): the
+# recorded plaintext dialogue must contain no 'AUTH' and the message must NOT be
+# forwarded (no msg file).
+d2_negative_scenario() {
+    echo
+    echo "== scenario: D2 negative (tls=starttls + auth.enabled, plaintext relay)"
+    local d="$WORK/d2" db="$WORK/d2/db" spool="$WORK/d2/spool" relay="$WORK/d2/relay"
+    local conf="$WORK/d2/config.dhall" rpid="" dpid=""
+    local SMTP=2537 RELAY=2538 HTTP=8091
+    mkdir -p "$d" "$relay" "$db" "$spool"
+    gen_config "$conf" "$SMTP" "$RELAY" starttls True "$HTTP" "$db" "$spool"
+
+    # PLAINTEXT relay_fake: single-line EHLO reply, no STARTTLS advertised.
+    "$ROOT/tests/relay_fake.com" "$RELAY" "$relay" >"$d/relay.log" 2>&1 &
+    rpid=$!
+    sleep 0.3
+    if ! kill -0 "$rpid" 2>/dev/null; then
+        fail "D2: plaintext relay_fake failed to start (see $d/relay.log)"
+        return
+    fi
+    "$ROOT/visage.com" daemon -c "$conf" >"$d/daemon.log" 2>&1 &
+    dpid=$!
+    if wait_health "$HTTP" "$dpid" "$d/daemon.log"; then
+        pass "D2: daemon up"
+    else
+        fail "D2: daemon failed to become healthy"
+        [ -n "$rpid" ] && kill "$rpid" 2>/dev/null
+        return
+    fi
+
+    # Send a message: the daemon accepts it (queued), then the outbound forward
+    # attempt must be refused by the D2 rule before any AUTH/MAIL goes out.
+    if "$ROOT/tests/smtptest.com" 127.0.0.1 "$SMTP" sender@foo.org jane@example.com "$WORK/msg1.eml" >"$d/fwd.log" 2>&1; then
+        pass "D2: smtptest forward accepted (queued)"
+    else
+        fail "D2: smtptest forward failed (see $d/fwd.log)"
+    fi
+
+    local DL="$relay/dialogue-1.txt"
+    if wait_for_file "$DL"; then
+        pass "D2: daemon connected to the plaintext relay (forward attempted)"
+        if grep -qi 'AUTH' "$DL"; then
+            fail "D2: FAIL — AUTH sent over plaintext (see $DL)"
+        else
+            pass "D2: no AUTH command in the plaintext dialogue"
+        fi
+        if [ -s "$relay/msg-1.eml" ]; then
+            fail "D2: FAIL — message was forwarded over plaintext despite no STARTTLS"
+        else
+            pass "D2: message was NOT forwarded to the plaintext relay"
+        fi
+    else
+        fail "D2: daemon did not attempt to reach the relay"
+    fi
+
+    [ -n "$dpid" ] && kill "$dpid" 2>/dev/null
+    [ -n "$rpid" ] && kill "$rpid" 2>/dev/null
+    wait "$dpid" 2>/dev/null || true
+    wait "$rpid" 2>/dev/null || true
+}
+
+# --- durable-queue e2e scenarios (S-A3) -----------------------------------
+# These prove at-least-once DURABLE delivery via the spool-file lifecycle (the
+# observable proxy for queued->delivered).  The daemon spools the sanitized
+# outbound body to <spool>/<msgid>.<k>.out.eml at enqueue time and unlinks it
+# once the relay accepts the message (status 'delivered'); the raw inbound
+# <msgid>.eml is never removed.  There is no CLI that exposes queue status, so
+# "queued" == .out.eml present, "delivered" == .out.eml gone.
+#
+# Print the path of the newest durable outbound spool file, or return nonzero
+# if none exists yet.
+newest_out_eml() {
+    local spool="$1" f
+    f="$(ls -t "$spool"/*.out.eml 2>/dev/null | head -n1 || true)"
+    if [ -n "$f" ] && [ -s "$f" ]; then
+        printf '%s\n' "$f"
+        return 0
+    fi
+    return 1
+}
+
+# Scenario: OUTAGE -> RE-DRIVE (same daemon, no restart).  The relay port is
+# initially DOWN (nothing listening): the daemon must durably accept + spool the
+# message (250), keep it queued while the relay is unreachable, then re-drive
+# and deliver it once relay_fake comes up — at-least-once without a restart.
+outage_redrive_scenario() {
+    echo
+    echo "== scenario: outage -> re-drive (same daemon, no restart)"
+    local d="$WORK/outage" db="$WORK/outage/db" spool="$WORK/outage/spool"
+    local relay="$WORK/outage/relay" conf="$WORK/outage/config.dhall"
+    local dpid="" rpid="" i
+    local SMTP=2540 RELAY=2541 HTTP=8092
+    mkdir -p "$d" "$relay" "$db" "$spool"
+    gen_config "$conf" "$SMTP" "$RELAY" none False "$HTTP" "$db" "$spool"
+
+    # Relay port is intentionally DOWN: do NOT start relay_fake yet.
+    "$ROOT/visage.com" daemon -c "$conf" >"$d/daemon.log" 2>&1 &
+    dpid=$!
+    if wait_health "$HTTP" "$dpid" "$d/daemon.log"; then
+        pass "OUTAGE: daemon up (relay port $RELAY down)"
+    else
+        fail "OUTAGE: daemon failed to become healthy"
+        return
+    fi
+
+    if "$ROOT/tests/smtptest.com" 127.0.0.1 "$SMTP" sender@foo.org jane@example.com \
+            "$WORK/msg1.eml" >"$d/fwd.log" 2>&1; then
+        pass "OUTAGE: smtptest forward accepted (250; durably queued)"
+    else
+        fail "OUTAGE: smtptest forward failed (see $d/fwd.log)"
+        [ -n "$dpid" ] && kill "$dpid" 2>/dev/null
+        return
+    fi
+
+    local OUT=""
+    if OUT="$(newest_out_eml "$spool")"; then
+        pass "OUTAGE: message spooled to $(basename "$OUT") (queued)"
+    else
+        fail "OUTAGE: no outbound spool file appeared in $spool"
+        [ -n "$dpid" ] && kill "$dpid" 2>/dev/null
+        return
+    fi
+    # Relay is still down: nothing must have been delivered yet.
+    if [ -e "$relay/msg-1.eml" ]; then
+        fail "OUTAGE: FAIL — message delivered while relay was down"
+    else
+        pass "OUTAGE: not delivered while relay is down (stays queued)"
+    fi
+
+    # Bring the (plaintext) relay up on the previously-down port.
+    "$ROOT/tests/relay_fake.com" "$RELAY" "$relay" >"$d/relay.log" 2>&1 &
+    rpid=$!
+    sleep 0.3
+    if kill -0 "$rpid" 2>/dev/null; then
+        pass "OUTAGE: relay_fake now listening on $RELAY"
+        # Re-drive tick cap is 30s, so allow ~45s for delivery.
+        for i in $(seq 1 450); do
+            [ -s "$relay/msg-1.eml" ] && [ ! -e "$OUT" ] && break
+            sleep 0.1
+        done
+        if [ -s "$relay/msg-1.eml" ]; then
+            pass "OUTAGE: relay_fake recorded the forwarded message (re-driven)"
+            if [ ! -e "$OUT" ]; then
+                pass "OUTAGE: queue reached delivered (spool removed)"
+            else
+                fail "OUTAGE: relay got the message but spool file still present"
+            fi
+        else
+            fail "OUTAGE: relay_fake did not record the message within the re-drive window"
+        fi
+    else
+        fail "OUTAGE: relay_fake failed to start (see $d/relay.log)"
+    fi
+
+    [ -n "$dpid" ] && kill "$dpid" 2>/dev/null
+    [ -n "$rpid" ] && kill "$rpid" 2>/dev/null
+    wait "$dpid" 2>/dev/null || true
+    wait "$rpid" 2>/dev/null || true
+}
+
+# Scenario: RESTART persistence (crash recovery).  With the relay down the daemon
+# durably queues the message; killing the daemon while it is queued must NOT lose
+# it.  On restart with the SAME storage dir, the leftover 'queued' row is drained
+# at boot (reset_delivering + queue_redrive) and the message delivered —
+# crash-survivable at-least-once.
+restart_persistence_scenario() {
+    echo
+    echo "== scenario: restart persistence (crash while queued)"
+    local d="$WORK/restart" db="$WORK/restart/db" spool="$WORK/restart/spool"
+    local relay="$WORK/restart/relay" conf="$WORK/restart/config.dhall"
+    local dpid="" rpid="" i
+    local SMTP=2543 RELAY=2544 HTTP=8093
+    mkdir -p "$d" "$relay" "$db" "$spool"
+    gen_config "$conf" "$SMTP" "$RELAY" none False "$HTTP" "$db" "$spool"
+
+    # Relay down initially: queue the message, then kill the daemon.
+    "$ROOT/visage.com" daemon -c "$conf" >"$d/daemon1.log" 2>&1 &
+    dpid=$!
+    if wait_health "$HTTP" "$dpid" "$d/daemon1.log"; then
+        pass "RESTART: daemon up (relay down)"
+    else
+        fail "RESTART: daemon failed to become healthy"
+        return
+    fi
+
+    if "$ROOT/tests/smtptest.com" 127.0.0.1 "$SMTP" sender@foo.org jane@example.com \
+            "$WORK/msg1.eml" >"$d/fwd.log" 2>&1; then
+        pass "RESTART: smtptest forward accepted (250; durably queued)"
+    else
+        fail "RESTART: smtptest forward failed (see $d/fwd.log)"
+        [ -n "$dpid" ] && kill "$dpid" 2>/dev/null
+        return
+    fi
+
+    local OUT=""
+    if OUT="$(newest_out_eml "$spool")"; then
+        pass "RESTART: message spooled to $(basename "$OUT") (queued)"
+    else
+        fail "RESTART: no outbound spool file appeared in $spool"
+        [ -n "$dpid" ] && kill "$dpid" 2>/dev/null
+        return
+    fi
+
+    # Kill the daemon while it is still queued (relay unreachable).
+    kill "$dpid" 2>/dev/null
+    wait "$dpid" 2>/dev/null || true
+    dpid=""
+    pass "RESTART: daemon killed (SIGTERM) while message queued"
+    if [ -e "$OUT" ]; then
+        pass "RESTART: queued spool body survived the daemon death"
+    else
+        fail "RESTART: queued spool body was lost on daemon death"
+    fi
+
+    # Relay comes up; daemon restarts with the SAME storage -> drains at boot.
+    "$ROOT/tests/relay_fake.com" "$RELAY" "$relay" >"$d/relay.log" 2>&1 &
+    rpid=$!
+    sleep 0.3
+    if ! kill -0 "$rpid" 2>/dev/null; then
+        fail "RESTART: relay_fake failed to start (see $d/relay.log)"
+    fi
+    "$ROOT/visage.com" daemon -c "$conf" >"$d/daemon2.log" 2>&1 &
+    dpid=$!
+    if wait_health "$HTTP" "$dpid" "$d/daemon2.log"; then
+        pass "RESTART: daemon restarted (same storage)"
+    else
+        fail "RESTART: restarted daemon failed to become healthy"
+        [ -n "$rpid" ] && kill "$rpid" 2>/dev/null
+        [ -n "$dpid" ] && kill "$dpid" 2>/dev/null
+        return
+    fi
+
+    # Startup drain re-drives the leftover 'queued'; allow the re-drive window.
+    for i in $(seq 1 450); do
+        [ -s "$relay/msg-1.eml" ] && [ ! -e "$OUT" ] && break
+        sleep 0.1
+    done
+    if [ -s "$relay/msg-1.eml" ]; then
+        pass "RESTART: relay_fake recorded the message after restart"
+        if [ ! -e "$OUT" ]; then
+            pass "RESTART: queue reached delivered (spool removed)"
+        else
+            fail "RESTART: relay got the message but spool file still present"
+        fi
+    else
+        fail "RESTART: relay_fake did not record the message after restart"
+    fi
+
+    [ -n "$dpid" ] && kill "$dpid" 2>/dev/null
+    [ -n "$rpid" ] && kill "$rpid" 2>/dev/null
+    wait "$dpid" 2>/dev/null || true
+    wait "$rpid" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
@@ -242,6 +638,16 @@ if http_ok "$RESP" '"ok":true'; then
 else
     fail "GET /health returned unexpected response: $RESP"
 fi
+
+# (S-B3) TLS forward scenario ------------------------------------------------
+tls_forward_scenario
+
+# (S-B3) D2 negative scenario ------------------------------------------------
+d2_negative_scenario
+
+# (S-A3) durable-queue scenarios ---------------------------------------------
+outage_redrive_scenario
+restart_persistence_scenario
 
 # ---------------------------------------------------------------------------
 echo

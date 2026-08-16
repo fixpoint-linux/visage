@@ -16,6 +16,7 @@
  * Exit codes: 0 success, 1 runtime error, 2 usage/config error. */
 #include "visage.h"
 #include "json.h"
+#include "smtp.h"
 
 #include <sys/socket.h>
 #include <netdb.h>
@@ -158,6 +159,12 @@ static const char *resp_body(const char *resp) {
 /* ------------------------------------------------------------------ */
 
 static int cmd_daemon(const Config *cfg) {
+    if (smtp_tls_valid(cfg->relay.tls) != 0) {
+        fprintf(stderr, "visage: relay.tls must be \"none\" or \"starttls\" "
+                        "(got '%s')\n", cfg->relay.tls ? cfg->relay.tls : "");
+        return 1;
+    }
+
     Store *s = store_open(cfg->storage.path);
     if (!s) {
         fprintf(stderr, "visage: cannot open store at '%s'\n", cfg->storage.path);
@@ -198,6 +205,12 @@ static int cmd_config_check(const Config *cfg) {
     }
     if (!cfg->admin.token || !cfg->admin.token[0]) {
         fprintf(stderr, "visage: config-check: missing admin token\n");
+        ok = 0;
+    }
+    if (smtp_tls_valid(cfg->relay.tls) != 0) {
+        fprintf(stderr,
+                "visage: config-check: relay.tls must be \"none\" or "
+                "\"starttls\"\n");
         ok = 0;
     }
     if (!ok) return 1;

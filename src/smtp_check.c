@@ -183,6 +183,51 @@ static void rcpt_decision_test(void) {
     (void)store_close(s);
 }
 
+/* ---- outbound STARTTLS pure helpers (S-B2) ---- */
+
+static void tls_valid_test(void) {
+    EXPECT(smtp_tls_valid("none") == 0, "tls_valid accepts none");
+    EXPECT(smtp_tls_valid("starttls") == 0, "tls_valid accepts starttls");
+    EXPECT(smtp_tls_valid("starttls-verify") == -1,
+           "tls_valid rejects starttls-verify");
+    EXPECT(smtp_tls_valid("tls") == -1, "tls_valid rejects tls");
+    EXPECT(smtp_tls_valid("") == -1, "tls_valid rejects empty");
+    EXPECT(smtp_tls_valid(NULL) == -1, "tls_valid rejects NULL");
+}
+
+static void cap_test(void) {
+    /* STARTTLS on the final "250 " line */
+    const char *r1 = "250-localhost\r\n250-8BITMIME\r\n250 STARTTLS\r\n";
+    EXPECT(smtp_reply_has_cap(r1, strlen(r1), "STARTTLS"),
+           "cap: STARTTLS on final 250 line");
+
+    /* STARTTLS on a "250-" continuation line */
+    const char *r2 =
+        "250-localhost\r\n250-STARTTLS\r\n250-8BITMIME\r\n250 OK\r\n";
+    EXPECT(smtp_reply_has_cap(r2, strlen(r2), "STARTTLS"),
+           "cap: STARTTLS on a 250- continuation line");
+
+    /* match is case-insensitive */
+    const char *r3 = "250-localhost\r\n250 starttls\r\n";
+    EXPECT(smtp_reply_has_cap(r3, strlen(r3), "STARTTLS"),
+           "cap: STARTTLS match is case-insensitive");
+
+    /* not advertised -> false */
+    const char *r4 = "250-localhost\r\n250-8BITMIME\r\n250 SIZE 100000\r\n";
+    EXPECT(!smtp_reply_has_cap(r4, strlen(r4), "STARTTLS"),
+           "cap: STARTTLS absent -> false");
+
+    /* no prefix false-positive on a longer keyword */
+    const char *r5 = "250-STARTTLSFOO\r\n";
+    EXPECT(!smtp_reply_has_cap(r5, strlen(r5), "STARTTLS"),
+           "cap: no prefix match on STARTTLSFOO");
+
+    EXPECT(!smtp_reply_has_cap("", 0, "STARTTLS"), "cap: empty reply -> false");
+    EXPECT(!smtp_reply_has_cap(NULL, 0, "STARTTLS"), "cap: NULL reply -> false");
+    EXPECT(!smtp_reply_has_cap("250 OK\r\n", 7, ""), "cap: empty cap -> false");
+    EXPECT(!smtp_reply_has_cap("250 OK\r\n", 7, NULL), "cap: NULL cap -> false");
+}
+
 int main(void) {
     /* base64 known vectors (RFC 4648) */
     b64_test("", 0, "", "base64 empty");
@@ -209,6 +254,18 @@ int main(void) {
                SMTP_ERROR == 3,
            "status enum values");
 
+    /* backoff cadence (shared by smtp_out in-attempt retry + durable-queue
+       across-attempt re-drive) */
+    EXPECT(smtp_backoff_sec(1) == 1, "backoff_sec 1 -> 1s");
+    EXPECT(smtp_backoff_sec(2) == 2, "backoff_sec 2 -> 2s");
+    EXPECT(smtp_backoff_sec(3) == 4, "backoff_sec 3 -> 4s");
+    EXPECT(smtp_backoff_sec(4) == 8, "backoff_sec 4 -> 8s");
+    EXPECT(smtp_backoff_sec(5) == 16, "backoff_sec 5 -> 16s");
+    EXPECT(smtp_backoff_sec(6) == 32, "backoff_sec 6 -> 32s");
+    EXPECT(smtp_backoff_sec(12) == 2048, "backoff_sec 12 -> 2048s");
+    EXPECT(smtp_backoff_sec(13) == 3600, "backoff_sec 13 -> capped 3600s");
+    EXPECT(smtp_backoff_sec(100) == 3600, "backoff_sec 100 -> capped 3600s");
+
     /* reply-code parsing */
     {
         int code = 0;
@@ -232,6 +289,10 @@ int main(void) {
     /* smtp_in pure decision logic (no sockets) */
     size_parse_test();
     rcpt_decision_test();
+
+    /* outbound STARTTLS pure helpers (S-B2) */
+    tls_valid_test();
+    cap_test();
 
     printf("\n%d checks, %d failed\n", nchecks, nfails);
     return nfails ? 1 : 0;

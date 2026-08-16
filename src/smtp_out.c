@@ -1,20 +1,31 @@
-/* smtp_out.c — outbound SMTP relay client (slice S4).
+/* smtp_out.c — outbound SMTP relay client (slice S4, STARTTLS added S-B2).
  *
  * Full delivery dialogue against Config.relay:
- *   connect (bounded timeout) -> 220 greeting -> EHLO -> [AUTH PLAIN] ->
- *   MAIL FROM -> RCPT TO -> DATA -> dot-stuffed body -> CRLF.CRLF ->
- *   final reply -> QUIT -> close.
+ *   connect (bounded timeout) -> 220 greeting -> EHLO -> [STARTTLS] ->
+ *   [AUTH PLAIN] -> MAIL FROM -> RCPT TO -> DATA -> dot-stuffed body ->
+ *   CRLF.CRLF -> final reply -> QUIT -> close.
+ *
+ * STARTTLS (relay.tls == "starttls", opportunistic): after EHLO, if the relay
+ * advertises STARTTLS (any line of the full multi-line EHLO reply), we send
+ * "STARTTLS", expect 220, then run an mbedTLS 1.2 handshake over the SAME
+ * blocking fd (authmode VERIFY_NONE + SNI via relay.host; protects against
+ * passive snooping only), then re-EHLO over TLS (RFC 3207) and continue.  If
+ * STARTTLS is NOT advertised (or the STARTTLS command is refused) we fall back
+ * to plaintext — EXCEPT the hard rule: when relay.tls == "starttls" AND
+ * relay.auth.enabled, we REFUSE the fallback (SMTP_PERMFAIL, "refusing to send
+ * AUTH over plaintext") so AUTH PLAIN credentials are never sent in the clear.
+ * relay.tls == "none" is the unchanged plaintext path (byte-identical).
  *
  * Reply-code mapping: 2xx/3xx = ok, 4xx = tempfail, 5xx = permfail. Connect
  * failures and 4xx replies are retried up to Config.relay.retries additional
  * times with exponential backoff; 5xx is permanent and is never retried.
- * STARTTLS is deferred: any Config.relay.tls other than "none" is rejected
- * with SMTP_ERROR ("tls not supported").
  *
  * Bounds: every server line is capped at SMTP_MAX_LINE bytes; each read/write
  * is bounded by Config.limits.cmd_timeout (the DATA payload uses data_timeout,
  * falling back to cmd_timeout); the connect uses a fixed
- * SMTP_CONNECT_TIMEOUT_MS. No unbounded buffers are used. */
+ * SMTP_CONNECT_TIMEOUT_MS; the TLS BIO callbacks are poll-bounded with those
+ * same timeouts (blocking sockets, so recv/send never return EAGAIN).  No
+ * unbounded buffers are used. */
 #include "visage.h"
 #include "smtp.h"
 #include "mail.h"
@@ -24,10 +35,16 @@
 #include <poll.h>
 #include <fcntl.h>
 
+#include "mbedtls/ssl.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/ctr_drbg.h"
+#include "mbedtls/error.h"
+
 #define SMTP_CONNECT_TIMEOUT_MS 10000  /* bounded connect timeout (10 s)   */
 #define SMTP_DEFAULT_TIMEOUT    60     /* fallback when a *timeout == 0     */
 #define SMTP_MAX_CRED_LEN       4096   /* sanity cap on AUTH PLAIN payload  */
 #define SMTP_WRITE_CHUNK        65536  /* bound each blocking send()        */
+#define SMTP_MAX_REPLY          16384  /* cap on a full multi-line EHLO reply */
 
 static const char b64_tab[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -123,20 +140,228 @@ static int timeout_ms(uint32_t seconds) {
     return (int)ms;
 }
 
+/* Validate relay.tls ∈ {"none", "starttls"}.  Pure; unit-tested. */
+int smtp_tls_valid(const char *tls) {
+    if (!tls) return -1;
+    if (strcmp(tls, "none") == 0) return 0;
+    if (strcmp(tls, "starttls") == 0) return 0;
+    return -1;
+}
+
+/* Does the multi-line SMTP reply advertise capability `cap`?  `reply` is the
+   raw reply text (each line begins with a 3-digit code + ' ' or '-' and is
+   '\n'- or '\r'-terminated).  Matching is a case-insensitive, whole-keyword
+   comparison against the whitespace-delimited tokens in the text that follows
+   the "ddd " / "ddd-" prefix of each line — so "STARTTLS" is found whether it
+   appears on a continuation line or on the final line (some servers put it
+   last).  Pure — no I/O. */
+bool smtp_reply_has_cap(const char *reply, size_t len, const char *cap) {
+    if (!reply || !cap) return false;
+    size_t capn = strlen(cap);
+    if (capn == 0) return false;
+
+    size_t i = 0;
+    while (i < len) {
+        size_t line_start = i;
+        while (i < len && reply[i] != '\n') i++;
+        size_t line_end = i;                 /* at '\n' or len */
+        if (i < len) i++;                    /* skip the '\n' */
+
+        size_t llen = line_end - line_start;
+        if (llen < 4) continue;
+        const char *lp = reply + line_start;
+        if (lp[0] < '0' || lp[0] > '9' || lp[1] < '0' || lp[1] > '9' ||
+            lp[2] < '0' || lp[2] > '9') continue;
+        if (lp[3] != ' ' && lp[3] != '-') continue;
+
+        /* tokenize the text after "ddd " / "ddd-" */
+        size_t p = line_start + 4;
+        while (p < line_end) {
+            while (p < line_end &&
+                   (reply[p] == ' ' || reply[p] == '\t' || reply[p] == '\r'))
+                p++;
+            size_t tok = p;
+            while (p < line_end &&
+                   !(reply[p] == ' ' || reply[p] == '\t' || reply[p] == '\r'))
+                p++;
+            size_t tlen = p - tok;
+            if (tlen != capn) continue;
+            size_t k;
+            for (k = 0; k < capn; k++) {
+                int a = (reply[tok + k] >= 'A' && reply[tok + k] <= 'Z')
+                            ? reply[tok + k] + ('a' - 'A') : reply[tok + k];
+                int b = (cap[k] >= 'A' && cap[k] <= 'Z')
+                            ? cap[k] + ('a' - 'A') : cap[k];
+                if (a != b) break;
+            }
+            if (k == capn) return true;
+        }
+    }
+    return false;
+}
+
+/* Copy the first reply line's text (after the "ddd " / "ddd-" prefix) into
+   out for a human-readable status message. */
+static void reply_first_text(const char *reply, size_t len, char *out,
+                             size_t outsz) {
+    if (!out || outsz == 0) return;
+    out[0] = '\0';
+    if (!reply || len < 4) return;
+    size_t end = 0;
+    while (end < len && reply[end] != '\n' && reply[end] != '\r') end++;
+    size_t start = 4;
+    size_t copylen = (end > start) ? (end - start) : 0;
+    if (copylen > outsz - 1) copylen = outsz - 1;
+    memcpy(out, reply + start, copylen);
+    out[copylen] = '\0';
+}
+
+/* ------------------------------------------------------------------ */
+/* TLS connection state                                               */
+/* ------------------------------------------------------------------ */
+
+/* A relay connection: the fd plus optional in-place TLS state.  tls is false
+   until the STARTTLS handshake completes; the I/O primitives below dispatch on
+   it (read/send vs mbedtls_ssl_read/mbedtls_ssl_write). */
+typedef struct SmtpConn {
+    int        fd;
+    bool       tls;              /* handshake completed; speak TLS           */
+    uint32_t   tmo;              /* current op timeout (s) for the BIO poll  */
+    mbedtls_ssl_context ssl;     /* in-place storage (valid once setup'd)    */
+} SmtpConn;
+
+/* Process-wide mbedTLS state, seeded lazily and once (single-threaded daemon;
+   smtp_out_send may be called repeatedly).  The SSL config is shared across
+   connections: it is read-only after setup and every connection uses the same
+   CLIENT / VERIFY_NONE / TLS1.2 settings. */
+static mbedtls_entropy_context g_entropy;
+static mbedtls_ctr_drbg_context g_drbg;
+static mbedtls_ssl_config     g_ssl_conf;
+static bool g_tls_ready = false;
+static int  g_tls_status = 0;   /* 0 = ok, else the mbedTLS seed/setup error */
+
+/* Idempotent one-time mbedTLS init.  Returns 0, or the mbedTLS error. */
+static int smtp_tls_global_init(void) {
+    if (g_tls_ready) return g_tls_status;
+
+    mbedtls_entropy_init(&g_entropy);
+    mbedtls_ctr_drbg_init(&g_drbg);
+    mbedtls_ssl_config_init(&g_ssl_conf);
+
+    const char pers[] = "visage_smtp_out";
+    int r = mbedtls_ctr_drbg_seed(&g_drbg, mbedtls_entropy_func, &g_entropy,
+                                  (const unsigned char *)pers, sizeof pers - 1);
+    if (r == 0)
+        r = mbedtls_ssl_config_defaults(&g_ssl_conf, MBEDTLS_SSL_IS_CLIENT,
+                                        MBEDTLS_SSL_TRANSPORT_STREAM,
+                                        MBEDTLS_SSL_PRESET_DEFAULT);
+    if (r == 0) {
+        mbedtls_ssl_conf_rng(&g_ssl_conf, mbedtls_ctr_drbg_random, &g_drbg);
+        mbedtls_ssl_conf_authmode(&g_ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
+        mbedtls_ssl_conf_min_tls_version(&g_ssl_conf,
+                                         MBEDTLS_SSL_VERSION_TLS1_2);
+        mbedtls_ssl_conf_max_tls_version(&g_ssl_conf,
+                                         MBEDTLS_SSL_VERSION_TLS1_2);
+    }
+
+    g_tls_status = r;
+    g_tls_ready = true;   /* do not re-seed on every attempt */
+    return r;
+}
+
+/* mbedTLS BIO callbacks: blocking, poll-bounded (the production contract).
+   ctx is the SmtpConn carrying the fd + the current operation timeout.  On
+   poll timeout return MBEDTLS_ERR_SSL_TIMEOUT (from ssl.h; NOT the NET_* codes
+   in net_sockets.h, which we do not compile).  recv()==0 is EOF -> return 0
+   per the mbedTLS contract.  EINTR loops; the fd stays BLOCKING so recv/send
+   never return EAGAIN. */
+static int bio_recv(void *ctx, unsigned char *buf, size_t len) {
+    SmtpConn *c = ctx;
+    for (;;) {
+        struct pollfd pfd;
+        pfd.fd = c->fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, timeout_ms(c->tmo));
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+        }
+        if (pr == 0) return MBEDTLS_ERR_SSL_TIMEOUT;
+        ssize_t r = recv(c->fd, buf, len, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+        }
+        if (r == 0) return 0;               /* EOF */
+        return (int)r;
+    }
+}
+
+static int bio_send(void *ctx, const unsigned char *buf, size_t len) {
+    SmtpConn *c = ctx;
+    size_t chunk = len;
+    if (chunk > SMTP_WRITE_CHUNK) chunk = SMTP_WRITE_CHUNK;
+    for (;;) {
+        struct pollfd pfd;
+        pfd.fd = c->fd;
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, timeout_ms(c->tmo));
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+        }
+        if (pr == 0) return MBEDTLS_ERR_SSL_TIMEOUT;
+        ssize_t w = send(c->fd, buf, chunk, MSG_NOSIGNAL);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+        }
+        if (w == 0) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+        return (int)w;                      /* partial write is fine */
+    }
+}
+
+/* Initialise a connection around an already-connected blocking fd. */
+static void smtp_conn_init(SmtpConn *conn, int fd) {
+    conn->fd = fd;
+    conn->tls = false;
+    conn->tmo = 0;
+    mbedtls_ssl_init(&conn->ssl);
+}
+
+/* Close a connection: send TLS close_notify (best effort) on the success
+   path, free any TLS state, then close the fd.  Safe on the plaintext path
+   (tls == false) and on an init-only/partially-setup ssl context. */
+static void smtp_conn_close(SmtpConn *conn, bool graceful) {
+    if (!conn) return;
+    if (conn->tls && graceful)
+        (void)mbedtls_ssl_close_notify(&conn->ssl);
+    mbedtls_ssl_free(&conn->ssl);
+    if (conn->fd >= 0) close(conn->fd);
+    conn->fd = -1;
+}
+
 /* ------------------------------------------------------------------ */
 /* Bounded I/O primitives                                             */
 /* ------------------------------------------------------------------ */
 
-/* Read one CRLF-terminated line (tolerating a bare LF) into buf[0..bufsz).
-   Returns 0 and sets *outlen (including the terminator) on success; -1 on
-   timeout, EOF, I/O error, or a line that would exceed bufsz bytes. */
-static int smtp_read_line(int fd, uint32_t tmo, char *buf, size_t bufsz,
-                          size_t *outlen) {
-    size_t n = 0;
+/* Read one byte with a bounded timeout.  Returns 1 (byte stored in *b), 0
+   (EOF), -1 (timeout/error).  The TLS path dispatches to mbedtls_ssl_read,
+   whose BIO callbacks enforce the timeout; the plaintext path polls + reads
+   directly (byte-identical to the original smtp_read_line inner loop). */
+static int conn_read_byte(SmtpConn *conn, uint32_t tmo, unsigned char *b) {
+    if (conn->tls) {
+        conn->tmo = tmo;
+        int r = mbedtls_ssl_read(&conn->ssl, b, 1);
+        if (r == 1) return 1;
+        if (r == 0 || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return 0;
+        return -1;   /* MBEDTLS_ERR_SSL_TIMEOUT (propagated) or other error */
+    }
     for (;;) {
-        if (n >= bufsz) return -1;                 /* line too long */
         struct pollfd pfd;
-        pfd.fd = fd;
+        pfd.fd = conn->fd;
         pfd.events = POLLIN;
         pfd.revents = 0;
         int pr = poll(&pfd, 1, timeout_ms(tmo));
@@ -144,14 +369,62 @@ static int smtp_read_line(int fd, uint32_t tmo, char *buf, size_t bufsz,
             if (errno == EINTR) continue;
             return -1;
         }
-        if (pr == 0) return -1;                    /* timed out */
-        ssize_t r = read(fd, buf + n, 1);
+        if (pr == 0) return -1;                /* timed out */
+        ssize_t r = read(conn->fd, b, 1);
         if (r < 0) {
             if (errno == EINTR) continue;
             return -1;
         }
-        if (r == 0) return -1;                     /* EOF */
-        n++;
+        if (r == 0) return 0;                  /* EOF */
+        return 1;
+    }
+}
+
+/* Send up to len bytes (may be partial).  Returns bytes sent (>0) or -1 on
+   timeout/error.  The plaintext path is byte-identical to the original
+   smtp_write_all inner loop (poll POLLOUT, send up to SMTP_WRITE_CHUNK). */
+static ssize_t conn_send(SmtpConn *conn, const char *buf, size_t len,
+                         uint32_t tmo) {
+    if (conn->tls) {
+        conn->tmo = tmo;
+        int w = mbedtls_ssl_write(&conn->ssl, (const unsigned char *)buf, len);
+        if (w > 0) return (ssize_t)w;
+        return -1;   /* MBEDTLS_ERR_SSL_TIMEOUT (propagated) or other error */
+    }
+    size_t chunk = len;
+    if (chunk > SMTP_WRITE_CHUNK) chunk = SMTP_WRITE_CHUNK;
+    for (;;) {
+        struct pollfd pfd;
+        pfd.fd = conn->fd;
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, timeout_ms(tmo));
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (pr == 0) return -1;                /* timed out */
+        ssize_t w = send(conn->fd, buf, chunk, MSG_NOSIGNAL);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (w == 0) return -1;
+        return w;
+    }
+}
+
+/* Read one CRLF-terminated line (tolerating a bare LF) into buf[0..bufsz).
+   Returns 0 and sets *outlen (including the terminator) on success; -1 on
+   timeout, EOF, I/O error, or a line that would exceed bufsz bytes. */
+static int smtp_read_line(SmtpConn *conn, uint32_t tmo, char *buf, size_t bufsz,
+                          size_t *outlen) {
+    size_t n = 0;
+    for (;;) {
+        if (n >= bufsz) return -1;                 /* line too long */
+        unsigned char b;
+        if (conn_read_byte(conn, tmo, &b) <= 0) return -1;
+        buf[n++] = (char)b;
         if (n >= 2 && buf[n - 2] == '\r' && buf[n - 1] == '\n') {
             *outlen = n;
             return 0;
@@ -166,7 +439,7 @@ static int smtp_read_line(int fd, uint32_t tmo, char *buf, size_t bufsz,
 /* Read one complete (possibly multi-line) SMTP reply. The first line's text
    (after "ddd " or "ddd-") is copied into text[0..textsz). Returns 0 and
    sets *code on success; -1 on any error or malformed reply. */
-static int smtp_read_reply(int fd, uint32_t tmo, int *code, char *text,
+static int smtp_read_reply(SmtpConn *conn, uint32_t tmo, int *code, char *text,
                            size_t textsz) {
     if (code) *code = 0;
     if (text && textsz) text[0] = '\0';
@@ -175,7 +448,7 @@ static int smtp_read_reply(int fd, uint32_t tmo, int *code, char *text,
     for (;;) {
         char line[SMTP_MAX_LINE];
         size_t n = 0;
-        if (smtp_read_line(fd, tmo, line, sizeof line, &n) != 0)
+        if (smtp_read_line(conn, tmo, line, sizeof line, &n) != 0)
             return -1;
 
         int lc = 0;
@@ -210,29 +483,58 @@ static int smtp_read_reply(int fd, uint32_t tmo, int *code, char *text,
     }
 }
 
+/* Read one complete (possibly multi-line) SMTP reply, capturing the raw text
+   of EVERY line (CRLF-terminated, as received) into reply[0..replysz) so the
+   full capability list is available (some servers put STARTTLS on a later
+   line).  Returns 0 and sets *code and *replylen on success; -1 on error, a
+   malformed reply, or a reply that would overflow replysz. */
+static int smtp_read_reply_all(SmtpConn *conn, uint32_t tmo, int *code,
+                               char *reply, size_t replysz, size_t *replylen) {
+    if (code) *code = 0;
+    if (replylen) *replylen = 0;
+    if (reply && replysz) reply[0] = '\0';
+
+    int first = -1;
+    size_t total = 0;
+    for (;;) {
+        char line[SMTP_MAX_LINE];
+        size_t n = 0;
+        if (smtp_read_line(conn, tmo, line, sizeof line, &n) != 0)
+            return -1;
+
+        int lc = 0;
+        if (n < 4 || smtp_reply_code(line, &lc) != 0)
+            return -1;
+        char sep = line[3];
+        if (sep != ' ' && sep != '-')
+            return -1;
+
+        if (first < 0) first = lc;
+        else if (lc != first) return -1;      /* code changed mid-reply */
+
+        if (reply && replysz > 0) {
+            if (total > replysz - 1 || n > replysz - 1 - total)
+                return -1;                    /* overflow: fail closed */
+            memcpy(reply + total, line, n);
+            total += n;
+        }
+        if (sep == ' ') {
+            *code = first;
+            if (reply && replysz > 0) reply[total] = '\0';
+            if (replylen) *replylen = total;
+            return 0;
+        }
+    }
+}
+
 /* Write exactly len bytes, bounded by tmo seconds, handling partial writes
    and EINTR. Returns 0 on success, -1 on timeout/error. */
-static int smtp_write_all(int fd, const char *buf, size_t len, uint32_t tmo) {
+static int smtp_write_all(SmtpConn *conn, const char *buf, size_t len,
+                          uint32_t tmo) {
     size_t off = 0;
     while (off < len) {
-        struct pollfd pfd;
-        pfd.fd = fd;
-        pfd.events = POLLOUT;
-        pfd.revents = 0;
-        int pr = poll(&pfd, 1, timeout_ms(tmo));
-        if (pr < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (pr == 0) return -1;                    /* timed out */
-        size_t chunk = len - off;
-        if (chunk > SMTP_WRITE_CHUNK) chunk = SMTP_WRITE_CHUNK;
-        ssize_t w = send(fd, buf + off, chunk, MSG_NOSIGNAL);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (w == 0) return -1;
+        ssize_t w = conn_send(conn, buf + off, len - off, tmo);
+        if (w <= 0) return -1;
         off += (size_t)w;
     }
     return 0;
@@ -241,14 +543,14 @@ static int smtp_write_all(int fd, const char *buf, size_t len, uint32_t tmo) {
 /* Send one command line (including its CRLF) and read the reply into *code.
    The first reply line's text is copied into status_out. Returns 0 on
    success, -1 on a write/read failure. */
-static int smtp_exchange(int fd, uint32_t tmo, const char *cmd, int *code,
-                         char *status_out, size_t status_sz) {
-    if (smtp_write_all(fd, cmd, strlen(cmd), tmo) != 0) {
+static int smtp_exchange(SmtpConn *conn, uint32_t tmo, const char *cmd,
+                         int *code, char *status_out, size_t status_sz) {
+    if (smtp_write_all(conn, cmd, strlen(cmd), tmo) != 0) {
         set_status(status_out, status_sz, "write failed");
         return -1;
     }
     char text[SMTP_MAX_LINE];
-    if (smtp_read_reply(fd, tmo, code, text, sizeof text) != 0) {
+    if (smtp_read_reply(conn, tmo, code, text, sizeof text) != 0) {
         set_status(status_out, status_sz, "read failed");
         return -1;
     }
@@ -338,14 +640,59 @@ static int smtp_connect(const Config *c, char *status_out, size_t status_sz) {
 }
 
 /* ------------------------------------------------------------------ */
+/* STARTTLS                                                            */
+/* ------------------------------------------------------------------ */
+
+/* Perform the TLS handshake over conn->fd.  conn->tls is false on entry; on
+   success conn->tls is set and the caller may speak TLS.  On failure the fd
+   stays plaintext (conn->tls left false) and the caller must abort the
+   attempt.  Returns 0 on success, or a negative mbedTLS error code
+   (MBEDTLS_ERR_SSL_TIMEOUT on a poll timeout). */
+static int smtp_tls_handshake(SmtpConn *conn, const char *host, uint32_t tmo,
+                              char *status_out, size_t status_sz) {
+    int r = smtp_tls_global_init();
+    if (r != 0) {
+        set_status(status_out, status_sz, "tls init failed");
+        return r;
+    }
+
+    r = mbedtls_ssl_setup(&conn->ssl, &g_ssl_conf);
+    if (r != 0) {
+        set_status(status_out, status_sz, "tls setup failed");
+        return r;
+    }
+    if (host && *host) {
+        r = mbedtls_ssl_set_hostname(&conn->ssl, host);   /* SNI */
+        if (r != 0) {
+            set_status(status_out, status_sz, "tls hostname failed");
+            return r;
+        }
+    }
+
+    conn->tmo = tmo;
+    mbedtls_ssl_set_bio(&conn->ssl, conn, bio_send, bio_recv, NULL);
+
+    r = mbedtls_ssl_handshake(&conn->ssl);
+    if (r != 0) {
+        char ebuf[128];
+        mbedtls_strerror(r, ebuf, sizeof ebuf);
+        set_status(status_out, status_sz, ebuf);
+        return r;
+    }
+    conn->tls = true;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* AUTH PLAIN                                                         */
 /* ------------------------------------------------------------------ */
 
 /* Perform "AUTH PLAIN <base64(authzid NUL authcid NUL passwd)>". We use
    authzid = authcid = username. Returns a status class (SMTP_OK on 235,
    SMTP_TEMPFAIL on 4xx, SMTP_PERMFAIL on 5xx, SMTP_ERROR otherwise). */
-static int smtp_auth_plain(int fd, uint32_t tmo, const ConfigRelayAuth *auth,
-                           char *status_out, size_t status_sz) {
+static int smtp_auth_plain(SmtpConn *conn, uint32_t tmo,
+                           const ConfigRelayAuth *auth, char *status_out,
+                           size_t status_sz) {
     const char *u = auth->username ? auth->username : "";
     const char *p = auth->password ? auth->password : "";
     size_t ulen = strlen(u);
@@ -403,7 +750,7 @@ static int smtp_auth_plain(int fd, uint32_t tmo, const ConfigRelayAuth *auth,
     free(b64);
 
     int code = 0;
-    int r = smtp_exchange(fd, tmo, cmd, &code, status_out, status_sz);
+    int r = smtp_exchange(conn, tmo, cmd, &code, status_out, status_sz);
     free(cmd);
     if (r != 0) return SMTP_TEMPFAIL;
     if (code != 235)
@@ -416,15 +763,15 @@ static int smtp_auth_plain(int fd, uint32_t tmo, const ConfigRelayAuth *auth,
 /* ------------------------------------------------------------------ */
 
 /* Dot-stuff the body and send it followed by the "CRLF . CRLF" terminator. */
-static int smtp_send_data(int fd, uint32_t dtmo, const char *body,
+static int smtp_send_data(SmtpConn *conn, uint32_t dtmo, const char *body,
                           size_t bodylen) {
     char *stuffed = NULL;
     size_t slen = 0;
     if (mail_stuff_dots(body, bodylen, &stuffed, &slen) != 0)
         return -1;
-    int rc = smtp_write_all(fd, stuffed, slen, dtmo);
+    int rc = smtp_write_all(conn, stuffed, slen, dtmo);
     if (rc == 0)
-        rc = smtp_write_all(fd, "\r\n.\r\n", 5, dtmo);
+        rc = smtp_write_all(conn, "\r\n.\r\n", 5, dtmo);
     mail_free(stuffed);
     return rc;
 }
@@ -433,23 +780,35 @@ static int smtp_send_data(int fd, uint32_t dtmo, const char *body,
 /* Dialogue                                                           */
 /* ------------------------------------------------------------------ */
 
-static void smtp_backoff(uint32_t attempt) {
-    /* attempt is 1-based: sleep 1s, 2s, 4s, 8s, 16s, then capped at 30s. */
+/* Exponential backoff cadence, shared by the outbound client's in-attempt
+   retry loop and (S-A2) the durable-queue's across-attempt re-drive.  attempt
+   is 1-based: 1s, 2s, 4s, 8s, 16s, ... doubling, then capped at 1h (3600s) so
+   a multi-hour relay outage re-drives for ~3.7 days (max_attempts=100) rather
+   than dropping after ~48 min.  Pure (no sleep). */
+uint32_t smtp_backoff_sec(uint32_t attempt) {
     uint32_t exp = attempt - 1;
-    uint32_t sec = (exp > 4) ? 30u : (1u << exp);
-    sleep(sec);
+    if (exp >= 12) return 3600u;    /* cap at 1h (also guards the shift) */
+    return 1u << exp;
 }
 
-static int smtp_dialogue(int fd, const Config *c, uint32_t tmo, uint32_t dtmo,
-                         const char *body, size_t bodylen,
+static void smtp_backoff(uint32_t attempt) {
+    sleep(smtp_backoff_sec(attempt));
+}
+
+static int smtp_dialogue(SmtpConn *conn, const Config *c, uint32_t tmo,
+                         uint32_t dtmo, const char *body, size_t bodylen,
                          const char *mail_cmd, const char *rcpt_cmd,
                          char *status_out, size_t status_sz) {
     char text[SMTP_MAX_LINE];
+    char caps[SMTP_MAX_REPLY];
+    size_t caplen = 0;
     int code = 0;
     int cls;
+    int starttls_cls = SMTP_ERROR;   /* STARTTLS-command refusal class (if any) */
+    bool want_tls = (c->relay.tls && strcmp(c->relay.tls, "starttls") == 0);
 
     /* 1. greeting: expect 220 */
-    if (smtp_read_reply(fd, tmo, &code, text, sizeof text) != 0) {
+    if (smtp_read_reply(conn, tmo, &code, text, sizeof text) != 0) {
         set_status(status_out, status_sz, "no greeting");
         return SMTP_TEMPFAIL;
     }
@@ -457,7 +816,7 @@ static int smtp_dialogue(int fd, const Config *c, uint32_t tmo, uint32_t dtmo,
     if (code != 220)
         return (code >= 400) ? smtp_class(code) : SMTP_ERROR;
 
-    /* 2. EHLO */
+    /* 2. EHLO (capture the full multi-line capability list) */
     const char *helo = (c->hostname && *c->hostname) ? c->hostname : "localhost";
     char ehlo_cmd[SMTP_MAX_LINE];
     int n = snprintf(ehlo_cmd, sizeof ehlo_cmd, "EHLO %s\r\n", helo);
@@ -465,44 +824,99 @@ static int smtp_dialogue(int fd, const Config *c, uint32_t tmo, uint32_t dtmo,
         set_status(status_out, status_sz, "EHLO name too long");
         return SMTP_ERROR;
     }
-    if (smtp_exchange(fd, tmo, ehlo_cmd, &code, status_out, status_sz) != 0)
+    if (smtp_write_all(conn, ehlo_cmd, strlen(ehlo_cmd), tmo) != 0) {
+        set_status(status_out, status_sz, "write failed");
         return SMTP_TEMPFAIL;
+    }
+    if (smtp_read_reply_all(conn, tmo, &code, caps, sizeof caps, &caplen) != 0) {
+        set_status(status_out, status_sz, "read failed");
+        return SMTP_TEMPFAIL;
+    }
+    reply_first_text(caps, caplen, status_out, status_sz);
     if ((cls = smtp_class(code)) != SMTP_OK)
         return cls;
 
-    /* 3. AUTH PLAIN (if enabled) */
+    /* 3. STARTTLS (opportunistic) */
+    bool did_tls = false;
+    if (want_tls) {
+        if (smtp_reply_has_cap(caps, caplen, "STARTTLS")) {
+            /* advertised: attempt the upgrade */
+            if (smtp_exchange(conn, tmo, "STARTTLS\r\n", &code, status_out,
+                              status_sz) != 0)
+                return SMTP_TEMPFAIL;
+            if (code == 220) {
+                int hr = smtp_tls_handshake(conn, c->relay.host, tmo,
+                                            status_out, status_sz);
+                if (hr != 0) {
+                    /* Handshake failed (timeout or a non-timeout TLS error):
+                     * transient — return TEMPFAIL so the durable queue
+                     * re-drives later.  Aborting here (never falling through
+                     * to AUTH) preserves the 'never AUTH over plaintext'
+                     * invariant regardless of auth.enabled.  status_out
+                     * already carries the specific mbedTLS error. */
+                    return SMTP_TEMPFAIL;
+                }
+                did_tls = true;
+                /* re-EHLO over TLS (RFC 3207: server forgets EHLO state) */
+                if (smtp_exchange(conn, tmo, ehlo_cmd, &code, status_out,
+                                  status_sz) != 0)
+                    return SMTP_TEMPFAIL;
+                if ((cls = smtp_class(code)) != SMTP_OK)
+                    return cls;
+            } else {
+                /* STARTTLS command refused.  RFC 3207: a 4xx (e.g. 454) is
+                 * temporary (the server may offer TLS later); a 5xx means the
+                 * upgrade is unavailable.  Capture the class so the auth rule
+                 * below maps 4xx -> TEMPFAIL (retry) and 5xx -> PERMFAIL. */
+                starttls_cls = smtp_class(code);
+            }
+        }
+        if (!did_tls && c->relay.auth.enabled) {
+            /* STARTTLS unavailable (not advertised, or command refused): hard
+               rule — never send AUTH PLAIN credentials in the clear.  A 4xx
+               refusal is transient (retry later); not-advertised or 5xx is
+               permanent. */
+            set_status(status_out, status_sz,
+                       "refusing to send AUTH over plaintext");
+            return (starttls_cls == SMTP_TEMPFAIL) ? SMTP_TEMPFAIL
+                                                   : SMTP_PERMFAIL;
+        }
+        /* no auth and no TLS: opportunistic plaintext fallback */
+    }
+
+    /* 4. AUTH PLAIN (if enabled; over TLS iff we did STARTTLS) */
     if (c->relay.auth.enabled) {
-        cls = smtp_auth_plain(fd, tmo, &c->relay.auth, status_out, status_sz);
+        cls = smtp_auth_plain(conn, tmo, &c->relay.auth, status_out, status_sz);
         if (cls != SMTP_OK)
             return cls;
     }
 
-    /* 4. MAIL FROM */
-    if (smtp_exchange(fd, tmo, mail_cmd, &code, status_out, status_sz) != 0)
+    /* 5. MAIL FROM */
+    if (smtp_exchange(conn, tmo, mail_cmd, &code, status_out, status_sz) != 0)
         return SMTP_TEMPFAIL;
     if ((cls = smtp_class(code)) != SMTP_OK)
         return cls;
 
-    /* 5. RCPT TO */
-    if (smtp_exchange(fd, tmo, rcpt_cmd, &code, status_out, status_sz) != 0)
+    /* 6. RCPT TO */
+    if (smtp_exchange(conn, tmo, rcpt_cmd, &code, status_out, status_sz) != 0)
         return SMTP_TEMPFAIL;
     if ((cls = smtp_class(code)) != SMTP_OK)
         return cls;
 
-    /* 6. DATA: expect 354 */
-    if (smtp_exchange(fd, tmo, "DATA\r\n", &code, status_out, status_sz) != 0)
+    /* 7. DATA: expect 354 */
+    if (smtp_exchange(conn, tmo, "DATA\r\n", &code, status_out, status_sz) != 0)
         return SMTP_TEMPFAIL;
     if (code != 354)
         return (smtp_class(code) == SMTP_OK) ? SMTP_ERROR : smtp_class(code);
 
-    /* 7. dot-stuffed body + terminator */
-    if (smtp_send_data(fd, dtmo, body, bodylen) != 0) {
+    /* 8. dot-stuffed body + terminator */
+    if (smtp_send_data(conn, dtmo, body, bodylen) != 0) {
         set_status(status_out, status_sz, "data write failed");
         return SMTP_TEMPFAIL;
     }
 
-    /* 8. final reply: 250/251 = accepted */
-    if (smtp_read_reply(fd, tmo, &code, text, sizeof text) != 0) {
+    /* 9. final reply: 250/251 = accepted */
+    if (smtp_read_reply(conn, tmo, &code, text, sizeof text) != 0) {
         set_status(status_out, status_sz, "no reply after DATA");
         return SMTP_TEMPFAIL;
     }
@@ -510,8 +924,8 @@ static int smtp_dialogue(int fd, const Config *c, uint32_t tmo, uint32_t dtmo,
     if (code != 250 && code != 251)
         return (smtp_class(code) == SMTP_OK) ? SMTP_ERROR : smtp_class(code);
 
-    /* 9. QUIT (best-effort; do not block waiting for the 221) */
-    (void)smtp_write_all(fd, "QUIT\r\n", 6, tmo);
+    /* 10. QUIT (best-effort; do not block waiting for the 221) */
+    (void)smtp_write_all(conn, "QUIT\r\n", 6, tmo);
 
     return SMTP_OK;
 }
@@ -534,8 +948,9 @@ int smtp_out_send(Store *s, const Config *c, const char *from, const char *to,
         set_status(status_out, status_sz, "no relay host configured");
         return SMTP_ERROR;
     }
-    if (c->relay.tls && strcmp(c->relay.tls, "none") != 0) {
-        set_status(status_out, status_sz, "tls not supported");
+    if (smtp_tls_valid(c->relay.tls) != 0) {
+        set_status(status_out, status_sz,
+                   "invalid relay.tls (expected \"none\" or \"starttls\")");
         return SMTP_ERROR;
     }
     if (has_crlf(from) || has_crlf(to)) {
@@ -571,9 +986,11 @@ int smtp_out_send(Store *s, const Config *c, const char *from, const char *to,
             continue;
         }
 
-        int rc = smtp_dialogue(fd, c, tmo, dtmo, body, bodylen, mail_cmd,
+        SmtpConn conn;
+        smtp_conn_init(&conn, fd);
+        int rc = smtp_dialogue(&conn, c, tmo, dtmo, body, bodylen, mail_cmd,
                                rcpt_cmd, status_out, status_sz);
-        close(fd);
+        smtp_conn_close(&conn, rc == SMTP_OK);
 
         if (rc == SMTP_OK || rc == SMTP_PERMFAIL || rc == SMTP_ERROR)
             return rc;

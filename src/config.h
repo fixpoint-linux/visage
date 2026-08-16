@@ -30,13 +30,14 @@ typedef struct {
     char    *password;
 } ConfigRelayAuth;
 
-/* relay { host, port, auth, retries, tls } */
+/* relay { host, port, auth, retries, tls, max_attempts } */
 typedef struct {
     char          *host;
     uint32_t       port;
     ConfigRelayAuth auth;
     uint32_t       retries;
     char          *tls;
+    uint32_t       max_attempts;   /* durable-queue redrive cap (0 -> default) */
 } ConfigRelay;
 
 /* storage { path, spool } */

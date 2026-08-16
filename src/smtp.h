@@ -37,6 +37,12 @@ enum {
 /* Human-readable name for a status code (never NULL). */
 const char *smtp_status_str(int status);
 
+/* Exponential backoff cadence shared by the outbound client's in-attempt
+ * retry loop and the durable-queue's across-attempt re-drive: attempt is
+ * 1-based -> 1s, 2s, 4s, 8s, 16s, ... doubling, then capped at 1h (3600s).
+ * Pure (no sleep). */
+uint32_t smtp_backoff_sec(uint32_t attempt);
+
 /* Parse the 3-digit code that begins an SMTP reply line. Returns 0 and stores
    the code in *code on success; -1 if the line is too short or does not begin
    with three ASCII digits. */
@@ -72,5 +78,21 @@ RcptDecision smtp_in_rcpt_ok(Store *s, const Config *cfg, const char *rcpt);
  * *size when a SIZE token is found (leaving *size untouched when absent).
  * Returns -1 on a malformed or overflowing SIZE value. */
 int smtp_in_parse_size(const char *params, uint64_t *size, bool *present);
+
+/* ------------------------------------------------------------------ */
+/* Outbound relay STARTTLS helpers (smtp_out.c).                       */
+/* ------------------------------------------------------------------ */
+
+/* Validate relay.tls ∈ {"none", "starttls"}.  Returns 0 if valid, -1 if the
+   value is missing or not a supported TLS mode ("starttls-verify" is deferred
+   to a later slice and is rejected here).  Pure. */
+int smtp_tls_valid(const char *tls);
+
+/* Does the multi-line SMTP reply advertise capability `cap`?  `reply` is the
+   raw reply text (each line begins with a 3-digit code + ' ' or '-' and is
+   '\n'- or '\r'-terminated).  Match is a case-insensitive comparison against
+   the whitespace-delimited keywords that follow the "ddd " / "ddd-" prefix of
+   each line.  Pure — no I/O. */
+bool smtp_reply_has_cap(const char *reply, size_t len, const char *cap);
 
 #endif /* VISAGE_SMTP_H */

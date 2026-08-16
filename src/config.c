@@ -130,6 +130,18 @@ static bool walk_config(Config *cfg, Term *nf) {
     if (!nat_u64(rec_get(rel, "retries"), &v)) return false;
     cfg->relay.retries = (uint32_t)v;
     if (!text_dup(rec_get(rel, "tls"), &cfg->relay.tls)) return false;
+    {
+        /* relay.max_attempts is the durable-queue re-drive cap.  Tolerate an
+         * absent field (older configs) by defaulting to 100; a present 0 also
+         * falls back to 100 at the usage site. */
+        Term *maxa = rec_get(rel, "max_attempts");
+        if (maxa) {
+            if (!nat_u64(maxa, &v)) return false;
+            cfg->relay.max_attempts = (uint32_t)v;
+        } else {
+            cfg->relay.max_attempts = 100;
+        }
+    }
     Term *auth = rec_get(rel, "auth");
     if (!auth) { cfg_error("config missing 'relay.auth'"); return false; }
     if (!bool_get(rec_get(auth, "enabled"), &cfg->relay.auth.enabled)) return false;
