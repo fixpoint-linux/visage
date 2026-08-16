@@ -59,6 +59,23 @@ int smtp_in_main(const Config *c, const Store *s);
    is readable.  Must be called before smtp_in_main.  Returns VISAGE_OK, or a
    negative error code if the registration table is full. */
 int smtp_in_add_extra_fd(int fd, void (*cb)(int fd, void *user), void *user);
+/* Per-connection admin HTTP registration (R4).  Registers an accepted HTTP
+   connection's fd so it is multiplexed into the SMTP poll loop alongside SMTP
+   connections (non-blocking, shared single-threaded event loop).  Returns a
+   stable handle (>= 0) or a negative error code (VISAGE_EPARAM on bad args,
+   VISAGE_ENOMEM when the connection table is full).  The caller owns the fd
+   and closes it itself after smtp_in_http_close. */
+int smtp_in_register_http_conn(int fd,
+        void (*on_readable)(int fd, void *user),
+        void (*on_writable)(int fd, void *user),
+        void (*on_closed)(int fd, void *user),
+        uint32_t idle_timeout_sec, void *user);
+/* Re-arm which events (POLLIN/POLLOUT) the loop polls for a registered HTTP
+   conn. */
+void smtp_in_http_set_events(int handle, short events);
+/* Release a registered HTTP conn's slot (idempotent).  Does NOT close the fd;
+   the caller frees its own per-connection state and closes the fd. */
+void smtp_in_http_close(int handle);
 int smtp_out_send(Store *s, const Config *c, const char *from, const char *to,
                   const char *body, size_t bodylen, char *status_out,
                   size_t status_sz);

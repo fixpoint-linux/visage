@@ -47,8 +47,8 @@ tests/tls_selfcheck.com: tests/tls_selfcheck.c $(MBEDTLS_OBJ) src/mbedtls_visage
 tests/verify_selfcheck.com: tests/verify_selfcheck.c $(MBEDTLS_OBJ) src/mbedtls_visage_config.h src/data/cacert_pem.c
 	$(CC) $(CFLAGS) $(MBEDTLS_FLAGS) -o $@ tests/verify_selfcheck.c $(MBEDTLS_OBJ) src/data/cacert_pem.c
 
-SRC = src/config.c src/store.c src/smtp_in.c src/smtp_out.c src/mail.c src/reply.c src/http.c src/json.c src/main.c
-all: visage.com config_check.com store_check.com mail_check.com reply_check.com smtp_check.com tests/tls_selfcheck.com tests/verify_selfcheck.com
+SRC = src/config.c src/store.c src/smtp_in.c src/smtp_out.c src/mail.c src/reply.c src/http.c src/http_parse.c src/json.c src/main.c
+all: visage.com config_check.com store_check.com mail_check.com reply_check.com smtp_check.com http_check.com tests/tls_selfcheck.com tests/verify_selfcheck.com
 visage.com: $(SRC) src/visage.h src/config.h src/store.h $(CORE_DHALL) $(CORE_DATALOG) $(MBEDTLS_OBJ) src/data/cacert_pem.c
 	$(CC) $(CFLAGS) $(MBEDTLS_FLAGS) -o $@ $(SRC) $(CORE_DHALL) $(CORE_DATALOG) $(MBEDTLS_OBJ) src/data/cacert_pem.c
 config_check.com: src/config.c src/config_check.c src/config.h src/visage.h $(CORE_DHALL)
@@ -61,6 +61,8 @@ reply_check.com: src/reply.c src/reply_check.c src/reply.h src/store.c src/store
 	$(CC) $(CFLAGS) -o $@ src/reply.c src/reply_check.c src/store.c src/mail.c $(CORE_DATALOG)
 smtp_check.com: src/smtp_in.c src/smtp_out.c src/store.c src/reply.c src/smtp_check.c src/smtp.h src/store.h src/reply.h src/mail.c src/mail.h src/config.h src/visage.h $(CORE_DATALOG) $(MBEDTLS_OBJ) src/data/cacert_pem.c
 	$(CC) $(CFLAGS) $(MBEDTLS_FLAGS) -o $@ src/smtp_in.c src/smtp_out.c src/store.c src/reply.c src/smtp_check.c src/mail.c $(CORE_DATALOG) $(MBEDTLS_OBJ) src/data/cacert_pem.c
+http_check.com: src/http_parse.c src/http_check.c src/http_parse.h
+	$(CC) $(CFLAGS) -o $@ src/http_parse.c src/http_check.c
 
 # --- S8 e2e harness ---------------------------------------------------------
 # smtptest is a standalone POSIX-socket tool (no visage/dep code).  relay_fake

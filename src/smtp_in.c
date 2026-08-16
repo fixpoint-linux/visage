@@ -69,6 +69,83 @@ int smtp_in_add_extra_fd(int fd, void (*cb)(int fd, void *user), void *user) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Per-connection HTTP registration (R4)                              */
+/* ------------------------------------------------------------------ */
+
+/* The admin HTTP server (http.c) registers each accepted connection here so
+   its fd is multiplexed into this poll loop alongside SMTP connections — a
+   NON-BLOCKING HTTP state machine that shares the loop fairly with SMTP
+   (datalog is single-writer, so everything runs on one thread).  Handles are
+   stable indices into a fixed slot table; a slot is released by
+   smtp_in_http_close() (the caller owns and closes the fd itself). */
+#define SMTP_IN_MAX_HTTP 32   /* max concurrent admin HTTP conns (HTTP_MAX_CONNS) */
+
+typedef struct HttpSlot {
+    bool     used;
+    int      fd;                /* owned by the HTTP layer; polled here */
+    short    events;            /* POLLIN / POLLOUT to poll for */
+    uint32_t idle_timeout_sec;  /* 0 = no idle timeout */
+    time_t   last_act;          /* last readable/writable dispatch (idle clock) */
+    void   (*on_readable)(int fd, void *user);
+    void   (*on_writable)(int fd, void *user);
+    void   (*on_closed)(int fd, void *user);   /* idle-timeout notification */
+    void    *user;
+} HttpSlot;
+
+static HttpSlot s_http[SMTP_IN_MAX_HTTP];
+
+int smtp_in_register_http_conn(int fd,
+        void (*on_readable)(int fd, void *user),
+        void (*on_writable)(int fd, void *user),
+        void (*on_closed)(int fd, void *user),
+        uint32_t idle_timeout_sec, void *user) {
+    int i;
+    if (fd < 0 || !on_readable || !on_writable) return VISAGE_EPARAM;
+    for (i = 0; i < SMTP_IN_MAX_HTTP; i++) {
+        if (!s_http[i].used) {
+            s_http[i].used = true;
+            s_http[i].fd = fd;
+            s_http[i].events = POLLIN;
+            s_http[i].idle_timeout_sec = idle_timeout_sec;
+            s_http[i].last_act = time(NULL);
+            s_http[i].on_readable = on_readable;
+            s_http[i].on_writable = on_writable;
+            s_http[i].on_closed = on_closed;
+            s_http[i].user = user;
+            return i;   /* the handle */
+        }
+    }
+    return VISAGE_ENOMEM;   /* connection table full */
+}
+
+void smtp_in_http_set_events(int handle, short events) {
+    if (handle < 0 || handle >= SMTP_IN_MAX_HTTP) return;
+    if (!s_http[handle].used) return;
+    s_http[handle].events = events;
+}
+
+void smtp_in_http_close(int handle) {
+    if (handle < 0 || handle >= SMTP_IN_MAX_HTTP) return;
+    s_http[handle].used = false;
+    s_http[handle].fd = -1;
+    s_http[handle].events = 0;
+    s_http[handle].on_readable = NULL;
+    s_http[handle].on_writable = NULL;
+    s_http[handle].on_closed = NULL;
+    s_http[handle].user = NULL;
+}
+
+/* Idle-timeout a HTTP conn: release its slot, then notify the owner so it can
+   close the fd and free its per-connection state. */
+static void http_slot_idle_close(int handle) {
+    int fd = s_http[handle].fd;
+    void (*on_closed)(int, void *) = s_http[handle].on_closed;
+    void *user = s_http[handle].user;
+    smtp_in_http_close(handle);
+    if (on_closed) on_closed(fd, user);
+}
+
+/* ------------------------------------------------------------------ */
 /* Per-connection state                                               */
 /* ------------------------------------------------------------------ */
 
@@ -1244,6 +1321,21 @@ static int poll_timeout_ms(const Server *srv, time_t now) {
         if (ms < 0 || rms < ms) ms = rms;
     }
 
+    /* HTTP conn idle deadline: wake poll() so the idle sweep can reap a
+       trickling admin conn even when nothing else is scheduled. */
+    for (i = 0; i < SMTP_IN_MAX_HTTP; i++) {
+        const HttpSlot *h = &s_http[i];
+        time_t elapsed, remain;
+        int rms;
+        if (!h->used || h->idle_timeout_sec == 0) continue;
+        elapsed = (now > h->last_act) ? (now - h->last_act) : 0;
+        if (elapsed >= (time_t)h->idle_timeout_sec) return 0;
+        remain = (time_t)h->idle_timeout_sec - elapsed;
+        rms = (int)(remain * 1000);
+        if (rms > 2147483647) rms = 2147483647;
+        if (ms < 0 || rms < ms) ms = rms;
+    }
+
     /* Queue re-drive deadline: wake poll() when the soonest queued next_ts is
        reached so an otherwise-idle daemon still re-drives on schedule.  A
        due-now item (next_ts <= now) yields 0 ms -> poll returns immediately.
@@ -1306,7 +1398,7 @@ static void server_poll(Server *srv) {
 
     for (;;) {
         time_t now = time(NULL);
-        size_t nfds, n_before, i;
+        size_t nfds, n_before, i, http_base;
 
         /* idle timeout */
         for (i = 0; i < srv->nconns; i++) {
@@ -1319,12 +1411,22 @@ static void server_poll(Server *srv) {
             }
         }
 
+        /* idle timeout (admin HTTP conns) */
+        for (i = 0; i < SMTP_IN_MAX_HTTP; i++) {
+            HttpSlot *h = &s_http[i];
+            if (!h->used || h->idle_timeout_sec == 0) continue;
+            if (now > h->last_act &&
+                (now - h->last_act) >= (time_t)h->idle_timeout_sec)
+                http_slot_idle_close((int)i);
+        }
+
         /* Re-drive any due durable-queue deliveries.  Idempotent and a no-op
            when nothing is due (full walk, filtered). */
         queue_redrive(srv);
 
-        /* build pollfd array */
-        nfds = srv->nconns + 1 + s_nextra;
+        /* build pollfd array: [0] SMTP listen, [1..] extra listeners,
+           then SMTP conns, then a fixed block of HTTP conn slots. */
+        nfds = 1 + s_nextra + srv->nconns + SMTP_IN_MAX_HTTP;
         if (nfds > pfds_cap) {
             free(pfds);
             pfds = malloc(nfds * sizeof *pfds);
@@ -1349,6 +1451,13 @@ static void server_poll(Server *srv) {
                 if (c->out_off < c->out_len) pfds[1 + s_nextra + i].events |= POLLOUT;
             }
             pfds[1 + s_nextra + i].revents = 0;
+        }
+        http_base = 1 + s_nextra + srv->nconns;
+        for (i = 0; i < SMTP_IN_MAX_HTTP; i++) {
+            const HttpSlot *h = &s_http[i];
+            pfds[http_base + i].fd = h->used ? h->fd : -1;   /* poll skips -1 */
+            pfds[http_base + i].events = h->used ? h->events : 0;
+            pfds[http_base + i].revents = 0;
         }
 
         {
@@ -1381,6 +1490,22 @@ static void server_poll(Server *srv) {
                 conn_readable(srv, c, now);
             if (!c->closed && (rev & POLLOUT))
                 conn_flush(c);
+        }
+
+        /* dispatch admin HTTP conns (readable, then writable) */
+        for (i = 0; i < SMTP_IN_MAX_HTTP; i++) {
+            HttpSlot *h = &s_http[i];
+            short rev;
+            if (!h->used) continue;
+            rev = pfds[http_base + i].revents;
+            if (rev & (POLLIN | POLLHUP | POLLERR)) {
+                h->last_act = now;
+                if (h->on_readable) h->on_readable(h->fd, h->user);
+            }
+            if (h->used && (rev & POLLOUT)) {
+                h->last_act = now;
+                if (h->on_writable) h->on_writable(h->fd, h->user);
+            }
         }
 
         /* destroy closed connections whose output has drained */
