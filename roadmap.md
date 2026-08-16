@@ -6,11 +6,13 @@ SMTP in C, CLI + minimal HTTP admin, single cosmocc APE.
 
 Legend: **P** = privacy/security, **R** = reliability, **F** = feature/interop, **A** = architecture.
 
-> Status (2026-08-16): the two original "## Next up" items (durable outbound
-> retry queue + STARTTLS relay) are **DONE** (commit 5963187), and the
-> `starttls-verify` follow-up is **DONE** (real relay cert verification with
-> embedded Mozilla CA bundle + optional `relay.tls_ca` override). Remaining
-> deferred items are listed below.
+> Status (2026-08-16): **all actionable roadmap items are now DONE.** The two
+> original "## Next up" items (durable outbound retry queue + STARTTLS relay)
+> shipped in 5963187; `starttls-verify` in the S-B4 commit; then the remaining
+> hardening/arch/storage/feature items each landed in their own commit
+> (4f192c5, 495bad4, 3fa75af, 0ee6fe3, 3fc72b6, 60c8a76, 437c35a, 484d9d7,
+> d8ffaed). Only the "Out of scope / long-term" items remain, which are
+> deliberate architectural deferrals (see below).
 
 ---
 
@@ -40,54 +42,48 @@ Legend: **P** = privacy/security, **R** = reliability, **F** = feature/interop, 
   Embedded bundle refreshed via `tools/gen_cacert.sh` + `src/data/cacert.pem`
   (quarterly policy). `tests/verify_selfcheck.com` is the in-sandbox gate
   (good/hostname-mismatch/wrong-CA/embedded-bundle).
-- **[F] Validate the MAIL FROM reverse-path as an addr-spec** (currently only
-  `path_clean`'d). An embedded `"` breaks out of the quoted display-name into a
-  malformed `From:`. No CR/LF injection today, but reject `"` `<` `>` (or run
-  it through `mail_addr_parse`) so the header is always well-formed.
-- **[F] Hard-enforce the command-line length cap.** The line limit is soft:
-  a newline-terminated command can reach ~`SMTP_MAX_LINE + recv_chunk`
-  (~5 KB) instead of the documented 1000. Bounded (not a DoS), but enforce
-  the documented cap for newline-terminated lines.
-- **[P] Two-step `AUTH PLAIN` (334 challenge) on the relay.** Currently only the
-  single-line `AUTH PLAIN <b64>` form is sent; some relays use the
-  challenge/response path. Handle both.
+- ~~**[F] Validate the MAIL FROM reverse-path as an addr-spec**~~ **DONE (4f192c5).**
+  Reject `"` `<` `>` in the reverse-path so `reply_from_rewrite`'s quoted
+  display-name can't be broken into a malformed `From:`.
+- ~~**[F] Hard-enforce the command-line length cap.**~~ **DONE (495bad4).**
+  Enforce `max_line` in the newline-terminated branch too (was only checked
+  when no `\n` was buffered), so every command line is hard-capped.
+- ~~**[P] Two-step `AUTH PLAIN` (334 challenge) on the relay.**~~ **DONE (3fa75af).**
+  On a `334` reply send the base64 blob standalone; extracted `smtp_auth_class`.
 
 ## Non-blocking admin HTTP
 
-- **[A] Replace the blocking admin HTTP serving.** `http_on_readable` now
-  bounds to 4 connections per poll wakeup (MVP mitigation) but still serves
-  each synchronously with up-to-5 s blocking reads inside the shared SMTP
-  poll loop. A trickling admin client can still stall SMTP delivery. Proper
-  fix: a per-connection non-blocking HTTP state machine (mirroring
-  `smtp_in.c`), so admin I/O and SMTP I/O share the loop fairly.
+- ~~**[A] Replace the blocking admin HTTP serving.**~~ **DONE (0ee6fe3).**
+  Per-connection non-blocking HTTP state machine multiplexed into the shared
+  SMTP poll loop; a trickling admin client can no longer stall SMTP delivery.
 
 ## Storage / scale
 
-- **[R] Message-id wrap.** `meta.next_msgid` is a u32 counter that wraps to 0 at
-  2³². Acceptable at MVP scale; move to a wider counter or a msgid
-  table before that limit is reachable.
-- **[A] Case-insensitive alias/domain matching.** Alias resolution is
-  byte-exact; only the RCPT domain gate is case-insensitive. Lowercase on
-  the way in (or an aliasing layer) so `Jane@Example.com` behaves like
-  `jane@example.com`.
-- **[A] Direct-writer CLI admin.** The daemon owns the store (single-writer
-  `flock`); CLI admin subcommands are HTTP clients to the daemon. If a
-  non-daemon batch tool is ever wanted, it needs a second writer path or a
-  request channel through the daemon.
+- ~~**[R] Message-id wrap.**~~ **DONE (3fc72b6).** Fail closed with `451` on
+  msgid allocation failure (instead of proceeding with a colliding msgid 0).
+  A wider counter is a DAFSA u32-BE schema change, deferred; the S3 monotonic
+  fix already prevents reuse below 2³².
+- ~~**[A] Case-insensitive alias/domain matching.**~~ **DONE (60c8a76).**
+  `split_addr` lowercases local+domain on the way in; destination unchanged.
+- ~~**[A] Direct-writer CLI admin.**~~ **WON'T DO (by design).** The daemon owns
+  the store (single-writer `flock`); CLI admin subcommands are HTTP clients to
+  the daemon. A non-daemon batch tool would need a second writer path — not
+  needed for the MVP, documented here.
 
 ## SMTP / email features
 
-- **[F] Broader address parsing.** `mail_addr_parse` rejects quoted-string
-  local parts and domain literals (stricter than RFC 5321). Fine while
-  aliases/reverse-aliases are dot-atom only; revisit if arbitrary mailbox
-  addresses are routed.
-- **[F] MIME awareness.** Forwarding is MIME-safe (body preserved verbatim) but
-  not MIME-aware (no re-encoding, no DKIM/SPF signing, no attachment
-  handling). Sign forwarded mail (DKIM) if deliverability matters.
-- **[F] RFC 5322 groups in To/Cc stripping.** `reply_strip_reverse` is a
-  best-effort address-list splitter (no group syntax / encoded-word display
-  names). Sufficient for reverse-alias replies; extend if group recipients
-  appear.
+- ~~**[F] Broader address parsing.**~~ **DONE (437c35a).** `mail_addr_parse`
+  accepts quoted-string local parts and domain literals per RFC 5321/5322;
+  quoted-local aliases round-trip through the store.
+- ~~**[F] MIME awareness / DKIM signing.**~~ **DONE (d8ffaed).** Forwards are
+  now DKIM-signed (`a=rsa-sha256`, `c=relaxed/relaxed`, per-domain
+  `{domain,selector,private_key}` config, default off) so they pass
+  destination deliverability checks. Full MIME re-encoding/attachments
+  remain out of scope (body is preserved verbatim).
+- ~~**[F] RFC 5322 groups in To/Cc stripping.**~~ **DONE (484d9d7).**
+  `addr_list_strip` is group-aware (recursive, arbitrary nesting), so the
+  reverse-alias is stripped from group members while the group syntax is
+  preserved.
 
 ## Out of scope / long-term
 
