@@ -45,6 +45,31 @@ Email routing needs exactly two lookups, and both are native DAFSA primitives �
 Prefix enumeration is the DAFSA's second-strongest primitive (after exact-key lookup), so alias
 resolution and reply-token routing are O(prefix length) regardless of how many aliases exist.
 
+## Security posture
+
+The wire path is hand-rolled C11, so the hardening is explicit. visage was given a deep
+wire-path security review before public launch (3 HIGH + 4 MEDIUM findings, all fixed, no
+CRITICAL). Where it stands:
+
+- **Wire memory safety** — bounded per-connection buffers on the SMTP and admin paths; a
+  reply-backlog cap (`SMTP_IN_MAX_OUT` 256&nbsp;KB) + TCP backpressure so a never-reading client
+  can't exhaust memory; hard command-length limits.
+- **Reply tokens** — 32 hex chars from `/dev/urandom`, **no weak fallback** (fail-closed), expiring
+  after 30 days. Tokens are the reply feature's only credential.
+- **Admin API** — constant-time bearer-token comparison; `config-check` rejects tokens that can
+  never authenticate (>500 chars) and warns on weak defaults.
+- **Anti-injection** — MAIL FROM and RCPT are validated (printable ASCII, no quote/angle chars) so
+  forwarded headers can't be broken; no SMTP-envelope CRLF injection to the relay; mail containing
+  NUL/control bytes is rejected (`554`) rather than silently forwarded.
+- **Relay integrity** — `starttls-verify` does mandatory STARTTLS with CA + hostname verification
+  and never falls back to plaintext or sends AUTH over it; `starttls` is documented as
+  anti-passive-snooping only.
+- **Availability** — inbound SMTP is rate-bounded (512 conns global / 16 per-IP, `421` on excess);
+  queue-driven relay sends are batched (8/tick) so a slow relay can't stall the event loop; null
+  reverse-path mail is preserved end-to-end (`MAIL FROM:<>`) so DSN bounce loops can't ping-pong.
+- **Browser demo** — remote `http://` Dhall imports are **compiled out** of the wasm build, so a
+  pasted config can't make your browser probe URLs.
+
 ## Stack
 
 | Piece | Role |

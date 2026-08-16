@@ -50,6 +50,23 @@ Legend: **P** = privacy/security, **R** = reliability, **F** = feature/interop, 
   when no `\n` was buffered), so every command line is hard-capped.
 - ~~**[P] Two-step `AUTH PLAIN` (334 challenge) on the relay.**~~ **DONE (3fa75af).**
   On a `334` reply send the base64 blob standalone; extracted `smtp_auth_class`.
+- ~~**[P] Pre-launch deep security review + fixes.**~~ **DONE (2026-08-16, commits
+  c11ea7b + 9865d0d).** A deep wire-path review before public launch returned 3 HIGH +
+  4 MEDIUM (no CRITICAL); all fixed across two commits:
+  - **c11ea7b** — per-conn reply-backlog cap (`SMTP_IN_MAX_OUT` 256&nbsp;KB) + `POLLIN`
+    backpressure (unauthenticated memory-exhaustion DoS); one-shot `relay.retries=0` +
+    redrive batch of 8 for queue sends (single-thread event-loop freeze during a relay
+    outage); deleted the `prng16` fallback so reply tokens fail-closed from `/dev/urandom`
+    (predictable/colliding tokens were the reply feature's only credential); `path_clean`
+    on RCPT (header-injection surface via quoted-string local parts); constant-time admin
+    bearer comparison; post-`DATA` pipelined bytes routed to the DATA buffer (silent mail
+    loss).
+  - **9865d0d** — reply-token TTL (30&nbsp;days, hourly sweep) + expired-row rejection in
+    resolve; inbound conn caps (512 global / 16 per-IP, `421` on excess); admin-token
+    `config-check` fails tokens >500 chars / warns on weak defaults; wasm demo remote
+    `http://` imports disabled (stub, so no SSRF from visitor browsers); NUL/control-byte
+    rejection (`554`, 8-bit preserved); null reverse-path preserved end-to-end
+    (`MAIL FROM:<>`) to break DSN bounce loops.
 
 ## Non-blocking admin HTTP
 
