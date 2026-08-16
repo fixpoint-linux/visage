@@ -38,23 +38,6 @@ static int urandom16(unsigned char *b) {
     return 1;
 }
 
-/* Fallback PRNG: xorshift64 seeded from time + pid + stack addresses.  Always
- * succeeds (never all-zero seed). */
-static void prng16(unsigned char *b) {
-    uint64_t s = (uint64_t)time(NULL);
-    s ^= (uint64_t)(uintptr_t)getpid() << 32;
-    s ^= (uint64_t)(uintptr_t)b;       /* stack address of the output buffer */
-    s ^= (uint64_t)(uintptr_t)&s;      /* stack address of the seed itself */
-    if (s == 0) s = 0x9E3779B97F4A7C15ull;
-
-    for (int i = 0; i < 16; i += 8) {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        memcpy(b + i, &s, 8);
-    }
-}
-
 int reply_token_gen(char *out, size_t outsz) {
     unsigned char b[16];
     int nonzero = 0;
@@ -62,7 +45,12 @@ int reply_token_gen(char *out, size_t outsz) {
 
     if (!out || outsz < 33) return VISAGE_EPARAM;
 
-    if (!urandom16(b)) prng16(b);
+    /* No weak fallback: a token derived from time+pid+stack addresses is
+       predictable (all tokens minted in the same second are even IDENTICAL),
+       and reply tokens are the only authentication of the reverse-alias
+       reply path.  Fail closed - the caller (forward_one, smtp_in.c:799-806)
+       already refuses acceptance with 451 when this errors. */
+    if (!urandom16(b)) return VISAGE_ERR;
 
     for (i = 0; i < 16; i++) {
         if (b[i]) { nonzero = 1; break; }

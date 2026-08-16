@@ -114,6 +114,23 @@ static int parse_request_line(const char *req, size_t reqlen,
 /* Auth                                                               */
 /* ------------------------------------------------------------------ */
 
+/* Constant-time equality of `supplied` against the configured `token`.
+   The loop bound is the FIXED secret length, so runtime is independent of the
+   supplied token's value; `supplied[i]` is only ever read while i < strlen(supplied)
+   (never past its NUL), and a length mismatch is folded into d so both shorter and
+   longer supplied tokens are rejected without any over-read.  No early exit. */
+static int token_eq_ct(const char *supplied, const char *configured) {
+    size_t ns = strlen(supplied);
+    size_t nc = strlen(configured);
+    size_t i;
+    unsigned char d = (ns == nc) ? 0 : 1;
+    for (i = 0; i < nc; i++) {
+        unsigned char ac = (i < ns) ? (unsigned char)supplied[i] : 0u;
+        d |= (unsigned char)(ac ^ (unsigned char)configured[i]);
+    }
+    return d == 0;
+}
+
 /* True if the Authorization header equals "Bearer <token>". */
 static int auth_ok(const char *req, size_t reqlen, size_t header_end,
                    const char *token) {
@@ -129,7 +146,7 @@ static int auth_ok(const char *req, size_t reqlen, size_t header_end,
     if (strlen(p) < 7 || !http_ci_eq(p, "Bearer ", 7)) return 0;
     p += 7;
     while (*p == ' ' || *p == '\t') p++;
-    return strcmp(p, token) == 0;
+    return token_eq_ct(p, token);
 }
 
 /* ------------------------------------------------------------------ */

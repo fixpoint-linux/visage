@@ -35,6 +35,15 @@
 #define SMTP_IN_LISTEN_BACKLOG 128
 #define SMTP_IN_RECV_CHUNK     4096
 
+/* Hard cap on the pending reply backlog per connection.  Without it a
+   client that pipelines commands and never reads grows c->out without
+   bound (each pipelined line generates a reply send() cannot drain). */
+#define SMTP_IN_MAX_OUT        (256u * 1024u)
+
+/* Max deliveries re-driven per event-loop tick (bounded blocking relay work;
+   skipped items remain due and are picked up on the next tick). */
+#define SMTP_IN_REDRIVE_BATCH  8
+
 /* log relation "dir" column codes (raw u32). */
 #define LOG_DIR_IN  1u
 #define LOG_DIR_OUT 2u
@@ -377,6 +386,12 @@ static void conn_flush(Conn *c) {
 
 /* Queue a NUL-terminated reply line (with its CRLF) and try to flush it. */
 static void conn_reply(Conn *c, const char *text) {
+    /* A client that never reads must not be able to grow c->out without
+       bound - once the backlog exceeds the cap, drop the connection. */
+    if (c->out_len > SMTP_IN_MAX_OUT) {
+        c->closed = true;
+        return;
+    }
     if (buf_append(&c->out, &c->out_len, &c->out_cap, text, strlen(text)) != 0) {
         c->closed = true;
         return;
@@ -609,7 +624,19 @@ static void queue_deliver_one(Server *srv, uint32_t msgid, uint32_t k,
         return;
     }
 
-    sres = smtp_out_send(s, cfg, from, to, body, bodylen, status, sizeof status);
+    /* smtp_out_send() blocks (connect timeout + reply timeouts) and, with
+       relay.retries > 0, also SLEEPS between in-attempt retries - and it
+       runs on the single-threaded poll loop that also serves SMTP accept
+       and the admin HTTP API.  Use a shallow one-shot Config (pointer
+       fields are shared; only the scalar retries is zeroed) so each
+       redrive tick does at most ONE relay attempt per due item; the
+       durable queue's across-attempt re-drive supplies the retry cadence. */
+    {
+        Config one_shot = *cfg;
+        one_shot.relay.retries = 0;
+        sres = smtp_out_send(s, &one_shot, from, to, body, bodylen, status,
+                             sizeof status);
+    }
     free(body);
 
     switch (sres) {
@@ -696,10 +723,14 @@ static void queue_redrive(Server *srv) {
         return;   /* items stay queued; the next tick retries */
     }
 
-    for (i = 0; i < qc.n; i++) {
+    for (i = 0; i < qc.n && i < SMTP_IN_REDRIVE_BATCH; i++) {
         queue_deliver_one(srv, qc.items[i].msgid, qc.items[i].k,
                           qc.items[i].from, qc.items[i].to,
                           qc.items[i].attempts);
+        free(qc.items[i].from);
+        free(qc.items[i].to);
+    }
+    for (; i < qc.n; i++) {   /* free the batch tail so skipped items don't leak */
         free(qc.items[i].from);
         free(qc.items[i].to);
     }
@@ -1179,6 +1210,16 @@ static void do_rcpt(Server *srv, Conn *c, const char *rest) {
         return;
     }
     (void)params;
+    /* The forward path flows into the rewritten From:/Reply-To: of
+       forwarded mail (reply_from_rewrite / reply_make_reverse), so it must
+       be as clean as the reverse path: printable ASCII, no quote/angle
+       chars.  This also blocks quoted-string local parts, whose '"' and
+       embedded '@' break out of the display-name quoting and poison the
+       reverse-alias domain split (which uses the first '@'). */
+    if (!path_clean(path)) {
+        conn_reply(c, "501 5.5.4 Invalid recipient address\r\n");
+        return;
+    }
     if (path[0] == '\0') {
         conn_reply(c, "501 5.5.4 Empty recipient\r\n");
         return;
@@ -1300,6 +1341,28 @@ static void process_commands(Server *srv, Conn *c, time_t now) {
         consumed = i + 1;
         memmove(c->in, c->in + consumed, c->in_len - consumed);
         c->in_len -= consumed;
+
+        /* Once DATA starts, every remaining buffered byte is MESSAGE DATA,
+           not commands (a pipelining client that sent the body in the same
+           segment must not have it eaten by the command parser).  Move the
+           leftover into the DATA buffer and stop command processing. */
+        if (c->state == ST_DATA && !c->closed) {
+            if (c->in_len > 0) {
+                if ((uint64_t)c->data_len + (uint64_t)c->in_len > srv->raw_cap) {
+                    conn_reply(c, "552 5.3.4 Message exceeds fixed limit\r\n");
+                    c->closed = true;
+                    return;
+                }
+                if (buf_append(&c->data, &c->data_len, &c->data_cap,
+                               c->in, c->in_len) != 0) {
+                    conn_reply(c, "451 4.3.0 Storage allocation failure\r\n");
+                    c->closed = true;
+                    return;
+                }
+                c->in_len = 0;
+            }
+            return;
+        }
     }
 }
 
@@ -1490,7 +1553,10 @@ static void server_poll(Server *srv) {
             if (c->closed) {
                 pfds[1 + s_nextra + i].events = (c->out_off < c->out_len) ? POLLOUT : 0;
             } else {
-                pfds[1 + s_nextra + i].events = POLLIN;
+                /* stop reading new commands while the reply backlog is high:
+                   backpressure instead of unbounded c->out growth. */
+                pfds[1 + s_nextra + i].events =
+                    (c->out_len < SMTP_IN_MAX_OUT / 2) ? POLLIN : 0;
                 if (c->out_off < c->out_len) pfds[1 + s_nextra + i].events |= POLLOUT;
             }
             pfds[1 + s_nextra + i].revents = 0;
