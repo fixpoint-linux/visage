@@ -11,6 +11,7 @@ CORE_DATALOG = $(DATALOG)/vendor/dafsa.c $(DATALOG)/vendor/dafsa_state.c \
              $(DATALOG)/vendor/dafsa_core.c $(DATALOG)/vendor/dafsa_persist.c \
              $(DATALOG)/vendor/dafsa_view.c $(DATALOG)/vendor/dafsa_crc32.c \
              $(DATALOG)/vendor/dafsa_wal.c $(DATALOG)/vendor/dafsa_build.c \
+             $(DATALOG)/vendor/dafsa_rank.c \
              $(DATALOG)/src/intern.c $(DATALOG)/src/termstore.c $(DATALOG)/src/relation.c \
              $(DATALOG)/src/vrelation.c $(DATALOG)/src/tupleset.c $(DATALOG)/src/parser.c \
              $(DATALOG)/src/compiler.c $(DATALOG)/src/vm.c $(DATALOG)/src/snapshot.c \
@@ -55,6 +56,8 @@ config_check.com: src/config.c src/config_check.c src/config.h src/visage.h $(CO
 	$(CC) $(CFLAGS) -o $@ src/config.c src/config_check.c $(CORE_DHALL)
 store_check.com: src/store.c src/store_check.c src/store.h src/visage.h $(CORE_DATALOG)
 	$(CC) $(CFLAGS) -o $@ src/store.c src/store_check.c $(CORE_DATALOG)
+store_bench.com: src/store.c src/store_bench.c src/store.h src/visage.h $(CORE_DATALOG)
+	$(CC) $(CFLAGS) -o $@ src/store.c src/store_bench.c $(CORE_DATALOG)
 mail_check.com: src/mail.c src/mail_check.c src/mail.h src/visage.h
 	$(CC) $(CFLAGS) -o $@ src/mail.c src/mail_check.c
 reply_check.com: src/reply.c src/reply_check.c src/reply.h src/store.c src/store.h src/mail.c src/mail.h src/config.h src/visage.h $(CORE_DATALOG)
@@ -85,4 +88,14 @@ wasm:
 	./scripts/build-wasm.sh
 	@node tests/wasm-smoke.js
 
-.PHONY: all e2e wasm
+# --- store benchmark + plots ----------------------------------------------
+# Runs the store benchmark (seeds N in {1e3..1e6}, measures load throughput,
+# warm/cold resolve latency, and on-disk size) into bench.csv, then renders
+# the latency + size charts with a dependency-free python3 script.
+# The full run seeds a 1e6-alias store and takes several minutes (revmap
+# interner is super-linear) — allow a generous timeout.
+bench: store_bench.com
+	./store_bench.com
+	python3 tools/bench_plot.py bench.csv docs/bench-latency.svg docs/bench-size.svg
+
+.PHONY: all e2e wasm bench

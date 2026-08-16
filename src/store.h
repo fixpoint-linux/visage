@@ -47,6 +47,20 @@ int store_seed_aliases(Store *s, const Config *cfg);
  * Returns 0 on success. */
 int store_alias_add(Store *s, const char *alias, const char *dest);
 
+/* Bulk-load alias facts from a headerless CSV (one row per dest,
+ * "domain,local,dest" — same 3 sym columns as alias).  Uses the engine's
+ * sorted bulk build (dl_load_facts) with NO per-row fsync, so it is much
+ * faster than store_alias_add for seeding a fresh store.  NOTE: unlike
+ * store_alias_add it does NOT lowercase-normalize the local/domain — the CSV
+ * must already be pre-normalized.  The schema must already be declared
+ * (store_open).  Returns 0 on success. */
+int store_alias_load_bulk(Store *s, const char *csv_path);
+
+/* Bulk-load revmap facts from a headerless CSV (one row per token,
+ * "token,sender,alias_addr,created_ts" — 3 sym + 1 raw-u32 column, matching
+ * revmap).  Same bulk path as store_alias_load_bulk.  Returns 0 on success. */
+int store_revmap_load_bulk(Store *s, const char *csv_path);
+
 /* Remove one alias -> destination mapping.  Returns 0 on success, including
  * the case where the mapping was already absent. */
 int store_alias_rm(Store *s, const char *alias, const char *dest);

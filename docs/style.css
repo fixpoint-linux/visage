@@ -373,6 +373,12 @@ textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3
 .card h3 { margin: 0 0 7px; font-size: 1.02rem; }
 .card p { margin: 0; color: var(--muted); font-size: 0.9rem; }
 
+/* ---- benchmark charts ---- */
+.bench-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 22px; margin-top: 30px; }
+.bench-charts figure { margin: 0; }
+.bench-charts img { width: 100%; height: auto; background: #fff; border-radius: 10px; padding: 10px; border: 1px solid rgba(255, 255, 255, 0.06); }
+.bench-charts figcaption { margin-top: 8px; font-size: 0.85rem; color: var(--muted); text-align: center; }
+
 /* ---- how it works ---- */
 .how-list { display: flex; flex-direction: column; gap: 14px; max-width: 780px; margin: 0 0 26px; }
 .how-item {

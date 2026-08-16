@@ -245,6 +245,12 @@ int store_alias_rm(Store *s, const char *alias, const char *dest) {
     return VISAGE_OK;
 }
 
+int store_alias_load_bulk(Store *s, const char *csv_path) {
+    if (!s || !s->db || !csv_path || !csv_path[0]) return VISAGE_EPARAM;
+    if (dl_load_facts(s->db, REL_ALIAS, csv_path) < 0) return VISAGE_ESTORE;
+    return VISAGE_OK;
+}
+
 int store_seed_aliases(Store *s, const Config *cfg) {
     size_t i, j;
     int rc;
@@ -356,6 +362,12 @@ int store_revmap_add(Store *s, const char *token, const char *sender,
                      const char *alias_addr) {
     return store_revmap_add_at(s, token, sender, alias_addr,
                                (uint32_t)time(NULL));
+}
+
+int store_revmap_load_bulk(Store *s, const char *csv_path) {
+    if (!s || !s->db || !csv_path || !csv_path[0]) return VISAGE_EPARAM;
+    if (dl_load_facts(s->db, REL_REVMAP, csv_path) < 0) return VISAGE_ESTORE;
+    return VISAGE_OK;
 }
 
 /* Collect-then-mutate walk for the revmap sweep: collect the full 4-col tuple

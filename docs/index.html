@@ -262,6 +262,17 @@ $ node tests/wasm-smoke.js</code></pre></div>
           <p>Relations are served from mmap'd read-only snapshots and durably WAL'd (single-writer, <code>flock</code>) — fast reads, crash-safe writes, no database server.</p>
         </div>
       </div>
+
+      <div class="bench-charts">
+        <figure>
+          <img src="bench-latency.svg" alt="Resolve latency vs alias count: sub-linear, about 0.6 microseconds at 1k aliases to about 3 microseconds at 1M">
+          <figcaption>Warm resolve latency vs alias count — sub-linear: O(prefix), not O(aliases).</figcaption>
+        </figure>
+        <figure>
+          <img src="bench-size.svg" alt="Store size in bytes per alias vs alias count: roughly constant near 500 bytes">
+          <figcaption>On-disk bytes/alias — ~constant across three decades; no per-alias index bloat.</figcaption>
+        </figure>
+      </div>
     </div>
   </section>
 

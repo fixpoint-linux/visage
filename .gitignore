@@ -6,3 +6,5 @@ var/
 *.o
 __pycache__/
 vendor/mbedtls/build/
+bench.csv
+store_bench.com
