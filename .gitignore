@@ -5,3 +5,4 @@
 var/
 *.o
 __pycache__/
+vendor/mbedtls/build/
