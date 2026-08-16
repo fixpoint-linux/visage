@@ -7,8 +7,10 @@ SMTP in C, CLI + minimal HTTP admin, single cosmocc APE.
 Legend: **P** = privacy/security, **R** = reliability, **F** = feature/interop, **A** = architecture.
 
 > Status (2026-08-16): the two original "## Next up" items (durable outbound
-> retry queue + STARTTLS relay) are **DONE** (commit 5963187). Their
-> remaining follow-ups (`starttls-verify`) are listed below.
+> retry queue + STARTTLS relay) are **DONE** (commit 5963187), and the
+> `starttls-verify` follow-up is **DONE** (real relay cert verification with
+> embedded Mozilla CA bundle + optional `relay.tls_ca` override). Remaining
+> deferred items are listed below.
 
 ---
 
@@ -29,12 +31,15 @@ Legend: **P** = privacy/security, **R** = reliability, **F** = feature/interop, 
 
 ## Security / correctness hardening
 
-- **[P] `starttls-verify` (real relay cert verification).** `starttls` is
-  currently opportunistic `VERIFY_NONE` (protects against passive snooping
-  only; an active MITM can strip STARTTLS or impersonate the relay). Add a
-  `relay.tls = "starttls-verify"` mode with `VERIFY_REQUIRED` + chain +
-  hostname check + a CA bundle (embed Mozilla list vs `relay.tls_ca` file
-  path — separate decision), plus a real-CA e2e.
+- ~~**[P] `starttls-verify` (real relay cert verification).**~~ **DONE
+  (2026-08-16).** `relay.tls = "starttls-verify"` = mandatory STARTTLS +
+  `VERIFY_REQUIRED` + hostname check (SAN/CN), trust anchors from an embedded
+  Mozilla CA bundle (default) or a `relay.tls_ca` PEM file. Fail-closed: a bad
+  cert → `SMTP_PERMFAIL` (never plaintext fallback, never AUTH-over-plaintext,
+  never retried); transport errors → `SMTP_TEMPFAIL` (queue re-drives).
+  Embedded bundle refreshed via `tools/gen_cacert.sh` + `src/data/cacert.pem`
+  (quarterly policy). `tests/verify_selfcheck.com` is the in-sandbox gate
+  (good/hostname-mismatch/wrong-CA/embedded-bundle).
 - **[F] Validate the MAIL FROM reverse-path as an addr-spec** (currently only
   `path_clean`'d). An embedded `"` breaks out of the quoted display-name into a
   malformed `From:`. No CR/LF injection today, but reject `"` `<` `>` (or run

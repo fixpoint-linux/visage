@@ -188,8 +188,8 @@ static void rcpt_decision_test(void) {
 static void tls_valid_test(void) {
     EXPECT(smtp_tls_valid("none") == 0, "tls_valid accepts none");
     EXPECT(smtp_tls_valid("starttls") == 0, "tls_valid accepts starttls");
-    EXPECT(smtp_tls_valid("starttls-verify") == -1,
-           "tls_valid rejects starttls-verify");
+    EXPECT(smtp_tls_valid("starttls-verify") == 0,
+           "tls_valid accepts starttls-verify");
     EXPECT(smtp_tls_valid("tls") == -1, "tls_valid rejects tls");
     EXPECT(smtp_tls_valid("") == -1, "tls_valid rejects empty");
     EXPECT(smtp_tls_valid(NULL) == -1, "tls_valid rejects NULL");

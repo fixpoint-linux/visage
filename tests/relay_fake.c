@@ -11,7 +11,7 @@
  * The loop keeps accepting connections until terminated (SIGTERM/SIGINT) so a
  * single run can record the forward message and the reply round-trip.
  *
- * Usage:  relay_fake PORT OUTDIR [--tls]
+ * Usage:  relay_fake PORT OUTDIR [--tls] [--cert PEM] [--key PEM]
  *
  * With `--tls` the accepted socket's reads/writes are wrapped in an mbedTLS
  * 1.2 SERVER session (the same vendored library the daemon links) using the
@@ -22,6 +22,11 @@
  * read: if the client fails to actually upgrade, the mbedTLS reads fail on the
  * plaintext bytes and nothing readable is recorded — so a non-empty, readable
  * msg-<seq>.eml + dialogue-<seq>.txt is itself proof TLS was used.
+ *
+ * `--cert`/`--key` override the served certificate/key (e.g. to serve the
+ * CA-signed leaf in the S-B4 starttls-verify scenarios).  They default to the
+ * existing tests/visage-test-cert.pem / visage-test-key.pem.  --tls, --cert
+ * and --key may appear in any position relative to PORT/OUTDIR.
  *
  * Exit codes: 0 normal exit; 1 bind/setup/TLS-init failure; 2 usage error. */
 #include <stdio.h>
@@ -88,6 +93,13 @@ static int  g_tls_status = 0;
 #define TEST_CERT_PATH "tests/visage-test-cert.pem"
 #define TEST_KEY_PATH  "tests/visage-test-key.pem"
 
+/* Served cert/key paths.  Default to the existing S-B3 test pair; the S-B4
+   starttls-verify scenarios override these with --cert/--key so the fake can
+   serve the CA-signed leaf (tests/verify-relay.pem/.key).  Set in main before
+   tls_server_init runs. */
+static const char *g_cert_path = TEST_CERT_PATH;
+static const char *g_key_path  = TEST_KEY_PATH;
+
 static int tls_server_init(void) {
     if (g_tls_ready) return g_tls_status;
     int r = 0;
@@ -97,7 +109,7 @@ static int tls_server_init(void) {
     mbedtls_ctr_drbg_init(&g_drbg);
     mbedtls_ssl_config_init(&g_ssl_conf);
 
-    r = mbedtls_x509_crt_parse_file(&g_cert, TEST_CERT_PATH);
+    r = mbedtls_x509_crt_parse_file(&g_cert, g_cert_path);
     if (r) goto fail;
     {
         const char *pers = "relay_fake";
@@ -105,7 +117,7 @@ static int tls_server_init(void) {
                                   (const unsigned char *) pers, strlen(pers));
         if (r) goto fail;
     }
-    r = mbedtls_pk_parse_keyfile(&g_key, TEST_KEY_PATH, NULL,
+    r = mbedtls_pk_parse_keyfile(&g_key, g_key_path, NULL,
                                  mbedtls_ctr_drbg_random, &g_drbg);
     if (r) goto fail;
     r = mbedtls_ssl_config_defaults(&g_ssl_conf, MBEDTLS_SSL_IS_SERVER,
@@ -413,22 +425,39 @@ int main(int argc, char **argv) {
     bool tls = false;
     const char *port_arg = NULL, *outdir = NULL;
     int i;
-    /* Usage: relay_fake PORT OUTDIR [--tls].  Tolerate the flag in any
-       position so callers may write PORT OUTDIR --tls or --tls PORT OUTDIR. */
+    /* Usage: relay_fake PORT OUTDIR [--tls] [--cert PEM] [--key PEM].
+       Tolerate the flags in any position relative to PORT/OUTDIR so callers
+       may write PORT OUTDIR --tls or --tls PORT OUTDIR etc. */
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--tls") == 0) {
             tls = true;
+        } else if (strcmp(argv[i], "--cert") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "usage: relay_fake PORT OUTDIR [--tls] "
+                                "[--cert PEM] [--key PEM]\n");
+                return 2;
+            }
+            g_cert_path = argv[++i];
+        } else if (strcmp(argv[i], "--key") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "usage: relay_fake PORT OUTDIR [--tls] "
+                                "[--cert PEM] [--key PEM]\n");
+                return 2;
+            }
+            g_key_path = argv[++i];
         } else if (!port_arg) {
             port_arg = argv[i];
         } else if (!outdir) {
             outdir = argv[i];
         } else {
-            fprintf(stderr, "usage: relay_fake PORT OUTDIR [--tls]\n");
+            fprintf(stderr, "usage: relay_fake PORT OUTDIR [--tls] "
+                            "[--cert PEM] [--key PEM]\n");
             return 2;
         }
     }
     if (!port_arg || !outdir) {
-        fprintf(stderr, "usage: relay_fake PORT OUTDIR [--tls]\n");
+        fprintf(stderr, "usage: relay_fake PORT OUTDIR [--tls] "
+                        "[--cert PEM] [--key PEM]\n");
         return 2;
     }
     long port = atol(port_arg);
@@ -439,7 +468,7 @@ int main(int argc, char **argv) {
     if (tls && tls_server_init() != 0) {
         fprintf(stderr, "relay_fake: cannot initialize TLS "
                         "(is %s / %s present from the project root?)\n",
-                TEST_CERT_PATH, TEST_KEY_PATH);
+                g_cert_path, g_key_path);
         return 1;
     }
 

@@ -160,7 +160,7 @@ static const char *resp_body(const char *resp) {
 
 static int cmd_daemon(const Config *cfg) {
     if (smtp_tls_valid(cfg->relay.tls) != 0) {
-        fprintf(stderr, "visage: relay.tls must be \"none\" or \"starttls\" "
+        fprintf(stderr, "visage: relay.tls must be \"none\", \"starttls\", or \"starttls-verify\" "
                         "(got '%s')\n", cfg->relay.tls ? cfg->relay.tls : "");
         return 1;
     }
@@ -209,8 +209,8 @@ static int cmd_config_check(const Config *cfg) {
     }
     if (smtp_tls_valid(cfg->relay.tls) != 0) {
         fprintf(stderr,
-                "visage: config-check: relay.tls must be \"none\" or "
-                "\"starttls\"\n");
+                "visage: config-check: relay.tls must be \"none\", \"starttls\", or "
+                "\"starttls-verify\"\n");
         ok = 0;
     }
     if (!ok) return 1;

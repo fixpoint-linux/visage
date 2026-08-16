@@ -116,9 +116,13 @@ body_of() {
 # --- TLS e2e scenarios (S-B3) -----------------------------------------------
 # gen_config emits a full config.dhall with the given SMTP/relay/HTTP ports, the
 # relay TLS mode and auth.enabled, and throwaway absolute storage dirs.
-#   gen_config <outfile> <smtp_port> <relay_port> <relay_tls> <auth_enabled> <http_port> <db> <spool>
+#   gen_config <outfile> <smtp_port> <relay_port> <relay_tls> <auth_enabled>
+#              <http_port> <db> <spool> [<relay_host>] [<relay_tls_ca>]
+# <relay_host> defaults to 127.0.0.1; <relay_tls_ca> defaults to "" (the embedded
+# Mozilla bundle).  Both are optional so existing callers are unchanged.
 gen_config() {
     local out="$1" smtp="$2" rport="$3" rtls="$4" authen="$5" hport="$6" db="$7" spool="$8"
+    local rhost="${9:-127.0.0.1}" rca="${10:-}"
     cat > "$out" <<DHALL
 let Auth = { enabled : Bool, username : Text, password : Text }
 in  let Config =
@@ -128,7 +132,7 @@ in  let Config =
       , limits : { message : Natural, line : Natural, rcpts : Natural
                  , cmd_timeout : Natural, data_timeout : Natural }
       , relay : { host : Text, port : Natural, auth : Auth, retries : Natural
-                , tls : Text, max_attempts : Natural }
+                , tls : Text, tls_ca : Text, max_attempts : Natural }
       , storage : { path : Text, spool : Text }
       , reply : { prefix : Text, separator : Text }
       , catch_all : Text
@@ -141,9 +145,9 @@ in  { hostname = "mx.example.com"
    , listen = { address = "127.0.0.1", port = $smtp }
    , limits = { message = 26214400, line = 1000, rcpts = 100
               , cmd_timeout = 300, data_timeout = 600 }
-   , relay = { host = "127.0.0.1", port = $rport
+   , relay = { host = "$rhost", port = $rport
              , auth = { enabled = $authen, username = "u", password = "p" }
-             , retries = 3, tls = "$rtls", max_attempts = 100 }
+             , retries = 3, tls = "$rtls", tls_ca = "$rca", max_attempts = 100 }
    , storage = { path = "$db", spool = "$spool" }
    , reply = { prefix = "reply", separator = "+" }
    , catch_all = ""
@@ -312,6 +316,164 @@ d2_negative_scenario() {
     wait "$rpid" 2>/dev/null || true
 }
 
+# --- starttls-verify e2e scenarios (S-B4) ----------------------------------
+# These prove the daemon's mandatory-TLS + CA/hostname verification path
+# against the committed S-B4 test PKI (tests/verify-ca.pem + the CA-signed leaf
+# tests/verify-relay.pem/.key with SAN DNS:localhost + IP:127.0.0.1).  The relay
+# hostname is 'localhost' so the daemon must (1) build a verified TLS chain
+# against the configured CA and (2) pass the SAN/CN hostname check for the name
+# it actually dials.
+
+# Scenario: relay.tls='starttls-verify' + relay.tls_ca=<test CA>, relay_fake
+# serving the CA-signed leaf.  The daemon must complete a VERIFY_REQUIRED
+# handshake (chain + hostname ok) and forward the message over the encrypted
+# channel: a non-empty, readable msg-<n>.eml + a dialogue showing the STARTTLS
+# upgrade and the decrypted MAIL exchange.
+verify_forward_scenario() {
+    echo
+    echo "== scenario: starttls-verify forward (tls=starttls-verify, tls_ca=test CA, leaf relay)"
+    local d="$WORK/verify" db="$WORK/verify/db" spool="$WORK/verify/spool" relay="$WORK/verify/relay"
+    local conf="$WORK/verify/config.dhall" rpid="" dpid=""
+    local SMTP=2546 RELAY=2547 HTTP=8094
+    mkdir -p "$d" "$relay" "$db" "$spool"
+    # Relay host is 'localhost' so the daemon verifies the SAN DNS:localhost.
+    gen_config "$conf" "$SMTP" "$RELAY" starttls-verify False "$HTTP" "$db" "$spool" \
+        localhost "$ROOT/tests/verify-ca.pem"
+
+    # Serve the CA-signed leaf (verify-relay.pem/.key) instead of the default
+    # S-B3 self-signed test cert, so the chain + hostname verify against the CA.
+    "$ROOT/tests/relay_fake.com" --tls --cert "$ROOT/tests/verify-relay.pem" \
+        --key "$ROOT/tests/verify-relay.key" "$RELAY" "$relay" >"$d/relay.log" 2>&1 &
+    rpid=$!
+    sleep 0.3
+    if ! kill -0 "$rpid" 2>/dev/null; then
+        fail "VERIFY: relay_fake --tls (CA leaf) failed to start (see $d/relay.log)"
+        return
+    fi
+    "$ROOT/visage.com" daemon -c "$conf" >"$d/daemon.log" 2>&1 &
+    dpid=$!
+    if wait_health "$HTTP" "$dpid" "$d/daemon.log"; then
+        pass "VERIFY: daemon up (GET /health ok)"
+    else
+        fail "VERIFY: daemon failed to become healthy"
+        [ -n "$rpid" ] && kill "$rpid" 2>/dev/null
+        return
+    fi
+
+    if "$ROOT/tests/smtptest.com" 127.0.0.1 "$SMTP" sender@foo.org jane@example.com "$WORK/msg1.eml" >"$d/fwd.log" 2>&1; then
+        pass "VERIFY: smtptest forward accepted"
+    else
+        fail "VERIFY: smtptest forward failed (see $d/fwd.log)"
+    fi
+
+    local FW="$relay/msg-1.eml" DL="$relay/dialogue-1.txt"
+    if wait_for_file "$FW"; then
+        pass "VERIFY: relay_fake recorded the decrypted forwarded message (chain+hostname verified)"
+        if grep -q '^Received:' "$FW"; then
+            pass "VERIFY: forwarded message has a Received header"
+        else
+            fail "VERIFY: forwarded message missing Received header"
+        fi
+        if grep -q 'reply+[0-9a-f]\{32\}@example.com' "$FW"; then
+            pass "VERIFY: forwarded From/Reply-To use a reverse alias"
+        else
+            fail "VERIFY: forwarded From/Reply-To are NOT a reverse alias"
+        fi
+        if diff -u <(body_of "$WORK/msg1.eml") <(body_of "$FW") >"$d/body.diff" 2>&1; then
+            pass "VERIFY: forwarded body matches msg1.eml"
+        else
+            fail "VERIFY: forwarded body differs from msg1.eml (see $d/body.diff)"
+        fi
+        # A readable MAIL line after the STARTTLS-upgrade reply proves the
+        # daemon actually upgraded AND completed the verified handshake.
+        if wait_for_file "$DL" && grep -q 'Ready to start TLS' "$DL" \
+           && grep -q 'MAIL FROM:<jane@example.com>' "$DL"; then
+            pass "VERIFY: dialogue shows STARTTLS upgrade + decrypted MAIL exchange"
+        else
+            fail "VERIFY: dialogue does not prove verified TLS was used (see $DL)"
+        fi
+    else
+        fail "VERIFY: relay_fake did not record a decrypted forwarded message"
+    fi
+
+    [ -n "$dpid" ] && kill "$dpid" 2>/dev/null
+    [ -n "$rpid" ] && kill "$rpid" 2>/dev/null
+    wait "$dpid" 2>/dev/null || true
+    wait "$rpid" 2>/dev/null || true
+}
+
+# Scenario: relay.tls='starttls-verify' + relay.tls_ca=<UNRELATED CA> (wrongca),
+# relay_fake still serving the CA-signed leaf.  The daemon connects, upgrades to
+# TLS, but the leaf does not chain to the configured CA -> verification fails
+# (NOT_TRUSTED) -> the daemon PERMFAILs with NO plaintext fallback and NO retry:
+# the message must NOT be forwarded and the dialogue must have no MAIL command.
+# relay_fake creates an empty msg-<n>.eml at connect, so use the -s (non-empty)
+# check for "not forwarded", exactly like the D2-negative precedent.
+verify_negative_scenario() {
+    echo
+    echo "== scenario: starttls-verify negative (tls=starttls-verify, tls_ca=unrelated CA)"
+    local d="$WORK/verifyneg" db="$WORK/verifyneg/db" spool="$WORK/verifyneg/spool" relay="$WORK/verifyneg/relay"
+    local conf="$WORK/verifyneg/config.dhall" rpid="" dpid=""
+    local SMTP=2549 RELAY=2550 HTTP=8095
+    mkdir -p "$d" "$relay" "$db" "$spool"
+    gen_config "$conf" "$SMTP" "$RELAY" starttls-verify False "$HTTP" "$db" "$spool" \
+        localhost "$ROOT/tests/verify-wrongca.pem"
+
+    "$ROOT/tests/relay_fake.com" --tls --cert "$ROOT/tests/verify-relay.pem" \
+        --key "$ROOT/tests/verify-relay.key" "$RELAY" "$relay" >"$d/relay.log" 2>&1 &
+    rpid=$!
+    sleep 0.3
+    if ! kill -0 "$rpid" 2>/dev/null; then
+        fail "VERIFY-NEG: relay_fake --tls failed to start (see $d/relay.log)"
+        return
+    fi
+    "$ROOT/visage.com" daemon -c "$conf" >"$d/daemon.log" 2>&1 &
+    dpid=$!
+    if wait_health "$HTTP" "$dpid" "$d/daemon.log"; then
+        pass "VERIFY-NEG: daemon up"
+    else
+        fail "VERIFY-NEG: daemon failed to become healthy"
+        [ -n "$rpid" ] && kill "$rpid" 2>/dev/null
+        return
+    fi
+
+    if "$ROOT/tests/smtptest.com" 127.0.0.1 "$SMTP" sender@foo.org jane@example.com "$WORK/msg1.eml" >"$d/fwd.log" 2>&1; then
+        pass "VERIFY-NEG: smtptest forward accepted (queued)"
+    else
+        fail "VERIFY-NEG: smtptest forward failed (see $d/fwd.log)"
+    fi
+
+    local DL="$relay/dialogue-1.txt" FW="$relay/msg-1.eml"
+    # Wait for the daemon to have reached the relay (dialogue non-empty) so we
+    # know the forward attempt ran, then assert the negative outcomes.
+    if wait_for_file "$DL"; then
+        pass "VERIFY-NEG: daemon connected to the relay (forward attempted)"
+        # It must have gotten as far as advertising/starting TLS...
+        if grep -q 'Ready to start TLS' "$DL"; then
+            pass "VERIFY-NEG: dialogue shows the STARTTLS upgrade was attempted"
+        else
+            fail "VERIFY-NEG: dialogue does not show a STARTTLS attempt (see $DL)"
+        fi
+        # ...but verification against the wrong CA fails, so no MAIL ever goes out.
+        if grep -q 'MAIL FROM:' "$DL"; then
+            fail "VERIFY-NEG: FAIL — MAIL sent over a failed-verification channel (see $DL)"
+        else
+            pass "VERIFY-NEG: no MAIL FROM in the dialogue (verification failed before MAIL)"
+        fi
+        if [ -s "$FW" ]; then
+            fail "VERIFY-NEG: FAIL — message forwarded despite failed verification"
+        else
+            pass "VERIFY-NEG: message NOT forwarded (untrusted cert -> permfail, no plaintext fallback)"
+        fi
+    else
+        fail "VERIFY-NEG: daemon did not attempt to reach the relay"
+    fi
+
+    [ -n "$dpid" ] && kill "$dpid" 2>/dev/null
+    [ -n "$rpid" ] && kill "$rpid" 2>/dev/null
+    wait "$dpid" 2>/dev/null || true
+    wait "$rpid" 2>/dev/null || true
+}
 # --- durable-queue e2e scenarios (S-A3) -----------------------------------
 # These prove at-least-once DURABLE delivery via the spool-file lifecycle (the
 # observable proxy for queued->delivered).  The daemon spools the sanitized
@@ -644,6 +806,10 @@ tls_forward_scenario
 
 # (S-B3) D2 negative scenario ------------------------------------------------
 d2_negative_scenario
+
+# (S-B4) starttls-verify scenarios -------------------------------------------
+verify_forward_scenario
+verify_negative_scenario
 
 # (S-A3) durable-queue scenarios ---------------------------------------------
 outage_redrive_scenario

@@ -83,9 +83,8 @@ int smtp_in_parse_size(const char *params, uint64_t *size, bool *present);
 /* Outbound relay STARTTLS helpers (smtp_out.c).                       */
 /* ------------------------------------------------------------------ */
 
-/* Validate relay.tls ∈ {"none", "starttls"}.  Returns 0 if valid, -1 if the
-   value is missing or not a supported TLS mode ("starttls-verify" is deferred
-   to a later slice and is rejected here).  Pure. */
+/* Validate relay.tls ∈ {"none", "starttls", "starttls-verify"}.  Returns 0 if
+   valid, -1 if the value is missing or not a supported TLS mode.  Pure. */
 int smtp_tls_valid(const char *tls);
 
 /* Does the multi-line SMTP reply advertise capability `cap`?  `reply` is the

@@ -23,9 +23,9 @@ int main(int argc, char **argv) {
     printf("limits:            message=%u line=%u rcpts=%u cmd_timeout=%u data_timeout=%u\n",
            cfg.limits.message, cfg.limits.line, cfg.limits.rcpts,
            cfg.limits.cmd_timeout, cfg.limits.data_timeout);
-    printf("relay:             %s:%u retries=%u tls=%s max_attempts=%u auth(enabled=%s user=%s)\n",
+    printf("relay:             %s:%u retries=%u tls=%s max_attempts=%u tls_ca=%s auth(enabled=%s user=%s)\n",
            cfg.relay.host, cfg.relay.port, cfg.relay.retries, cfg.relay.tls,
-           cfg.relay.max_attempts,
+           cfg.relay.max_attempts, cfg.relay.tls_ca,
            cfg.relay.auth.enabled ? "yes" : "no", cfg.relay.auth.username);
     printf("storage:           path=%s spool=%s\n", cfg.storage.path, cfg.storage.spool);
     printf("reply:             prefix=%s separator=%s\n", cfg.reply.prefix, cfg.reply.separator);

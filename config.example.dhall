@@ -6,7 +6,7 @@ in  let Config =
       , limits : { message : Natural, line : Natural, rcpts : Natural
                  , cmd_timeout : Natural, data_timeout : Natural }
       , relay : { host : Text, port : Natural, auth : Auth, retries : Natural
-                , tls : Text, max_attempts : Natural }
+                , tls : Text, tls_ca : Text, max_attempts : Natural }
       , storage : { path : Text, spool : Text }
       , reply : { prefix : Text, separator : Text }
       , catch_all : Text
@@ -21,7 +21,11 @@ in  { hostname = "mx.example.com"
               , cmd_timeout = 300, data_timeout = 600 }
    , relay = { host = "127.0.0.1", port = 2526
              , auth = { enabled = False, username = "", password = "" }
-             , retries = 3, tls = "none", max_attempts = 100 }
+             , retries = 3, tls = "none"
+             -- tls_ca = "" uses the embedded Mozilla CA bundle; a non-empty path
+             -- points at an operator-provided PEM CA bundle (only consulted
+             -- when tls == "starttls-verify").
+             , tls_ca = "", max_attempts = 100 }
    , storage = { path = "./var/db", spool = "./var/spool" }
    , reply = { prefix = "reply", separator = "+" }
    , catch_all = ""

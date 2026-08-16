@@ -5,15 +5,28 @@
  *   [AUTH PLAIN] -> MAIL FROM -> RCPT TO -> DATA -> dot-stuffed body ->
  *   CRLF.CRLF -> final reply -> QUIT -> close.
  *
- * STARTTLS (relay.tls == "starttls", opportunistic): after EHLO, if the relay
- * advertises STARTTLS (any line of the full multi-line EHLO reply), we send
- * "STARTTLS", expect 220, then run an mbedTLS 1.2 handshake over the SAME
- * blocking fd (authmode VERIFY_NONE + SNI via relay.host; protects against
- * passive snooping only), then re-EHLO over TLS (RFC 3207) and continue.  If
- * STARTTLS is NOT advertised (or the STARTTLS command is refused) we fall back
- * to plaintext — EXCEPT the hard rule: when relay.tls == "starttls" AND
- * relay.auth.enabled, we REFUSE the fallback (SMTP_PERMFAIL, "refusing to send
- * AUTH over plaintext") so AUTH PLAIN credentials are never sent in the clear.
+ * STARTTLS comes in two modes:
+ *   - relay.tls == "starttls" (opportunistic): after EHLO, if the relay
+ *     advertises STARTTLS (any line of the full multi-line EHLO reply), we send
+ *     "STARTTLS", expect 220, then run an mbedTLS 1.2 handshake over the SAME
+ *     blocking fd (authmode VERIFY_NONE + SNI via relay.host; protects against
+ *     passive snooping only), then re-EHLO over TLS (RFC 3207) and continue.
+ *     If STARTTLS is NOT advertised (or the STARTTLS command is refused) we
+ *     fall back to plaintext — EXCEPT the hard rule: when relay.tls ==
+ *     "starttls" AND relay.auth.enabled, we REFUSE the fallback (SMTP_PERMFAIL,
+ *     "refusing to send AUTH over plaintext") so AUTH PLAIN credentials are
+ *     never sent in the clear.
+ *   - relay.tls == "starttls-verify" (MANDATORY TLS + verification, fail
+ *     closed): STARTTLS MUST be advertised (else PERMFAIL) and the STARTTLS
+ *     command MUST be accepted (4xx refusal -> TEMPFAIL retry, 5xx/absent ->
+ *     PERMFAIL).  The handshake runs with VERIFY_REQUIRED against the trusted
+ *     CA chain (relay.tls_ca file, or the embedded Mozilla bundle when empty)
+ *     plus mbedtls_ssl_set_hostname for the SAN/CN check.  A certificate
+ *     verification failure (VERIFY_FAILED / BAD_CERTIFICATE / CA_CHAIN_REQUIRED
+ *     / non-zero verify_result) is PERMANENT — we NEVER fall back to plaintext
+ *     and NEVER retry a bad cert; any other TLS error (timeout/EOF/transport)
+ *     is TEMPFAIL and the durable queue re-drives.  No AUTH-over-plaintext is
+ *     possible in this mode (mandatory TLS subsumes the auth rule).
  * relay.tls == "none" is the unchanged plaintext path (byte-identical).
  *
  * Reply-code mapping: 2xx/3xx = ok, 4xx = tempfail, 5xx = permfail. Connect
@@ -39,6 +52,13 @@
 #include "mbedtls/entropy.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/error.h"
+#include "mbedtls/x509_crt.h"
+
+/* Embedded Mozilla CA bundle (src/data/cacert_pem.c — GENERATED; regenerate
+   via tools/gen_cacert.sh).  Referenced only on the 'starttls-verify' path as
+   the default trust anchor when relay.tls_ca is empty. */
+extern const char visage_cacert_pem[];
+extern const size_t visage_cacert_pem_len;
 
 #define SMTP_CONNECT_TIMEOUT_MS 10000  /* bounded connect timeout (10 s)   */
 #define SMTP_DEFAULT_TIMEOUT    60     /* fallback when a *timeout == 0     */
@@ -140,11 +160,12 @@ static int timeout_ms(uint32_t seconds) {
     return (int)ms;
 }
 
-/* Validate relay.tls ∈ {"none", "starttls"}.  Pure; unit-tested. */
+/* Validate relay.tls ∈ {"none", "starttls", "starttls-verify"}.  Pure; unit-tested. */
 int smtp_tls_valid(const char *tls) {
     if (!tls) return -1;
     if (strcmp(tls, "none") == 0) return 0;
     if (strcmp(tls, "starttls") == 0) return 0;
+    if (strcmp(tls, "starttls-verify") == 0) return 0;
     return -1;
 }
 
@@ -231,14 +252,21 @@ typedef struct SmtpConn {
 } SmtpConn;
 
 /* Process-wide mbedTLS state, seeded lazily and once (single-threaded daemon;
-   smtp_out_send may be called repeatedly).  The SSL config is shared across
-   connections: it is read-only after setup and every connection uses the same
-   CLIENT / VERIFY_NONE / TLS1.2 settings. */
+   smtp_out_send may be called repeatedly).  Two shared SSL configs are kept —
+   both read-only after setup and every connection reuses the same settings:
+     g_ssl_conf         CLIENT / VERIFY_NONE    / TLS1.2  (relay.tls "starttls")
+     g_ssl_conf_verify  CLIENT / VERIFY_REQUIRED / TLS1.2 + CA chain
+                        (relay.tls "starttls-verify"; CA chain installed
+                         lazily+sticky by smtp_tls_verify_init). */
 static mbedtls_entropy_context g_entropy;
 static mbedtls_ctr_drbg_context g_drbg;
 static mbedtls_ssl_config     g_ssl_conf;
+static mbedtls_ssl_config     g_ssl_conf_verify;
+static mbedtls_x509_crt       g_ca_chain;
 static bool g_tls_ready = false;
 static int  g_tls_status = 0;   /* 0 = ok, else the mbedTLS seed/setup error */
+static bool g_verify_ready = false;
+static int  g_verify_status = 0; /* 0 = ok, else the mbedTLS CA-parse error  */
 
 /* Idempotent one-time mbedTLS init.  Returns 0, or the mbedTLS error. */
 static int smtp_tls_global_init(void) {
@@ -247,6 +275,8 @@ static int smtp_tls_global_init(void) {
     mbedtls_entropy_init(&g_entropy);
     mbedtls_ctr_drbg_init(&g_drbg);
     mbedtls_ssl_config_init(&g_ssl_conf);
+    mbedtls_ssl_config_init(&g_ssl_conf_verify);
+    mbedtls_x509_crt_init(&g_ca_chain);
 
     const char pers[] = "visage_smtp_out";
     int r = mbedtls_ctr_drbg_seed(&g_drbg, mbedtls_entropy_func, &g_entropy,
@@ -263,10 +293,66 @@ static int smtp_tls_global_init(void) {
         mbedtls_ssl_conf_max_tls_version(&g_ssl_conf,
                                          MBEDTLS_SSL_VERSION_TLS1_2);
     }
+    if (r == 0)
+        r = mbedtls_ssl_config_defaults(&g_ssl_conf_verify, MBEDTLS_SSL_IS_CLIENT,
+                                        MBEDTLS_SSL_TRANSPORT_STREAM,
+                                        MBEDTLS_SSL_PRESET_DEFAULT);
+    if (r == 0) {
+        mbedtls_ssl_conf_rng(&g_ssl_conf_verify, mbedtls_ctr_drbg_random,
+                             &g_drbg);
+        mbedtls_ssl_conf_authmode(&g_ssl_conf_verify,
+                                  MBEDTLS_SSL_VERIFY_REQUIRED);
+        mbedtls_ssl_conf_min_tls_version(&g_ssl_conf_verify,
+                                         MBEDTLS_SSL_VERSION_TLS1_2);
+        mbedtls_ssl_conf_max_tls_version(&g_ssl_conf_verify,
+                                         MBEDTLS_SSL_VERSION_TLS1_2);
+    }
 
     g_tls_status = r;
     g_tls_ready = true;   /* do not re-seed on every attempt */
     return r;
+}
+
+/* Lazily parse the trusted CA chain and install it into g_ssl_conf_verify.
+   Sticky: attempted once, then the result is cached (a bad tls_ca file is not
+   re-read on every connection).  `tls_ca` empty (or NULL) selects the embedded
+   Mozilla bundle; otherwise it is a path to a PEM CA bundle.  Returns 0 on
+   success, or a negative mbedTLS error.  mbedtls_x509_crt_parse(_file) returns
+   the number of parsed certs (>= 0), and is permissive about a few skipped
+   certs — only a negative return is fatal; a non-negative count is accepted
+   even if some CAs were skipped. */
+static int smtp_tls_verify_init(const char *tls_ca) {
+    if (g_verify_ready) return g_verify_status;
+
+    int r = smtp_tls_global_init();
+    if (r != 0) {
+        g_verify_status = r;
+        g_verify_ready = true;
+        return r;
+    }
+
+    if (tls_ca && *tls_ca)
+        r = mbedtls_x509_crt_parse_file(&g_ca_chain, tls_ca);
+    else
+        /* mbedtls_x509_crt_parse's buflen must INCLUDE the terminating NUL
+           (its PEM-vs-DER detection checks buf[buflen-1] == '\0'); the
+           generated visage_cacert_pem_len excludes it, hence the +1. */
+        r = mbedtls_x509_crt_parse(&g_ca_chain,
+                                   (const unsigned char *)visage_cacert_pem,
+                                   visage_cacert_pem_len + 1);
+
+    if (r < 0) {
+        g_verify_status = r;
+        g_verify_ready = true;
+        return r;
+    }
+    /* r >= 0: some number of certs parsed (a few may be skipped — acceptable). */
+
+    mbedtls_ssl_conf_ca_chain(&g_ssl_conf_verify, &g_ca_chain, NULL);
+
+    g_verify_status = 0;
+    g_verify_ready = true;
+    return 0;
 }
 
 /* mbedTLS BIO callbacks: blocking, poll-bounded (the production contract).
@@ -646,9 +732,13 @@ static int smtp_connect(const Config *c, char *status_out, size_t status_sz) {
 /* Perform the TLS handshake over conn->fd.  conn->tls is false on entry; on
    success conn->tls is set and the caller may speak TLS.  On failure the fd
    stays plaintext (conn->tls left false) and the caller must abort the
-   attempt.  Returns 0 on success, or a negative mbedTLS error code
-   (MBEDTLS_ERR_SSL_TIMEOUT on a poll timeout). */
-static int smtp_tls_handshake(SmtpConn *conn, const char *host, uint32_t tmo,
+   attempt.  When `verify` is true the handshake uses g_ssl_conf_verify
+   (VERIFY_REQUIRED + the trusted CA chain installed by smtp_tls_verify_init,
+   keyed on tls_ca); the hostname is still set for SNI, which under
+   VERIFY_REQUIRED also enforces the SAN/CN match.  Returns 0 on success, or a
+   negative mbedTLS error code (MBEDTLS_ERR_SSL_TIMEOUT on a poll timeout). */
+static int smtp_tls_handshake(SmtpConn *conn, const char *host, bool verify,
+                              const char *tls_ca, uint32_t tmo,
                               char *status_out, size_t status_sz) {
     int r = smtp_tls_global_init();
     if (r != 0) {
@@ -656,13 +746,22 @@ static int smtp_tls_handshake(SmtpConn *conn, const char *host, uint32_t tmo,
         return r;
     }
 
-    r = mbedtls_ssl_setup(&conn->ssl, &g_ssl_conf);
+    if (verify) {
+        r = smtp_tls_verify_init(tls_ca);
+        if (r != 0) {
+            set_status(status_out, status_sz, "tls verify init failed");
+            return r;
+        }
+    }
+
+    r = mbedtls_ssl_setup(&conn->ssl,
+                          verify ? &g_ssl_conf_verify : &g_ssl_conf);
     if (r != 0) {
         set_status(status_out, status_sz, "tls setup failed");
         return r;
     }
     if (host && *host) {
-        r = mbedtls_ssl_set_hostname(&conn->ssl, host);   /* SNI */
+        r = mbedtls_ssl_set_hostname(&conn->ssl, host);   /* SNI (+SAN/CN) */
         if (r != 0) {
             set_status(status_out, status_sz, "tls hostname failed");
             return r;
@@ -805,7 +904,12 @@ static int smtp_dialogue(SmtpConn *conn, const Config *c, uint32_t tmo,
     int code = 0;
     int cls;
     int starttls_cls = SMTP_ERROR;   /* STARTTLS-command refusal class (if any) */
-    bool want_tls = (c->relay.tls && strcmp(c->relay.tls, "starttls") == 0);
+
+    /* Derive the TLS mode from relay.tls (validated by the caller). */
+    const char *tlsv = c->relay.tls;
+    bool tls_opp    = (tlsv && strcmp(tlsv, "starttls") == 0);        /* opportunistic */
+    bool tls_verify = (tlsv && strcmp(tlsv, "starttls-verify") == 0); /* mandatory TLS */
+    bool want_tls = tls_opp || tls_verify;
 
     /* 1. greeting: expect 220 */
     if (smtp_read_reply(conn, tmo, &code, text, sizeof text) != 0) {
@@ -836,24 +940,49 @@ static int smtp_dialogue(SmtpConn *conn, const Config *c, uint32_t tmo,
     if ((cls = smtp_class(code)) != SMTP_OK)
         return cls;
 
-    /* 3. STARTTLS (opportunistic) */
+    /* 3. STARTTLS */
     bool did_tls = false;
     if (want_tls) {
-        if (smtp_reply_has_cap(caps, caplen, "STARTTLS")) {
+        bool advertised = smtp_reply_has_cap(caps, caplen, "STARTTLS");
+        if (tls_verify && !advertised) {
+            /* Mandatory TLS: the relay must offer STARTTLS.  Absent -> it
+               cannot satisfy the policy — permanent (never fall back to
+               plaintext). */
+            set_status(status_out, status_sz,
+                       "relay does not advertise STARTTLS (starttls-verify)");
+            return SMTP_PERMFAIL;
+        }
+
+        if (advertised) {
             /* advertised: attempt the upgrade */
             if (smtp_exchange(conn, tmo, "STARTTLS\r\n", &code, status_out,
                               status_sz) != 0)
                 return SMTP_TEMPFAIL;
             if (code == 220) {
-                int hr = smtp_tls_handshake(conn, c->relay.host, tmo,
+                int hr = smtp_tls_handshake(conn, c->relay.host, tls_verify,
+                                            c->relay.tls_ca, tmo,
                                             status_out, status_sz);
                 if (hr != 0) {
-                    /* Handshake failed (timeout or a non-timeout TLS error):
-                     * transient — return TEMPFAIL so the durable queue
-                     * re-drives later.  Aborting here (never falling through
-                     * to AUTH) preserves the 'never AUTH over plaintext'
-                     * invariant regardless of auth.enabled.  status_out
-                     * already carries the specific mbedTLS error. */
+                    if (tls_verify) {
+                        /* Mandatory TLS: classify the handshake failure.  A
+                           certificate-verification failure is permanent — we
+                           NEVER fall back to plaintext and NEVER retry a bad
+                           cert; any other TLS error (timeout/EOF/transport) is
+                           transient and the durable queue re-drives.  status_out
+                           already carries the specific mbedTLS error.  The
+                           verify_result != 0 arm is belt-and-suspenders: it
+                           also catches a failed verify_init/setup (no session
+                           yet -> 0xFFFFFFFF), which is a config/alloc error and
+                           correctly fail-closed as PERMFAIL. */
+                        if (hr == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED ||
+                            hr == MBEDTLS_ERR_SSL_BAD_CERTIFICATE ||
+                            hr == MBEDTLS_ERR_SSL_CA_CHAIN_REQUIRED ||
+                            mbedtls_ssl_get_verify_result(&conn->ssl) != 0)
+                            return SMTP_PERMFAIL;
+                        return SMTP_TEMPFAIL;
+                    }
+                    /* opportunistic: transient — return TEMPFAIL so the durable
+                       queue re-drives later (never falling through to AUTH). */
                     return SMTP_TEMPFAIL;
                 }
                 did_tls = true;
@@ -865,17 +994,25 @@ static int smtp_dialogue(SmtpConn *conn, const Config *c, uint32_t tmo,
                     return cls;
             } else {
                 /* STARTTLS command refused.  RFC 3207: a 4xx (e.g. 454) is
-                 * temporary (the server may offer TLS later); a 5xx means the
-                 * upgrade is unavailable.  Capture the class so the auth rule
-                 * below maps 4xx -> TEMPFAIL (retry) and 5xx -> PERMFAIL. */
+                   temporary (the server may offer TLS later); a 5xx means the
+                   upgrade is unavailable. */
                 starttls_cls = smtp_class(code);
+                if (tls_verify) {
+                    /* Mandatory TLS: 4xx -> TEMPFAIL (retry), 5xx/absent ->
+                       PERMFAIL. */
+                    set_status(status_out, status_sz,
+                               "STARTTLS refused (starttls-verify)");
+                    return (starttls_cls == SMTP_TEMPFAIL) ? SMTP_TEMPFAIL
+                                                           : SMTP_PERMFAIL;
+                }
             }
         }
-        if (!did_tls && c->relay.auth.enabled) {
-            /* STARTTLS unavailable (not advertised, or command refused): hard
-               rule — never send AUTH PLAIN credentials in the clear.  A 4xx
-               refusal is transient (retry later); not-advertised or 5xx is
-               permanent. */
+
+        if (!did_tls && tls_opp && c->relay.auth.enabled) {
+            /* Opportunistic STARTTLS unavailable (not advertised, or command
+               refused): hard rule — never send AUTH PLAIN credentials in the
+               clear.  A 4xx refusal is transient (retry later); not-advertised
+               or 5xx is permanent. */
             set_status(status_out, status_sz,
                        "refusing to send AUTH over plaintext");
             return (starttls_cls == SMTP_TEMPFAIL) ? SMTP_TEMPFAIL
@@ -950,7 +1087,7 @@ int smtp_out_send(Store *s, const Config *c, const char *from, const char *to,
     }
     if (smtp_tls_valid(c->relay.tls) != 0) {
         set_status(status_out, status_sz,
-                   "invalid relay.tls (expected \"none\" or \"starttls\")");
+                   "invalid relay.tls (expected \"none\", \"starttls\", or \"starttls-verify\")");
         return SMTP_ERROR;
     }
     if (has_crlf(from) || has_crlf(to)) {

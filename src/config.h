@@ -38,6 +38,7 @@ typedef struct {
     uint32_t       retries;
     char          *tls;
     uint32_t       max_attempts;   /* durable-queue redrive cap (0 -> default) */
+    char          *tls_ca;         /* PEM CA bundle path ("" -> embedded bundle) */
 } ConfigRelay;
 
 /* storage { path, spool } */

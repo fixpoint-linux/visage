@@ -142,6 +142,18 @@ static bool walk_config(Config *cfg, Term *nf) {
             cfg->relay.max_attempts = 100;
         }
     }
+    {
+        /* relay.tls_ca is optional (older configs omit it): path to a PEM CA
+         * bundle used for peer verification when tls == "starttls-verify";
+         * empty means the embedded Mozilla bundle.  Default "" when absent. */
+        Term *ca = rec_get(rel, "tls_ca");
+        if (ca) {
+            if (!text_dup(ca, &cfg->relay.tls_ca)) return false;
+        } else {
+            cfg->relay.tls_ca = strdup("");
+            if (!cfg->relay.tls_ca) { cfg_error("out of memory"); return false; }
+        }
+    }
     Term *auth = rec_get(rel, "auth");
     if (!auth) { cfg_error("config missing 'relay.auth'"); return false; }
     if (!bool_get(rec_get(auth, "enabled"), &cfg->relay.auth.enabled)) return false;
@@ -273,6 +285,7 @@ void config_free(Config *cfg) {
     free(cfg->listen.address);
     free(cfg->relay.host);
     free(cfg->relay.tls);
+    free(cfg->relay.tls_ca);
     free(cfg->relay.auth.username);
     free(cfg->relay.auth.password);
     free(cfg->storage.path);
