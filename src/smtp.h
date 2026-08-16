@@ -94,4 +94,9 @@ int smtp_tls_valid(const char *tls);
    each line.  Pure — no I/O. */
 bool smtp_reply_has_cap(const char *reply, size_t len, const char *cap);
 
+/* Classify an AUTH PLAIN final reply code: 235 -> SMTP_OK, 4xx ->
+   SMTP_TEMPFAIL, 5xx (incl 535/534) -> SMTP_PERMFAIL, anything else ->
+   SMTP_ERROR.  Pure — no I/O. */
+int smtp_auth_class(int code);
+
 #endif /* VISAGE_SMTP_H */

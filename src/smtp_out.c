@@ -786,9 +786,30 @@ static int smtp_tls_handshake(SmtpConn *conn, const char *host, bool verify,
 /* AUTH PLAIN                                                         */
 /* ------------------------------------------------------------------ */
 
-/* Perform "AUTH PLAIN <base64(authzid NUL authcid NUL passwd)>". We use
-   authzid = authcid = username. Returns a status class (SMTP_OK on 235,
-   SMTP_TEMPFAIL on 4xx, SMTP_PERMFAIL on 5xx, SMTP_ERROR otherwise). */
+/* Classify an AUTH PLAIN final reply code: 235 -> SMTP_OK, 4xx ->
+   SMTP_TEMPFAIL, 5xx (incl 535/534 bad-credentials) -> SMTP_PERMFAIL, anything
+   else (a 2xx/3xx that isn't 235, an unexpected second 334 challenge, or an
+   out-of-range code) -> SMTP_ERROR.  Pure — no I/O; unit-tested. */
+int smtp_auth_class(int code) {
+    if (code == 235) return SMTP_OK;
+    if (code >= 400 && code < 500) return SMTP_TEMPFAIL;
+    if (code >= 500 && code < 600) return SMTP_PERMFAIL;
+    return SMTP_ERROR;
+}
+
+/* Perform SMTP AUTH PLAIN (RFC 4954/4616): the SASL PLAIN response is
+   base64("" NUL username NUL password) with an empty authzid.  Two forms are
+   supported, in order:
+     (a) single-line "AUTH PLAIN <b64>" -> 235 — the common path; most relays
+         accept the RFC 4954 initial response.
+     (b) two-step "AUTH PLAIN <b64>" -> 334 <challenge> -> "<b64>" -> 235/535 —
+         some relays reject the one-line form and instead solicit the response
+         with a 334.  Per RFC 4616 the client ignores the 334 challenge data
+         and sends the fixed PLAIN response unchanged.
+   Returns a status class (SMTP_OK on 235, SMTP_TEMPFAIL on 4xx, SMTP_PERMFAIL
+   on 5xx, SMTP_ERROR otherwise).  The caller guarantees this is reached only
+   when the transport is already cleared to carry credentials (TLS, or the
+   explicit no-auth-no-TLS plaintext path). */
 static int smtp_auth_plain(SmtpConn *conn, uint32_t tmo,
                            const ConfigRelayAuth *auth, char *status_out,
                            size_t status_sz) {
@@ -834,7 +855,7 @@ static int smtp_auth_plain(SmtpConn *conn, uint32_t tmo,
     }
     free(plain);
 
-    /* "AUTH PLAIN " (11 bytes) + encoded + CRLF */
+    /* (a) single-line form: "AUTH PLAIN " (11 bytes) + encoded + CRLF */
     size_t cmdlen = 11 + elen + 2;
     char *cmd = malloc(cmdlen + 1);
     if (!cmd) {
@@ -846,15 +867,41 @@ static int smtp_auth_plain(SmtpConn *conn, uint32_t tmo,
     memcpy(cmd + 11, b64, elen);
     memcpy(cmd + 11 + elen, "\r\n", 2);
     cmd[cmdlen] = '\0';
-    free(b64);
 
     int code = 0;
     int r = smtp_exchange(conn, tmo, cmd, &code, status_out, status_sz);
     free(cmd);
-    if (r != 0) return SMTP_TEMPFAIL;
-    if (code != 235)
-        return (smtp_class(code) == SMTP_OK) ? SMTP_ERROR : smtp_class(code);
-    return SMTP_OK;
+    if (r != 0) {
+        free(b64);
+        return SMTP_TEMPFAIL;
+    }
+
+    /* (b) two-step form: a 334 reply means the relay declined the initial
+       response and wants the credential on its own line (RFC 4954 §4).  Some
+       relays reject the one-line form outright and require this.  Send the
+       base64 blob standalone and read the final reply; ignore any challenge
+       data the 334 line carried (RFC 4616: the PLAIN response is fixed). */
+    if (code == 334) {
+        size_t resplen = elen + 2;
+        char *resp = malloc(resplen + 1);
+        if (!resp) {
+            free(b64);
+            set_status(status_out, status_sz, "out of memory");
+            return SMTP_ERROR;
+        }
+        memcpy(resp, b64, elen);
+        memcpy(resp + elen, "\r\n", 2);
+        resp[resplen] = '\0';
+        free(b64);
+
+        r = smtp_exchange(conn, tmo, resp, &code, status_out, status_sz);
+        free(resp);
+        if (r != 0) return SMTP_TEMPFAIL;
+        return smtp_auth_class(code);
+    }
+
+    free(b64);
+    return smtp_auth_class(code);
 }
 
 /* ------------------------------------------------------------------ */

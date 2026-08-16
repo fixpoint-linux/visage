@@ -228,6 +228,26 @@ static void cap_test(void) {
     EXPECT(!smtp_reply_has_cap("250 OK\r\n", 7, NULL), "cap: NULL cap -> false");
 }
 
+/* ---- outbound AUTH PLAIN classification (R3) ---- */
+
+/* smtp_auth_class maps a final AUTH reply code to its delivery class.  The
+   334 routing decision itself lives in smtp_auth_plain (needs a live SmtpConn),
+   so this pins the classification that both the single-line and two-step paths
+   converge on. */
+static void auth_class_test(void) {
+    EXPECT(smtp_auth_class(235) == SMTP_OK, "auth_class 235 -> OK");
+    EXPECT(smtp_auth_class(535) == SMTP_PERMFAIL, "auth_class 535 -> PERMFAIL");
+    EXPECT(smtp_auth_class(534) == SMTP_PERMFAIL, "auth_class 534 -> PERMFAIL");
+    EXPECT(smtp_auth_class(450) == SMTP_TEMPFAIL, "auth_class 450 -> TEMPFAIL");
+    EXPECT(smtp_auth_class(454) == SMTP_TEMPFAIL, "auth_class 454 -> TEMPFAIL");
+    EXPECT(smtp_auth_class(334) == SMTP_ERROR,
+           "auth_class unexpected 334 -> ERROR");
+    EXPECT(smtp_auth_class(250) == SMTP_ERROR, "auth_class 250 -> ERROR");
+    EXPECT(smtp_auth_class(301) == SMTP_ERROR, "auth_class 301 -> ERROR");
+    EXPECT(smtp_auth_class(100) == SMTP_ERROR, "auth_class 100 -> ERROR");
+    EXPECT(smtp_auth_class(600) == SMTP_ERROR, "auth_class 600 -> ERROR");
+}
+
 int main(void) {
     /* base64 known vectors (RFC 4648) */
     b64_test("", 0, "", "base64 empty");
@@ -293,6 +313,9 @@ int main(void) {
     /* outbound STARTTLS pure helpers (S-B2) */
     tls_valid_test();
     cap_test();
+
+    /* outbound AUTH PLAIN classification (R3) */
+    auth_class_test();
 
     printf("\n%d checks, %d failed\n", nchecks, nfails);
     return nfails ? 1 : 0;
