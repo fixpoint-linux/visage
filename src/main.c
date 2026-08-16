@@ -185,6 +185,29 @@ static int cmd_daemon(const Config *cfg) {
     return http_serve(s, cfg);
 }
 
+/* Case-insensitive match of `s` against a known-default/weak token. */
+static int ci_eq(const char *s, const char *t) {
+    while (*s && *t) {
+        unsigned char a = (unsigned char)*s, b = (unsigned char)*t;
+        if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+        if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+        if (a != b) return 0;
+        s++; t++;
+    }
+    return *s == 0 && *t == 0;
+}
+
+static int config_check_token_is_weak(const char *token) {
+    static const char *const weak[] = {
+        "change-me", "changeme", "change_me", "password",
+        "secret", "admin", "token", "letmein", "default"
+    };
+    size_t i;
+    for (i = 0; i < sizeof weak / sizeof weak[0]; i++)
+        if (ci_eq(token, weak[i])) return 1;
+    return 0;
+}
+
 static int cmd_config_check(const Config *cfg) {
     int ok = 1;
     if (!cfg->hostname || !cfg->hostname[0]) {
@@ -206,6 +229,20 @@ static int cmd_config_check(const Config *cfg) {
     if (!cfg->admin.token || !cfg->admin.token[0]) {
         fprintf(stderr, "visage: config-check: missing admin token\n");
         ok = 0;
+    } else if (strlen(cfg->admin.token) > ADMIN_TOKEN_MAX_LEN) {
+        /* A token longer than the 512-byte Authorization buffer (http.c
+           auth_ok) can never authenticate; fail closed so the operator does
+           not ship a config whose admin API is unreachable. */
+        fprintf(stderr,
+                "visage: config-check: admin token too long "
+                "(> %d chars, cannot authenticate)\n", ADMIN_TOKEN_MAX_LEN);
+        ok = 0;
+    } else if (strlen(cfg->admin.token) < 32 || config_check_token_is_weak(cfg->admin.token)) {
+        /* WARN only, never fail: the shipped config.example.dhall uses the
+           placeholder 'change-me' and must still pass config-check. */
+        fprintf(stderr,
+                "visage: config-check: WARNING admin token is weak "
+                "(short or a known default); use a long random token\n");
     }
     if (smtp_tls_valid(cfg->relay.tls) != 0) {
         fprintf(stderr,

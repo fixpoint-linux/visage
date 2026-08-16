@@ -137,6 +137,9 @@ static int auth_ok(const char *req, size_t reqlen, size_t header_end,
     char auth[512];
     const char *p;
     (void)reqlen;
+    /* auth[512] bounds the header value, so a "Bearer <token>" token longer
+       than ~505 chars is truncated and can never authenticate.  config-check
+       (main.c) enforces this ceiling via ADMIN_TOKEN_MAX_LEN (500). */
     if (!token || !token[0]) return 0;
     if (header_end == SIZE_MAX ||
         http_header_value(req, header_end, "Authorization", auth, sizeof auth) != 0)

@@ -303,6 +303,19 @@ int mail_unstuff_dots(char *buf, size_t *len) {
     return 0;
 }
 
+int mail_data_has_ctl(const char *buf, size_t len) {
+    size_t i;
+    if (!buf) return 0;
+    for (i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)buf[i];
+        /* NUL, DEL, or a C0 control other than TAB/LF/CR is rejected.
+           Bytes 0x80..0xFF (8BITMIME) are allowed. */
+        if (c == 0x00 || c == 0x7F || (c < 0x20 && c != 0x09 && c != 0x0A && c != 0x0D))
+            return 1;
+    }
+    return 0;
+}
+
 int mail_stuff_dots(const char *in, size_t inlen, char **out, size_t *outlen) {
     if (out) *out = NULL;
     if (outlen) *outlen = 0;

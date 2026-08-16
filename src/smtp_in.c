@@ -20,6 +20,7 @@
 #include "dkim.h"
 
 #include <sys/socket.h>
+#include <netinet/in.h>
 #include <netdb.h>
 #include <poll.h>
 #include <fcntl.h>
@@ -43,6 +44,13 @@
 /* Max deliveries re-driven per event-loop tick (bounded blocking relay work;
    skipped items remain due and are picked up on the next tick). */
 #define SMTP_IN_REDRIVE_BATCH  8
+
+/* Inbound connection limits.  A total cap bounds memory/CPU under a flood, and
+   the per-IP cap prevents one host from exhausting the pool (mitigating
+   slowloris-style resource hogging).  Both are enforced at accept time, BEFORE
+   the 220 greeting, by replying 421 and closing. */
+#define SMTP_IN_MAX_CONNS         512
+#define SMTP_IN_MAX_CONNS_PER_IP  16
 
 /* log relation "dir" column codes (raw u32). */
 #define LOG_DIR_IN  1u
@@ -173,6 +181,8 @@ typedef struct Conn {
     char  *out;                /* reply output buffer (owned) */
     size_t out_len, out_off, out_cap;
     time_t last_act;           /* last activity (idle-timeout clock) */
+    unsigned char peer_ip[16];  /* peer address bytes (4 IPv4 / 16 IPv6) */
+    uint8_t       peer_ip_len;  /* 0 = not set */
 } Conn;
 
 typedef struct Server {
@@ -184,6 +194,7 @@ typedef struct Server {
     /* effective limits (0 replaced with defaults) */
     uint32_t max_line, max_msg, max_rcpts, cmd_tmo, data_tmo;
     uint64_t raw_cap;          /* bounded DATA accumulation ceiling */
+    time_t   next_revmap_sweep; /* next time to expire stale revmap rows */
 } Server;
 
 /* ------------------------------------------------------------------ */
@@ -866,7 +877,12 @@ static int forward_one(Server *srv, const char *msg, size_t msglen,
 
     forward_sign(cfg, alias, &sanitized, &slen);
 
-    rc = queue_enqueue(srv, msgid, k, alias, dest, sanitized, slen);
+    /* Preserve the null reverse-path end-to-end: for a bounce (sender empty)
+       the envelope MAIL FROM must be <> (not the alias), otherwise the
+       destination bounces the bounce forever.  Only the envelope changes; the
+       header rewrite (rw.from=alias etc.) is unchanged. */
+    const char *env_from = (sender[0] != '\0') ? alias : "";
+    rc = queue_enqueue(srv, msgid, k, env_from, dest, sanitized, slen);
     mail_free(sanitized);
     return (rc == 0) ? 0 : -1;
 }
@@ -973,6 +989,15 @@ static void deliver_message(Server *srv, Conn *c, time_t now) {
 
     if (mail_unstuff_dots(msg, &msglen) != 0) {
         conn_reply(c, "451 4.3.0 Temporary processing error\r\n");
+        return;
+    }
+    /* Reject (never sanitize) NUL/control bytes: NUL is invalid in SMTP DATA,
+       and silently stripping controls would corrupt 8BITMIME content; upstream
+       relays would otherwise tempfail-loop this mail.  Runs on the
+       dot-unstuffed body.  8-bit bytes (0x80-0xFF) remain allowed. */
+    if (mail_data_has_ctl(msg, msglen)) {
+        conn_reply(c, "554 5.6.0 Message contains NUL or control bytes\r\n");
+        c->closed = true;
         return;
     }
     if (msglen > (size_t)srv->max_msg) {
@@ -1460,9 +1485,47 @@ static int poll_timeout_ms(const Server *srv, time_t now) {
     return ms;
 }
 
+/* Extract the peer address bytes (AF_INET -> 4 from sin_addr, AF_INET6 -> 16
+   from sin6_addr) into peer_ip/peer_ip_len; returns 0 on success, -1 on an
+   unknown family (len stays 0). */
+static int peer_ip_of(struct sockaddr_storage *sa, socklen_t salen,
+                      unsigned char *peer_ip, uint8_t *peer_ip_len) {
+    *peer_ip_len = 0;
+    if (sa->ss_family == AF_INET && salen >= sizeof(struct sockaddr_in)) {
+        struct sockaddr_in *a = (struct sockaddr_in *)sa;
+        memcpy(peer_ip, &a->sin_addr, 4);
+        *peer_ip_len = 4;
+        return 0;
+    }
+    if (sa->ss_family == AF_INET6 && salen >= sizeof(struct sockaddr_in6)) {
+        struct sockaddr_in6 *a = (struct sockaddr_in6 *)sa;
+        memcpy(peer_ip, &a->sin6_addr, 16);
+        *peer_ip_len = 16;
+        return 0;
+    }
+    return -1;
+}
+
+/* Count how many live connections share the peer's address (O(n), n<=512).
+   Deriving it by scanning srv->conns avoids a separate table and eliminates
+   decrement/leak bugs — the count is always exactly the live conn list. */
+static size_t count_peer_conns(const Server *srv, const unsigned char *ip,
+                               uint8_t iplen) {
+    size_t n = 0, i;
+    if (iplen == 0) return 0;
+    for (i = 0; i < srv->nconns; i++) {
+        const Conn *c = srv->conns[i];
+        if (c->peer_ip_len == iplen && memcmp(c->peer_ip, ip, iplen) == 0)
+            n++;
+    }
+    return n;
+}
+
 static void server_accept(Server *srv, time_t now) {
     for (;;) {
-        int fd = accept(srv->listen_fd, NULL, NULL);
+        struct sockaddr_storage sa;
+        socklen_t salen = sizeof sa;
+        int fd = accept(srv->listen_fd, (struct sockaddr *)&sa, &salen);
         Conn *c;
         char g[512];
         int gn;
@@ -1473,11 +1536,32 @@ static void server_accept(Server *srv, time_t now) {
         }
         set_nonblock(fd);
 
+        /* Connection limits are enforced BEFORE the 220 greeting: a client
+           refused here sees only the 421. */
+        if (srv->nconns >= SMTP_IN_MAX_CONNS) {
+            const char busy[] = "421 4.7.0 Too many connections\r\n";
+            (void)send(fd, busy, sizeof busy - 1, MSG_NOSIGNAL);
+            close(fd);
+            continue;
+        }
+        {
+            unsigned char ip[16];
+            uint8_t iplen = 0;
+            (void)peer_ip_of(&sa, salen, ip, &iplen);
+            if (iplen != 0 && count_peer_conns(srv, ip, iplen) >= SMTP_IN_MAX_CONNS_PER_IP) {
+                const char busy[] = "421 4.7.0 Too many connections\r\n";
+                (void)send(fd, busy, sizeof busy - 1, MSG_NOSIGNAL);
+                close(fd);
+                continue;
+            }
+        }
+
         c = calloc(1, sizeof *c);
         if (!c) { close(fd); continue; }
         c->fd = fd;
         c->state = ST_INIT;
         c->last_act = now;
+        (void)peer_ip_of(&sa, salen, c->peer_ip, &c->peer_ip_len);
 
         if (srv->nconns == srv->conn_cap) {
             size_t nc = srv->conn_cap ? srv->conn_cap * 2 : 16;
@@ -1529,6 +1613,12 @@ static void server_poll(Server *srv) {
         /* Re-drive any due durable-queue deliveries.  Idempotent and a no-op
            when nothing is due (full walk, filtered). */
         queue_redrive(srv);
+
+        /* Hourly sweep: expire stale reply-token reverse-map rows. */
+        if (now >= srv->next_revmap_sweep) {
+            (void)store_revmap_expire(srv->store, (uint32_t)now);
+            srv->next_revmap_sweep = now + 3600;
+        }
 
         /* build pollfd array: [0] SMTP listen, [1..] extra listeners,
            then SMTP conns, then a fixed block of HTTP conn slots. */
@@ -1680,6 +1770,7 @@ static void server_init(Server *srv, const Config *c, Store *s) {
     srv->cmd_tmo = c->limits.cmd_timeout ? c->limits.cmd_timeout : SMTP_IN_DEFAULT_TIMEOUT;
     srv->data_tmo = c->limits.data_timeout ? c->limits.data_timeout : SMTP_IN_DEFAULT_TIMEOUT;
     srv->raw_cap = (uint64_t)srv->max_msg * 2 + 16;
+    srv->next_revmap_sweep = time(NULL) + 3600;   /* first sweep in an hour */
 }
 
 int smtp_in_main(const Config *c, const Store *s) {
@@ -1692,6 +1783,9 @@ int smtp_in_main(const Config *c, const Store *s) {
     /* Startup recovery: reset any delivery left "delivering" by a crash, then
        drain everything due before serving (at-least-once). */
     (void)store_queue_reset_delivering((Store *)s);
+    /* Expire stale reverse-map rows now so a long-dormant process never keeps
+       leaked reply tokens alive. */
+    (void)store_revmap_expire((Store *)s, (uint32_t)time(NULL));
     queue_redrive(&srv);
 
     server_poll(&srv);

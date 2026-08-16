@@ -34,6 +34,10 @@ in  { hostname = "mx.example.com"
                , { alias = "shopping@example.com", destinations = [ "jane@realmail.example", "bob@realmail.example" ] }
                ]
    , http = { address = "127.0.0.1", port = 8080 }
+   -- admin.token is the bearer token for the admin HTTP API.  It is read into
+   -- a 512-byte Authorization buffer, so it must be at most ~505 chars (config
+   -- enforces a 500-char ceiling); the placeholder below is fine for config-check
+   -- but a real deployment must use a long random token.
    , admin = { token = "change-me" }
    , dkim = [] : List { domain : Text, selector : Text, private_key : Text }
    } : Config

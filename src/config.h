@@ -71,6 +71,13 @@ typedef struct {
     char *token;
 } ConfigAdmin;
 
+/* Maximum length of the admin bearer token.  The HTTP path parses the
+   Authorization header into a 512-byte buffer (see http.c auth_ok), so a
+   "Bearer <token>" token longer than ~505 chars can never authenticate; cap
+   the configured value at 500 so config-check fails closed (fail-fast
+   lockout) rather than silently shipping an unusable token. */
+#define ADMIN_TOKEN_MAX_LEN 500
+
 /* dkim element: { domain, selector, private_key } — domain is the signing
    domain (a=rsa-sha256, c=relaxed/relaxed), selector the DKIM selector, and
    private_key the operator PEM RSA private-key file path. */

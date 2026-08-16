@@ -63,9 +63,21 @@ int store_resolve(Store *s, const char *alias, char ***dests, size_t *ndests);
 int store_revmap_add(Store *s, const char *token, const char *sender,
                      const char *alias_addr);
 
+/* Record a reply-token reverse mapping with an explicit creation time (raw u32
+ * unix seconds).  Testable variant of store_revmap_add; the TTL / expiry logic
+ * keys off this column. */
+int store_revmap_add_at(Store *s, const char *token, const char *sender,
+                        const char *alias_addr, uint32_t created_ts);
+
+/* Expire (delete) every revmap row whose created_ts has passed REVMAP_TTL_SEC
+ * relative to `now`.  Idempotent (deleting an absent row is a no-op).  Returns
+ * 0 on success. */
+int store_revmap_expire(Store *s, uint32_t now);
+
 /* Look up a reply token -> (sender, alias_addr).  On success returns 0 and sets
  * *sender / *alias_addr to malloc'd strings (caller frees with free()).  An
- * unknown token returns 0 with both out-params set to NULL. */
+ * unknown token returns 0 with both out-params set to NULL.  Rows past their
+ * TTL are treated as not-found (defense-in-depth between sweeps). */
 int store_revmap_resolve(Store *s, const char *token, char **sender,
                          char **alias_addr);
 

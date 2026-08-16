@@ -29,6 +29,11 @@ struct Store {
 #define AR_META   2u
 #define AR_QUEUE  7u
 
+/* Reverse-map rows older than this are expired: a leaked reply token stops
+   working within 30 days even if no sweep runs (resolve also rejects expired
+   rows as defense-in-depth). */
+#define REVMAP_TTL_SEC (30u * 24u * 3600u)
+
 /* meta key that holds the monotonic next-msgid counter (raw u32 value). */
 #define META_KEY_NEXT_MSGID "next_msgid"
 
@@ -118,14 +123,16 @@ static int dest_collect_cb(const uint32_t *cols, uint8_t arity, void *user) {
     return 0;
 }
 
-/* revmap lookup: capture sender (col 1) and alias_addr (col 2). */
-typedef struct { uint32_t sender, alias_addr; int found; } RevmapCtx;
+/* revmap lookup: capture sender (col 1), alias_addr (col 2), created_ts
+   (col 3, raw u32). */
+typedef struct { uint32_t sender, alias_addr, created_ts; int found; } RevmapCtx;
 static int revmap_cb(const uint32_t *cols, uint8_t arity, void *user) {
     RevmapCtx *c = (RevmapCtx *)user;
     (void)arity;
     if (!c->found) {
         c->sender = cols[1];
         c->alias_addr = cols[2];
+        c->created_ts = cols[3];
         c->found = 1;
     }
     return 0;
@@ -325,8 +332,8 @@ void store_free_strvec(char **vec, size_t n) {
 
 /* --- reverse-alias reply map ------------------------------------------ */
 
-int store_revmap_add(Store *s, const char *token, const char *sender,
-                     const char *alias_addr) {
+int store_revmap_add_at(Store *s, const char *token, const char *sender,
+                        const char *alias_addr, uint32_t created_ts) {
     uint32_t cols[4];
     int rc;
 
@@ -338,10 +345,65 @@ int store_revmap_add(Store *s, const char *token, const char *sender,
     cols[1] = dl_intern_str(s->db, sender);
     cols[2] = dl_intern_str(s->db, alias_addr);
     if (!cols[0] || !cols[1] || !cols[2]) return VISAGE_ENOMEM;
-    cols[3] = (uint32_t)time(NULL);   /* raw u32 unix-seconds */
+    cols[3] = created_ts;   /* raw u32 unix-seconds */
 
     rc = dl_add_fact(s->db, REL_REVMAP, cols, AR_REVMAP);
     if (rc < 0) return VISAGE_ESTORE;
+    return VISAGE_OK;
+}
+
+int store_revmap_add(Store *s, const char *token, const char *sender,
+                     const char *alias_addr) {
+    return store_revmap_add_at(s, token, sender, alias_addr,
+                               (uint32_t)time(NULL));
+}
+
+/* Collect-then-mutate walk for the revmap sweep: collect the full 4-col tuple
+   of every row whose created_ts has passed its TTL, then dl_delete_fact each
+   AFTER the walk returns.  (dafsa add/delete realloc the states array, so
+   mutating inside the dl_prefix walk would be a use-after-free — same pattern
+   as store_queue_reset_delivering.) */
+typedef struct {
+    uint32_t (*rows)[4];
+    size_t    n, cap;
+    int       err;
+} RevmapExpireCtx;
+
+static int revmap_expire_cb(const uint32_t *cols, uint8_t arity, void *user) {
+    RevmapExpireCtx *c = (RevmapExpireCtx *)user;
+    (void)arity;
+    if (c->n == c->cap) {
+        size_t nc = c->cap ? c->cap * 2 : 16;
+        uint32_t (*na)[4] = realloc(c->rows, nc * sizeof *na);
+        if (!na) { c->err = 1; return 1; }
+        c->rows = na;
+        c->cap = nc;
+    }
+    for (int i = 0; i < 4; i++) c->rows[c->n][i] = cols[i];
+    c->n++;
+    return 0;
+}
+
+int store_revmap_expire(Store *s, uint32_t now) {
+    RevmapExpireCtx c;
+    long n;
+    size_t i;
+
+    if (!s || !s->db) return VISAGE_EPARAM;
+
+    memset(&c, 0, sizeof c);
+    n = dl_prefix(s->db, REL_REVMAP, NULL, 0, revmap_expire_cb, &c);
+    if (n < 0 || c.err) {
+        free(c.rows);
+        return c.err ? VISAGE_ENOMEM : VISAGE_ESTORE;
+    }
+
+    for (i = 0; i < c.n; i++) {
+        /* wraparound-safe: (now - created_ts) >= TTL means expired. */
+        if ((now - c.rows[i][3]) >= REVMAP_TTL_SEC)
+            (void)dl_delete_fact(s->db, REL_REVMAP, c.rows[i], AR_REVMAP);
+    }
+    free(c.rows);
     return VISAGE_OK;
 }
 
@@ -349,8 +411,9 @@ int store_revmap_resolve(Store *s, const char *token, char **sender,
                          char **alias_addr) {
     uint32_t tok_id;
     uint32_t leading[1];
-    RevmapCtx rc = {0, 0, 0};
+    RevmapCtx rc = {0, 0, 0, 0};
     long n;
+    uint32_t now;
     const char *s_sender, *s_alias;
 
     if (!s || !s->db || !token || !sender || !alias_addr) return VISAGE_EPARAM;
@@ -366,6 +429,10 @@ int store_revmap_resolve(Store *s, const char *token, char **sender,
     n = dl_prefix(s->db, REL_REVMAP, leading, 1, revmap_cb, &rc);
     if (n < 0) return VISAGE_ESTORE;
     if (n == 0) return VISAGE_OK;      /* unknown token: both out-params NULL */
+
+    now = (uint32_t)time(NULL);
+    /* Defense-in-depth: a leaked token stops working between sweeps too. */
+    if ((now - rc.created_ts) >= REVMAP_TTL_SEC) return VISAGE_OK;
 
     s_sender = dl_intern_str_of(s->db, rc.sender);
     s_alias = dl_intern_str_of(s->db, rc.alias_addr);
@@ -432,7 +499,7 @@ int store_log_add(Store *s, uint32_t msgid, uint32_t ts, uint32_t dir,
     uint32_t cols[6];
     int rc;
 
-    if (!s || !s->db || !local || !local[0] || !remote || !remote[0] ||
+    if (!s || !s->db || !local || !remote || !remote[0] ||
         !status || !status[0])
         return VISAGE_EPARAM;
 
@@ -570,7 +637,7 @@ int store_queue_add(Store *s, uint32_t msgid, uint32_t k,
     uint32_t cols[7];
     int rc;
 
-    if (!s || !s->db || !from || !from[0] || !to || !to[0])
+    if (!s || !s->db || !from || !to || !to[0])
         return VISAGE_EPARAM;
 
     cols[0] = msgid;                                   /* raw u32 */

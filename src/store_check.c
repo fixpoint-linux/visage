@@ -10,6 +10,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+/* Matches store.c REVMAP_TTL_SEC (30 days). */
+#define REVMAP_TTL_SEC (30u * 24u * 3600u)
 
 static int failures;
 
@@ -168,6 +172,46 @@ int main(void) {
           "revmap_resolve unknown returns OK");
     check(sender == NULL && alias_addr == NULL,
           "revmap unknown yields NULL sender/alias");
+
+    /* revmap TTL: an old row is expired + rejected; a fresh row survives. */
+    {
+        uint32_t now = (uint32_t)time(NULL);
+        check(store_revmap_add_at(s, "oldtok000000", "old@foo.org",
+                                  "jane@example.com",
+                                  now - REVMAP_TTL_SEC - 1) == VISAGE_OK,
+              "revmap_add_at old row");
+        check(store_revmap_add_at(s, "newtok000000", "new@foo.org",
+                                  "jane@example.com", now) == VISAGE_OK,
+              "revmap_add_at fresh row");
+        /* defense-in-depth: resolve already rejects the expired row. */
+        sender = NULL; alias_addr = NULL;
+        check(store_revmap_resolve(s, "oldtok000000", &sender, &alias_addr) == VISAGE_OK &&
+                  sender == NULL && alias_addr == NULL,
+              "revmap_resolve rejects expired row (defense-in-depth)");
+        /* the sweep deletes only the old row. */
+        check(store_revmap_expire(s, now) == VISAGE_OK, "revmap_expire runs");
+        sender = NULL; alias_addr = NULL;
+        check(store_revmap_resolve(s, "oldtok000000", &sender, &alias_addr) == VISAGE_OK &&
+                  sender == NULL && alias_addr == NULL,
+              "revmap old row not found after expire");
+        sender = NULL; alias_addr = NULL;
+        check(store_revmap_resolve(s, "newtok000000", &sender, &alias_addr) == VISAGE_OK &&
+                  sender != NULL && strcmp(sender, "new@foo.org") == 0 &&
+                  alias_addr != NULL && strcmp(alias_addr, "jane@example.com") == 0,
+              "revmap fresh row still resolves after expire");
+        free(sender);
+        free(alias_addr);
+        /* a row created exactly TTL seconds ago is expired too. */
+        check(store_revmap_add_at(s, "boundtok0000", "b@foo.org",
+                                  "jane@example.com",
+                                  now - REVMAP_TTL_SEC) == VISAGE_OK,
+              "revmap_add_at boundary row");
+        check(store_revmap_expire(s, now) == VISAGE_OK, "revmap_expire idempotent");
+        sender = NULL; alias_addr = NULL;
+        check(store_revmap_resolve(s, "boundtok0000", &sender, &alias_addr) == VISAGE_OK &&
+                  sender == NULL && alias_addr == NULL,
+              "revmap boundary (exactly TTL) row expired");
+    }
 
     /* next_msgid monotonic. */
     m1 = store_next_msgid(s);

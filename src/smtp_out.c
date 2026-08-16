@@ -1141,7 +1141,12 @@ int smtp_out_send(Store *s, const Config *c, const char *from, const char *to,
         set_status(status_out, status_sz, "invalid envelope address");
         return SMTP_ERROR;
     }
-    if (!*from || !*to) {
+    /* `from` may be the empty string = the null reverse-path (<>).  RFC 5321
+       forbids bouncing a null-reverse-path message, so preserving MAIL FROM:<>
+       is what breaks a bounce loop; build_addr_cmd already emits `<>` for an
+       empty from.  Only an empty `to` (which can never legitimately occur — a
+       recipient is always a non-empty address) is rejected here. */
+    if (!*to) {
         set_status(status_out, status_sz, "empty envelope address");
         return SMTP_ERROR;
     }

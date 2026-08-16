@@ -45,6 +45,12 @@ int mail_normalize_crlf(char *buf, size_t len);
    Shrinks in place; *len is updated. Returns 0, or -1 on error. */
 int mail_unstuff_dots(char *buf, size_t *len);
 
+/* Nonzero if buf[0..len) contains a NUL byte, a C0 control char other than
+   TAB(0x09)/LF(0x0A)/CR(0x0D), or DEL(0x7F).  Bytes 0x80..0xFF are ALLOWED
+   (8BITMIME bodies).  Used on the dot-unstuffed message body to REJECT (never
+   sanitize) NUL/control bytes before forwarding. */
+int mail_data_has_ctl(const char *buf, size_t len);
+
 /* Add one leading '.' to every line that begins with '.' (outbound DATA
    dot-stuff). Heap-allocates *out (NUL-terminated) and sets *outlen (excluding
    the NUL). Returns 0, or -1 on error (with *out left NULL). */

@@ -139,6 +139,30 @@ static void stuff_roundtrip(const char *orig, const char *what) {
     mail_free(tmp);
 }
 
+/* ---- NUL/control-byte detection ---- */
+static void ctl_check(const unsigned char *buf, size_t len, int want,
+                      const char *what) {
+    char detail[256];
+    int got = mail_data_has_ctl((const char *)buf, len);
+    if (got == want)
+        check_ok(what);
+    else {
+        snprintf(detail, sizeof detail, "got=%d want=%d", got, want);
+        check_fail(what, detail);
+    }
+}
+
+static void ctl_tests(void) {
+    ctl_check((const unsigned char *)"hello world", 11, 0, "ctl clean ASCII -> 0");
+    ctl_check((const unsigned char *)"", 0, 0, "ctl empty -> 0");
+    ctl_check((const unsigned char *)"a\x00" "b", 3, 1, "ctl embedded NUL -> 1");
+    ctl_check((const unsigned char *)"a\x01b", 3, 1, "ctl 0x01 -> 1");
+    ctl_check((const unsigned char *)"a\x7f" "b", 3, 1, "ctl DEL 0x7f -> 1");
+    ctl_check((const unsigned char *)"\t\n\r", 3, 0, "ctl TAB/LF/CR -> 0");
+    ctl_check((const unsigned char *)"\x80\xff", 2, 0, "ctl 8BITMIME 0x80/0xff -> 0");
+    ctl_check((const unsigned char *)"a\x1f" "b", 3, 1, "ctl 0x1f -> 1");
+}
+
 /* ---- header get/set/remove ---- */
 static void header_tests(void) {
     const char msg[] =
@@ -333,6 +357,9 @@ int main(void) {
     unstuff_exact("..a\r\n...b\r\n", ".a\r\n..b\r\n", "unstuff leading dots");
     stuff_roundtrip("hello\r\n.world\r\n..two\r\nend",
                     "stuff/unstuff round-trip");
+
+    /* NUL/control-byte detection */
+    ctl_tests();
 
     /* headers */
     header_tests();

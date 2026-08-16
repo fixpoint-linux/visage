@@ -753,6 +753,74 @@ dkim_forward_scenario() {
     wait "$rpid" 2>/dev/null || true
 }
 
+# Scenario: M-5 bounce-loop guard.  A message submitted with the null
+# reverse-path (MAIL FROM:<>, i.e. a bounce) to jane@example.com must be
+# forwarded with the null envelope preserved end-to-end: the relay's recorded
+# dialogue must show MAIL FROM:<> — NOT MAIL FROM:<jane@example.com>.  (RFC 5321
+# forbids bouncing a null-reverse-path message, so preserving <> breaks the
+# bounce ping-pong at the protocol level.)  The header rewrite is unchanged.
+null_path_scenario() {
+    echo
+    echo "== scenario: null reverse-path (MAIL FROM:<>) preserved on forward"
+    local d="$WORK/nullpath" db="$WORK/nullpath/db" spool="$WORK/nullpath/spool"
+    local relay="$WORK/nullpath/relay" conf="$WORK/nullpath/config.dhall"
+    local rpid="" dpid=""
+    local SMTP=2561 RELAY=2562 HTTP=8098
+    mkdir -p "$d" "$relay" "$db" "$spool"
+    gen_config "$conf" "$SMTP" "$RELAY" none False "$HTTP" "$db" "$spool"
+
+    "$ROOT/tests/relay_fake.com" "$RELAY" "$relay" >"$d/relay.log" 2>&1 &
+    rpid=$!
+    sleep 0.3
+    if ! kill -0 "$rpid" 2>/dev/null; then
+        fail "NULLPATH: relay_fake failed to start (see $d/relay.log)"
+        return
+    fi
+    "$ROOT/visage.com" daemon -c "$conf" >"$d/daemon.log" 2>&1 &
+    dpid=$!
+    if wait_health "$HTTP" "$dpid" "$d/daemon.log"; then
+        pass "NULLPATH: daemon up (GET /health ok)"
+    else
+        fail "NULLPATH: daemon failed to become healthy"
+        [ -n "$rpid" ] && kill "$rpid" 2>/dev/null
+        return
+    fi
+
+    # Empty FROM arg -> MAIL FROM:<> on the wire.
+    if "$ROOT/tests/smtptest.com" 127.0.0.1 "$SMTP" "" jane@example.com \
+            "$WORK/msg1.eml" >"$d/fwd.log" 2>&1; then
+        pass "NULLPATH: smtptest null-path forward accepted"
+    else
+        fail "NULLPATH: smtptest null-path forward failed (see $d/fwd.log)"
+    fi
+
+    local DL="$relay/dialogue-1.txt" FW="$relay/msg-1.eml"
+    if wait_for_file "$FW"; then
+        pass "NULLPATH: relay_fake recorded the forwarded message"
+        if wait_for_file "$DL"; then
+            if grep -q 'MAIL FROM:<>' "$DL"; then
+                pass "NULLPATH: dialogue shows MAIL FROM:<> (null envelope preserved)"
+            else
+                fail "NULLPATH: dialogue does NOT show MAIL FROM:<> (see $DL)"
+            fi
+            if grep -q 'MAIL FROM:<jane@example.com>' "$DL"; then
+                fail "NULLPATH: FAIL — envelope rewritten to alias, not null path (see $DL)"
+            else
+                pass "NULLPATH: envelope was NOT rewritten to the alias"
+            fi
+        else
+            fail "NULLPATH: relay_fake recorded no dialogue (see $DL)"
+        fi
+    else
+        fail "NULLPATH: relay_fake did not record a forwarded message"
+    fi
+
+    [ -n "$dpid" ] && kill "$dpid" 2>/dev/null
+    [ -n "$rpid" ] && kill "$rpid" 2>/dev/null
+    wait "$dpid" 2>/dev/null || true
+    wait "$rpid" 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 echo "== visage e2e (ports smtp=$SMTP_PORT relay=$RELAY_PORT http=$HTTP_PORT)"
 echo "== workdir: $WORK"
@@ -903,6 +971,9 @@ restart_persistence_scenario
 
 # (R9) DKIM signing scenario ------------------------------------------------
 dkim_forward_scenario
+
+# (M-5) null reverse-path preserved on forward ---------------------------------
+null_path_scenario
 
 # ---------------------------------------------------------------------------
 echo
