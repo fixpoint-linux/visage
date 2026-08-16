@@ -118,11 +118,21 @@ body_of() {
 # relay TLS mode and auth.enabled, and throwaway absolute storage dirs.
 #   gen_config <outfile> <smtp_port> <relay_port> <relay_tls> <auth_enabled>
 #              <http_port> <db> <spool> [<relay_host>] [<relay_tls_ca>]
+#              [<dkim_domain>] [<dkim_selector>] [<dkim_key>]
 # <relay_host> defaults to 127.0.0.1; <relay_tls_ca> defaults to "" (the embedded
-# Mozilla bundle).  Both are optional so existing callers are unchanged.
+# Mozilla bundle); <dkim_domain>/<dkim_selector>/<dkim_key> are optional — when
+# <dkim_domain> is empty the dkim list is empty (signing disabled), otherwise a
+# single { domain, selector, private_key } signing config is emitted.
 gen_config() {
     local out="$1" smtp="$2" rport="$3" rtls="$4" authen="$5" hport="$6" db="$7" spool="$8"
     local rhost="${9:-127.0.0.1}" rca="${10:-}"
+    local ddomain="${11:-}" dsel="${12:-sel1}" dkey="${13:-}"
+    local dkim_list
+    if [ -n "$ddomain" ]; then
+        dkim_list="dkim = [ { domain = \"$ddomain\", selector = \"$dsel\", private_key = \"$dkey\" } ]"
+    else
+        dkim_list="dkim = [] : List { domain : Text, selector : Text, private_key : Text }"
+    fi
     cat > "$out" <<DHALL
 let Auth = { enabled : Bool, username : Text, password : Text }
 in  let Config =
@@ -139,6 +149,7 @@ in  let Config =
       , aliases : List { alias : Text, destinations : List Text }
       , http : { address : Text, port : Natural }
       , admin : { token : Text }
+      , dkim : List { domain : Text, selector : Text, private_key : Text }
       }
 in  { hostname = "mx.example.com"
    , domains = [ "example.com" ]
@@ -156,6 +167,7 @@ in  { hostname = "mx.example.com"
                ]
    , http = { address = "127.0.0.1", port = $hport }
    , admin = { token = "change-me" }
+   , $dkim_list
    } : Config
 DHALL
 }
@@ -667,6 +679,80 @@ restart_persistence_scenario() {
     wait "$rpid" 2>/dev/null || true
 }
 
+# Scenario: DKIM signing (R9).  A config with dkim=[{domain=example.com,
+# selector=sel1, private_key=tests/dkim-test-key.pem}] + a plaintext relay_fake.
+# The daemon must DKIM-sign the sanitized forward copy (a=rsa-sha256,
+# c=relaxed/relaxed) before enqueue: the recorded msg-1.eml must carry a
+# well-formed DKIM-Signature (^DKIM-Signature: with v=1, a=rsa-sha256,
+# d=example.com, s=sel1, b=).  Full signature validity is the dkim_check unit's
+# job; here we assert presence + well-formedness.  The existing forward body
+# match still holds (DKIM adds a header only).
+dkim_forward_scenario() {
+    echo
+    echo "== scenario: DKIM forward (dkim=[{example.com,sel1}], plaintext relay)"
+    local d="$WORK/dkim" db="$WORK/dkim/db" spool="$WORK/dkim/spool" relay="$WORK/dkim/relay"
+    local conf="$WORK/dkim/config.dhall" rpid="" dpid=""
+    local SMTP=2551 RELAY=2552 HTTP=8096
+    mkdir -p "$d" "$relay" "$db" "$spool"
+    gen_config "$conf" "$SMTP" "$RELAY" none False "$HTTP" "$db" "$spool" \
+        127.0.0.1 "" example.com sel1 "$ROOT/tests/dkim-test-key.pem"
+
+    "$ROOT/tests/relay_fake.com" "$RELAY" "$relay" >"$d/relay.log" 2>&1 &
+    rpid=$!
+    sleep 0.3
+    if ! kill -0 "$rpid" 2>/dev/null; then
+        fail "DKIM: relay_fake failed to start (see $d/relay.log)"
+        return
+    fi
+    "$ROOT/visage.com" daemon -c "$conf" >"$d/daemon.log" 2>&1 &
+    dpid=$!
+    if wait_health "$HTTP" "$dpid" "$d/daemon.log"; then
+        pass "DKIM: daemon up (GET /health ok)"
+    else
+        fail "DKIM: daemon failed to become healthy"
+        [ -n "$rpid" ] && kill "$rpid" 2>/dev/null
+        return
+    fi
+
+    if "$ROOT/tests/smtptest.com" 127.0.0.1 "$SMTP" sender@foo.org jane@example.com "$WORK/msg1.eml" >"$d/fwd.log" 2>&1; then
+        pass "DKIM: smtptest forward accepted"
+    else
+        fail "DKIM: smtptest forward failed (see $d/fwd.log)"
+    fi
+
+    local FW="$relay/msg-1.eml"
+    if wait_for_file "$FW"; then
+        pass "DKIM: relay_fake recorded the forwarded message"
+        if grep -q '^DKIM-Signature:' "$FW"; then
+            pass "DKIM: forwarded message has a DKIM-Signature header"
+        else
+            fail "DKIM: forwarded message missing DKIM-Signature header"
+        fi
+        # well-formed: v=1, a=rsa-sha256, d=example.com, s=sel1, b= present.
+        if grep -q '^DKIM-Signature:.*v=1' "$FW" \
+           && grep -q '^DKIM-Signature:.*a=rsa-sha256' "$FW" \
+           && grep -q '^DKIM-Signature:.*d=example.com' "$FW" \
+           && grep -q '^DKIM-Signature:.*s=sel1' "$FW" \
+           && grep -q '^DKIM-Signature:.*b=' "$FW"; then
+            pass "DKIM: DKIM-Signature well-formed (v=1,a=rsa-sha256,d=example.com,s=sel1,b=)"
+        else
+            fail "DKIM: DKIM-Signature not well-formed (see $FW)"
+        fi
+        if diff -u <(body_of "$WORK/msg1.eml") <(body_of "$FW") >"$d/body.diff" 2>&1; then
+            pass "DKIM: forwarded body still matches msg1.eml"
+        else
+            fail "DKIM: forwarded body differs from msg1.eml (see $d/body.diff)"
+        fi
+    else
+        fail "DKIM: relay_fake did not record a forwarded message"
+    fi
+
+    [ -n "$dpid" ] && kill "$dpid" 2>/dev/null
+    [ -n "$rpid" ] && kill "$rpid" 2>/dev/null
+    wait "$dpid" 2>/dev/null || true
+    wait "$rpid" 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 echo "== visage e2e (ports smtp=$SMTP_PORT relay=$RELAY_PORT http=$HTTP_PORT)"
 echo "== workdir: $WORK"
@@ -814,6 +900,9 @@ verify_negative_scenario
 # (S-A3) durable-queue scenarios ---------------------------------------------
 outage_redrive_scenario
 restart_persistence_scenario
+
+# (R9) DKIM signing scenario ------------------------------------------------
+dkim_forward_scenario
 
 # ---------------------------------------------------------------------------
 echo

@@ -17,6 +17,7 @@
 #include "smtp.h"
 #include "mail.h"
 #include "reply.h"
+#include "dkim.h"
 
 #include <sys/socket.h>
 #include <netdb.h>
@@ -747,6 +748,35 @@ static int queue_enqueue(Server *srv, uint32_t msgid, uint32_t k,
 /* Forwarding                                                         */
 /* ------------------------------------------------------------------ */
 
+/* DKIM-sign the sanitized outbound body in place when a signing config
+   matches the alias's domain.  On any failure (no config, address parse,
+   key load/sign error) the buffer is left UNCHANGED so the caller enqueues the
+   unsigned copy — availability over signature, no mail loss.  On success the
+   old sanitized buffer is freed and replaced with the signed one. */
+static void forward_sign(const Config *cfg, const char *alias,
+                         char **sanitized, size_t *slen) {
+    char *local = NULL, *domain = NULL;
+    ConfigDkim *dk;
+    char *signed_msg = NULL;
+    size_t signed_len = 0;
+
+    if (mail_addr_parse(alias, &local, &domain) != 0) return;
+    dk = config_dkim_find(cfg, domain);
+    mail_addr_free(local, domain);
+    if (!dk) return;
+
+    if (dkim_sign(*sanitized, *slen, dk->domain, dk->selector, dk->private_key,
+                  &signed_msg, &signed_len) != 0) {
+        fprintf(stderr, "visage: dkim: sign failed for domain '%s'; "
+                        "forwarding unsigned\n",
+                dk->domain ? dk->domain : "(null)");
+        return;
+    }
+    mail_free(*sanitized);
+    *sanitized = signed_msg;
+    *slen = signed_len;
+}
+
 /* Forward one sanitized copy of the message through `alias` to `dest`.
    Mints a reverse-alias token (or a plain rewrite for a null reverse-path)
    and durably enqueues the sanitized message for outbound delivery.  Returns
@@ -802,6 +832,8 @@ static int forward_one(Server *srv, const char *msg, size_t msglen,
         store_log_add(s, msgid, ts, LOG_DIR_OUT, alias, dest, "error");
         return -1;
     }
+
+    forward_sign(cfg, alias, &sanitized, &slen);
 
     rc = queue_enqueue(srv, msgid, k, alias, dest, sanitized, slen);
     mail_free(sanitized);
@@ -886,6 +918,8 @@ static int forward_reply(Server *srv, const char *msg, size_t msglen,
         mail_free(sanitized);
         return -1;
     }
+
+    forward_sign(cfg, alias_addr, &sanitized, &slen);
 
     rc = queue_enqueue(srv, msgid, k, alias_addr, dest, sanitized, slen);
     mail_free(sanitized);

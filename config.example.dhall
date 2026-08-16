@@ -13,6 +13,7 @@ in  let Config =
       , aliases : List { alias : Text, destinations : List Text }
       , http : { address : Text, port : Natural }
       , admin : { token : Text }
+      , dkim : List { domain : Text, selector : Text, private_key : Text }
       }
 in  { hostname = "mx.example.com"
    , domains = [ "example.com" ]
@@ -34,4 +35,5 @@ in  { hostname = "mx.example.com"
                ]
    , http = { address = "127.0.0.1", port = 8080 }
    , admin = { token = "change-me" }
+   , dkim = [] : List { domain : Text, selector : Text, private_key : Text }
    } : Config

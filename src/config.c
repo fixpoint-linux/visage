@@ -10,6 +10,7 @@
 #include "config.h"
 #include <stdarg.h>
 #include <string.h>
+#include <strings.h>
 
 static char cfg_err[256];
 static void cfg_error(const char *fmt, ...) {
@@ -207,7 +208,43 @@ static bool walk_config(Config *cfg, Term *nf) {
     if (!adm) { cfg_error("config missing 'admin'"); return false; }
     if (!text_dup(rec_get(adm, "token"), &cfg->admin.token)) return false;
 
+    {
+        /* dkim is optional (older configs omit it): a list of signing configs
+         * { domain, selector, private_key }.  Mirror the relay.tls_ca optional
+         * field precedent — absent defaults to an empty list. */
+        Term *dk = rec_get(nf, "dkim");
+        if (dk) {
+            int ndk = list_len(dk);
+            if (ndk < 0) return false;
+            Term **delems = list_collect(dk, ndk);
+            if (!delems) return false;
+            cfg->dkim = calloc((size_t)(ndk > 0 ? ndk : 1), sizeof(ConfigDkim));
+            if (!cfg->dkim) { free(delems); cfg_error("out of memory"); return false; }
+            cfg->ndkim = (size_t)ndk;
+            for (int i = 0; i < ndk; i++) {
+                ConfigDkim *cd = &cfg->dkim[i];
+                if (!text_dup(rec_get(delems[i], "domain"), &cd->domain)) { free(delems); return false; }
+                if (!text_dup(rec_get(delems[i], "selector"), &cd->selector)) { free(delems); return false; }
+                if (!text_dup(rec_get(delems[i], "private_key"), &cd->private_key)) { free(delems); return false; }
+            }
+            free(delems);
+        } else {
+            cfg->ndkim = 0;
+            cfg->dkim = NULL;
+        }
+    }
+
     return true;
+}
+
+ConfigDkim *config_dkim_find(const Config *cfg, const char *domain) {
+    if (!cfg || !domain) return NULL;
+    for (size_t i = 0; i < cfg->ndkim; i++) {
+        if (cfg->dkim[i].domain &&
+            strcasecmp(cfg->dkim[i].domain, domain) == 0)
+            return &cfg->dkim[i];
+    }
+    return NULL;
 }
 
 static char *read_all(FILE *f) {
@@ -302,5 +339,11 @@ void config_free(Config *cfg) {
     free(cfg->aliases);
     free(cfg->http.address);
     free(cfg->admin.token);
+    for (size_t i = 0; i < cfg->ndkim; i++) {
+        free(cfg->dkim[i].domain);
+        free(cfg->dkim[i].selector);
+        free(cfg->dkim[i].private_key);
+    }
+    free(cfg->dkim);
     memset(cfg, 0, sizeof *cfg);
 }

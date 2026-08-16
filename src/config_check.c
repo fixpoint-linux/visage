@@ -39,6 +39,10 @@ int main(int argc, char **argv) {
     }
     printf("http:              %s:%u\n", cfg.http.address, cfg.http.port);
     printf("admin:             token=%s\n", cfg.admin.token);
+    printf("dkim (%zu):\n", cfg.ndkim);
+    for (size_t i = 0; i < cfg.ndkim; i++)
+        printf("  domain=%s selector=%s private_key=%s\n",
+               cfg.dkim[i].domain, cfg.dkim[i].selector, cfg.dkim[i].private_key);
 
     config_free(&cfg);
     return 0;

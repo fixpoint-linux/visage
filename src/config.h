@@ -71,6 +71,15 @@ typedef struct {
     char *token;
 } ConfigAdmin;
 
+/* dkim element: { domain, selector, private_key } — domain is the signing
+   domain (a=rsa-sha256, c=relaxed/relaxed), selector the DKIM selector, and
+   private_key the operator PEM RSA private-key file path. */
+typedef struct {
+    char *domain;
+    char *selector;
+    char *private_key;
+} ConfigDkim;
+
 /* Top-level config record. Strings and arrays are heap-owned; release with
    config_free(). */
 typedef struct Config {
@@ -87,11 +96,17 @@ typedef struct Config {
     size_t       naliases;
     ConfigHttp   http;
     ConfigAdmin  admin;
+    ConfigDkim  *dkim;           /* DKIM signing configs (may be empty) */
+    size_t       ndkim;
 } Config;
 
 /* Load path into cfg (zeroed first). Returns 0 on success; on failure writes a
    NUL-terminated message into err (if errsz>0) and returns nonzero. */
 int config_load(const char *path, Config *cfg, char *err, size_t errsz);
+
+/* Find the DKIM signing config whose domain matches `domain`
+   (case-insensitive); NULL when there is no match. */
+ConfigDkim *config_dkim_find(const Config *cfg, const char *domain);
 
 /* Free every heap allocation owned by cfg. */
 void config_free(Config *cfg);
