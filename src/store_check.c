@@ -99,6 +99,24 @@ int main(void) {
           "resolve unknown alias returns OK");
     check(ndests == 0 && dests == NULL, "resolve unknown alias has 0 dests");
 
+    /* case-insensitive resolution: stored lowercase, resolved with mixed case. */
+    dests = NULL;
+    ndests = 0;
+    check(store_resolve(s, "JaNe@Example.COM", &dests, &ndests) == VISAGE_OK,
+          "resolve mixed-case alias returns OK");
+    check(ndests == 2, "resolve mixed-case alias ndests == 2 (case-insensitive)");
+    store_free_strvec(dests, ndests);
+
+    /* mixed-case add also stores lowercase (idempotent with the lowercase add). */
+    check(store_alias_add(s, "Shopping@Example.COM", "bob@realmail.example") == VISAGE_OK,
+          "alias_add mixed-case");
+    dests = NULL;
+    ndests = 0;
+    check(store_resolve(s, "shopping@example.com", &dests, &ndests) == VISAGE_OK,
+          "resolve lowercase of a mixed-case-add alias");
+    check(ndests == 1, "mixed-case add + lowercase resolve == 1 dest");
+    store_free_strvec(dests, ndests);
+
     /* alias remove drops exactly one destination. */
     check(store_alias_rm(s, "jane@example.com", "bob@realmail.example") == VISAGE_OK,
           "alias_rm dest2");

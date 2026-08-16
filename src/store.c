@@ -42,10 +42,15 @@ struct Store {
 /* --- small helpers ---------------------------------------------------- */
 
 /* Split "local@domain" into freshly-malloc'd local and domain.  Splits at the
- * first '@'.  Rejects a missing '@', an empty local, or an empty domain. */
+ * first '@'.  Rejects a missing '@', an empty local, or an empty domain.
+ * The local and domain are ASCII-lowercased on the way in so alias keys are
+ * stored and looked up case-insensitively (a mailbox is case-insensitive at
+ * the domain level; the RCPT domain gate in smtp_in.c is already
+ * case-insensitive).  `dest` (the destination address) is NOT lowercased —
+ * it may be case-sensitive at the destination, and is stored separately. */
 static int split_addr(const char *addr, char **local, char **domain) {
     const char *at;
-    size_t llen, dlen;
+    size_t llen, dlen, i;
 
     if (!addr) return VISAGE_EPARAM;
     at = strchr(addr, '@');
@@ -65,9 +70,15 @@ static int split_addr(const char *addr, char **local, char **domain) {
         *domain = NULL;
         return VISAGE_ENOMEM;
     }
-    memcpy(*local, addr, llen);
+    for (i = 0; i < llen; i++) {
+        unsigned char c = (unsigned char)addr[i];
+        (*local)[i] = (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : (char)c;
+    }
     (*local)[llen] = '\0';
-    memcpy(*domain, at + 1, dlen);
+    for (i = 0; i < dlen; i++) {
+        unsigned char c = (unsigned char)at[1 + i];
+        (*domain)[i] = (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : (char)c;
+    }
     (*domain)[dlen] = '\0';
     return VISAGE_OK;
 }
