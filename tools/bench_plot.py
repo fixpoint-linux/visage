@@ -58,16 +58,28 @@ def nice_bounds(lo, hi, ntick):
     return lo, hi, s
 
 
-def draw_axes(svg, x_ticks, y_min, y_max, y_step, y_label):
+def x_of(v, xmin, xmax):
+    """Map a value v (log scale) to a pixel x within the plot window.
+    Normalizes across [xmin, xmax] so the data spans the full plot width
+    (a bare `log10(v)` would overflow the canvas for large v)."""
+    l0 = math.log10(xmin)
+    l1 = math.log10(xmax)
+    span = l1 - l0
+    if span <= 0:
+        span = 1.0
+    return PAD_L + (math.log10(v) - l0) / span * PLOT_W
+
+
+def draw_axes(svg, x_ticks, y_min, y_max, y_step, y_label, xmin, xmax):
     """Gridlines + numeric tick labels for a log-x / linear-y chart."""
     for gx, _ in x_ticks:
-        px = PAD_L + math.log10(gx) / math.log10(10) * PLOT_W
+        px = x_of(gx, xmin, xmax)
         svg.append(
             f'<line x1="{px:.1f}" y1="{PAD_T}" x2="{px:.1f}" '
             f'y2="{PAD_T + PLOT_H}" stroke="{GRID_COLOR}" stroke-width="1"/>'
         )
     for gx, label in x_ticks:
-        px = PAD_L + math.log10(gx) / math.log10(10) * PLOT_W
+        px = x_of(gx, xmin, xmax)
         svg.append(
             f'<line x1="{px:.1f}" y1="{PAD_T + PLOT_H}" x2="{px:.1f}" '
             f'y2="{PAD_T + PLOT_H + 4}" stroke="{AXIS_COLOR}" stroke-width="1"/>'
@@ -112,10 +124,10 @@ def draw_axes(svg, x_ticks, y_min, y_max, y_step, y_label):
     )
 
 
-def polyline_for(xs, ys, y_min, y_max, color):
+def polyline_for(xs, ys, y_min, y_max, color, xmin, xmax):
     pts = []
     for x, y in zip(xs, ys):
-        px = PAD_L + math.log10(x) / math.log10(10) * PLOT_W
+        px = x_of(x, xmin, xmax)
         py = PAD_T + PLOT_H - (y - y_min) / (y_max - y_min) * PLOT_H
         pts.append(f"{px:.1f},{py:.1f}")
     return (f'<polyline points="{" ".join(pts)}" fill="none" '
@@ -155,16 +167,17 @@ def chart_latency(rows):
     if lo < 0:
         lo = 0.0
     x_ticks = [(t, f"{t:g}") for t in (1e3, 1e4, 1e5, 1e6) if t <= xs[-1]]
+    xmin, xmax = min(xs), max(xs)
 
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
            f'viewBox="0 0 {W} {H}">']
     svg.append(f'<text x="{PAD_L}" y="18" font-size="14" font-weight="bold" '
                f'fill="{TEXT_COLOR}">Resolve latency vs alias count '
                f'(warm, random batch)</text>')
-    draw_axes(svg, x_ticks, lo, hi, step, "latency (ns)")
-    svg.append(polyline_for(xs, alias, lo, hi, FG["alias"]))
-    svg.append(polyline_for(xs, revmap, lo, hi, FG["revmap"]))
-    legend(svg, [("alias", "alias warm"), ("revmap", "revmap warm")],
+    draw_axes(svg, x_ticks, lo, hi, step, "latency (ns)", xmin, xmax)
+    svg.append(polyline_for(xs, alias, lo, hi, FG["alias"], xmin, xmax))
+    svg.append(polyline_for(xs, revmap, lo, hi, FG["revmap"], xmin, xmax))
+    legend(svg, [(FG["alias"], "alias warm"), (FG["revmap"], "revmap warm")],
            PAD_L, PAD_T + PLOT_H + 30)
     svg.append(f'<text x="{PAD_L}" y="{PAD_T + PLOT_H + 44}" '
                f'font-size="10" fill="#6b7280">'
@@ -178,15 +191,16 @@ def chart_size(rows):
     ys = [num(r, "bytes_per_alias") for r in rows]
     lo, hi, step = nice_bounds(min(ys) * 0.95, max(ys) * 1.05, 5)
     x_ticks = [(t, f"{t:g}") for t in (1e3, 1e4, 1e5, 1e6) if t <= xs[-1]]
+    xmin, xmax = min(xs), max(xs)
 
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
            f'viewBox="0 0 {W} {H}">']
     svg.append(f'<text x="{PAD_L}" y="18" font-size="14" font-weight="bold" '
                f'fill="{TEXT_COLOR}">Store size vs alias count '
                f'(bytes per alias, on disk)</text>')
-    draw_axes(svg, x_ticks, lo, hi, step, "bytes / alias")
-    svg.append(polyline_for(xs, ys, lo, hi, FG["size"]))
-    legend(svg, [("size", "bytes / alias")], PAD_L, PAD_T + PLOT_H + 30)
+    draw_axes(svg, x_ticks, lo, hi, step, "bytes / alias", xmin, xmax)
+    svg.append(polyline_for(xs, ys, lo, hi, FG["size"], xmin, xmax))
+    legend(svg, [(FG["size"], "bytes / alias")], PAD_L, PAD_T + PLOT_H + 30)
     svg.append(f'<text x="{PAD_L}" y="{PAD_T + PLOT_H + 44}" '
                f'font-size="10" fill="#6b7280">'
                f'~constant bytes/alias across three decades: no per-alias '
