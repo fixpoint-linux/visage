@@ -919,6 +919,15 @@ static void deliver_message(Server *srv, Conn *c, time_t now) {
     msgid = store_next_msgid(s);
     ts = (uint32_t)now;
 
+    /* The msgid counter is exhausted (wrap at 2^32) or the store failed to
+     * allocate one.  Fail closed rather than proceed with a colliding msgid=0
+     * (every message would share it and overwrite the same spool file). */
+    if (msgid == 0) {
+        conn_reply(c, "451 4.3.0 Message-id allocation failure\r\n");
+        c->closed = true;
+        return;
+    }
+
     /* Spool a durable copy (best-effort; forwarding proceeds regardless). */
     if (msgid != 0 && mkdir_p(cfg->storage.spool) == 0) {
         char spoolpath[4096];
