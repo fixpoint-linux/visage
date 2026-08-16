@@ -158,6 +158,86 @@ int main(void) {
         reply_free(m);
     }
 
+    /* --- strip reverse alias from To/Cc (RFC 5322 groups, R8) --- */
+    {
+        char *m; size_t mlen; char tmp[512];
+
+        /* (a) group with the reverse alias + a surviving member */
+        m = strdup("To: Friends: \"Bob\" <reply+deadbeef@example.com>, carol@example.com;\r\n\r\n");
+        mlen = strlen(m);
+        check(reply_strip_reverse(&m, &mlen, "reply+deadbeef@example.com") == VISAGE_OK,
+              "group: strip returns OK");
+        check(mail_header_get(m, mlen, "to", tmp, sizeof tmp) == 0 &&
+              strcmp(tmp, "Friends: carol@example.com;") == 0,
+              "group: strips reverse, keeps group + survivor");
+        reply_free(m);
+
+        /* (b) group whose only member is the reverse alias -> whole group removed */
+        m = strdup("To: Friends: reply+deadbeef@example.com;\r\n"
+                   "Cc: keep@example.com\r\n\r\n");
+        mlen = strlen(m);
+        check(reply_strip_reverse(&m, &mlen, "reply+deadbeef@example.com") == VISAGE_OK,
+              "group-only: strip returns OK");
+        check(mail_header_get(m, mlen, "to", tmp, sizeof tmp) == -1,
+              "group-only: now-empty group removed");
+        check(mail_header_get(m, mlen, "cc", tmp, sizeof tmp) == 0 &&
+              strcmp(tmp, "keep@example.com") == 0,
+              "group-only: Cc untouched");
+        reply_free(m);
+
+        /* (c) group without the reverse alias -> unchanged */
+        m = strdup("To: Friends: bob@example.com, carol@example.com;\r\n\r\n");
+        mlen = strlen(m);
+        check(reply_strip_reverse(&m, &mlen, "reply+deadbeef@example.com") == VISAGE_OK,
+              "group-unchanged: strip returns OK");
+        check(mail_header_get(m, mlen, "to", tmp, sizeof tmp) == 0 &&
+              strcmp(tmp, "Friends: bob@example.com, carol@example.com;") == 0,
+              "group-unchanged: header unchanged");
+        reply_free(m);
+
+        /* (d) two groups + a bare mailbox */
+        m = strdup("To: G1: reply+deadbeef@example.com;, "
+                   "G2: a@example.com, reply+deadbeef@example.com;, "
+                   "keep@example.com\r\n\r\n");
+        mlen = strlen(m);
+        check(reply_strip_reverse(&m, &mlen, "reply+deadbeef@example.com") == VISAGE_OK,
+              "two-groups: strip returns OK");
+        check(mail_header_get(m, mlen, "to", tmp, sizeof tmp) == 0 &&
+              strcmp(tmp, "G2: a@example.com;, keep@example.com") == 0,
+              "two-groups: empty group dropped, others stripped");
+        reply_free(m);
+
+        /* (e) nested group (inner group fully stripped) */
+        m = strdup("To: Outer: inner: reply+deadbeef@example.com;, carol@example.com;\r\n\r\n");
+        mlen = strlen(m);
+        check(reply_strip_reverse(&m, &mlen, "reply+deadbeef@example.com") == VISAGE_OK,
+              "nested: strip returns OK");
+        check(mail_header_get(m, mlen, "to", tmp, sizeof tmp) == 0 &&
+              strcmp(tmp, "Outer: carol@example.com;") == 0,
+              "nested: inner group removed, outer preserved");
+        reply_free(m);
+
+        /* (f) nested group where the inner group survives (wrapping preserved) */
+        m = strdup("To: Outer: inner: keep@example.com;, reply+deadbeef@example.com;\r\n\r\n");
+        mlen = strlen(m);
+        check(reply_strip_reverse(&m, &mlen, "reply+deadbeef@example.com") == VISAGE_OK,
+              "nested-survive: strip returns OK");
+        check(mail_header_get(m, mlen, "to", tmp, sizeof tmp) == 0 &&
+              strcmp(tmp, "Outer: inner: keep@example.com;;") == 0,
+              "nested-survive: inner group wrapping preserved");
+        reply_free(m);
+
+        /* (g) unclosed group -> kept verbatim (conservative, no crash) */
+        m = strdup("To: Friends: reply+deadbeef@example.com\r\n\r\n");
+        mlen = strlen(m);
+        check(reply_strip_reverse(&m, &mlen, "reply+deadbeef@example.com") == VISAGE_OK,
+              "unclosed-group: strip returns OK");
+        check(mail_header_get(m, mlen, "to", tmp, sizeof tmp) == 0 &&
+              strcmp(tmp, "Friends: reply+deadbeef@example.com") == 0,
+              "unclosed-group: kept verbatim (reverse not stripped)");
+        reply_free(m);
+    }
+
     check(store_close(s) == VISAGE_OK, "store_close returns OK");
 
     if (failures) {

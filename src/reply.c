@@ -302,65 +302,232 @@ static int mailbox_matches(const char *s, size_t start, size_t end,
     }
 }
 
-/* Remove every mailbox whose addr-spec equals target from a comma-separated
- * address list.  Returns 1 (match found; *out = new list, possibly "") with a
- * heap buffer in *out, 0 (no match; *out = NULL), or negative on error. */
-static int addr_list_strip(const char *list, const char *target, char **out) {
-    size_t n = strlen(list);
-    size_t cap = n + 1;
-    char *buf = malloc(cap);
-    size_t w = 0, i = 0;
-    int matched = 0;
-    int first = 1;
+/* --- group-aware address-list stripping ---------------------------------
+ *
+ * RFC 5322 address-list grammar (subset handled here):
+ *     address-list = address *("," address)
+ *     address      = mailbox / group
+ *     group        = display-name ":" [group-list] ";"
+ *     group-list   = mailbox-list   (comma-separated, may nest via obs-syntax)
+ *
+ * A group is a SINGLE top-level element: its internal commas are not list
+ * separators.  The reverse alias is stripped from any mailbox inside a group
+ * while the group name, ':', surviving members, and closing ';' are preserved;
+ * if every member is stripped the whole group element is dropped.  Nesting is
+ * supported to arbitrary depth (a group body is itself an address list and is
+ * processed recursively). */
 
-    if (!buf) return VISAGE_ENOMEM;
+/* Growable output buffer.  Allocation failure is recorded in o->oom (sticky)
+ * so the recursive pass can bail out and the caller reports ENOMEM once. */
+typedef struct {
+    char *p;
+    size_t len;
+    size_t cap;
+    int oom;
+} OutBuf;
 
-    while (i < n) {
-        while (i < n && (list[i] == ',' || list[i] == ' ' || list[i] == '\t')) i++;
-        if (i >= n) break;
+static void ob_init(OutBuf *o) {
+    o->p = NULL;
+    o->len = 0;
+    o->cap = 0;
+    o->oom = 0;
+}
 
-        size_t start = i;
-        int q = 0, c = 0, a = 0;
-        size_t j = i;
-        while (j < n) {
-            char ch = list[j];
-            if (q) {
-                if (ch == '\\' && j + 1 < n) j += 2;
-                else { if (ch == '"') q = 0; j++; }
-            } else if (c) {
-                if (ch == ')') c = 0;
-                j++;
-            } else if (a) {
-                if (ch == '>') a = 0;
-                j++;
-            } else if (ch == '"') { q = 1; j++; }
-            else if (ch == '(') { c = 1; j++; }
-            else if (ch == '<') { a = 1; j++; }
-            else if (ch == ',') break;
-            else j++;
+static void ob_put(OutBuf *o, const char *s, size_t n) {
+    size_t need, ncap;
+    char *np;
+
+    if (o->oom || n == 0) return;
+    if (n > SIZE_MAX - o->len - 1) { o->oom = 1; return; }
+    need = o->len + n + 1;
+    if (need > o->cap) {
+        ncap = o->cap ? o->cap : 64;
+        while (ncap < need) ncap *= 2;
+        np = realloc(o->p, ncap);
+        if (!np) { o->oom = 1; return; }
+        o->p = np;
+        o->cap = ncap;
+    }
+    memcpy(o->p + o->len, s, n);
+    o->len += n;
+}
+
+static void ob_put_str(OutBuf *o, const char *s) {
+    ob_put(o, s, strlen(s));
+}
+
+/* Append the whitespace-trimmed element s[start..end) to o, with a ", "
+ * separator if o already holds an element (byte-identical to the legacy
+ * non-group join). */
+static void ob_put_elem(OutBuf *o, const char *s, size_t start, size_t end) {
+    size_t s0 = start, e0 = end;
+    while (s0 < e0 && (s[s0] == ' ' || s[s0] == '\t')) s0++;
+    while (e0 > s0 && (s[e0 - 1] == ' ' || s[e0 - 1] == '\t')) e0--;
+    if (e0 <= s0) return;
+    if (o->len > 0) ob_put_str(o, ", ");
+    ob_put(o, s + s0, e0 - s0);
+}
+
+/* Scan one address-list element starting at s[start]: a mailbox (bare or
+ * angle form) or an RFC 5322 group (display-name ":" group-list ";").  Tracks
+ * quoted strings, comments, angle brackets, and domain literals so that a
+ * ',', ':', or ';' inside any of those is never structural, and tracks group
+ * nesting depth so nested groups pair each ':' with its own ';'.
+ *
+ * Outputs: *is_group = 1 with *colon = index of the group ':' iff this is a
+ * group; for a closed group *semi = index of the matching ';', otherwise
+ * SIZE_MAX (unclosed).  Returns the index just past the element: just past the
+ * ';' for a closed group, at the top-level ',' for a mailbox, or `end`. */
+static size_t scan_address(const char *s, size_t start, size_t end,
+                           int *is_group, size_t *colon, size_t *semi) {
+    size_t i = start;
+    int q = 0, c = 0, a = 0, d = 0;
+    int depth = 0;
+
+    *is_group = 0;
+    *colon = SIZE_MAX;
+    *semi = SIZE_MAX;
+
+    while (i < end) {
+        char ch = s[i];
+        if (q) {
+            if (ch == '\\' && i + 1 < end) i += 2;
+            else { if (ch == '"') q = 0; i++; }
+            continue;
         }
-        size_t end = j;
+        if (c) { if (ch == ')') c = 0; i++; continue; }
+        if (a) { if (ch == '>') a = 0; i++; continue; }
+        if (d) { if (ch == ']') d = 0; i++; continue; }
 
-        if (mailbox_matches(list, start, end, target)) {
-            matched = 1;
-        } else {
-            size_t s0 = start, e0 = end;
-            while (s0 < e0 && (list[s0] == ' ' || list[s0] == '\t')) s0++;
-            while (e0 > s0 && (list[e0 - 1] == ' ' || list[e0 - 1] == '\t')) e0--;
-            if (e0 > s0) {
-                if (!first) { buf[w++] = ','; buf[w++] = ' '; }
-                memcpy(buf + w, list + s0, e0 - s0);
-                w += e0 - s0;
-                first = 0;
+        if (ch == '"') { q = 1; i++; continue; }
+        if (ch == '(') { c = 1; i++; continue; }
+        if (ch == '<') { a = 1; i++; continue; }
+        if (ch == '[') { d = 1; i++; continue; }
+
+        if (ch == ':') {
+            if (depth == 0) { *is_group = 1; *colon = i; }
+            depth++;
+            i++;
+            continue;
+        }
+        if (ch == ';') {
+            if (depth > 0) {
+                depth--;
+                if (depth == 0) { *semi = i; return i + 1; }
+            }
+            i++;   /* stray ';' outside any group: consume, stay bounded */
+            continue;
+        }
+        if (ch == ',') {
+            if (depth == 0) return i;   /* element ends at a top-level comma */
+            i++;                        /* comma inside a group body */
+            continue;
+        }
+        i++;
+    }
+    return i;   /* ran off the end (unclosed group leaves *semi = SIZE_MAX) */
+}
+
+/* Recursively strip mailboxes whose addr-spec equals `target` from the address
+ * list s[start..end).  Surviving addresses (mailboxes and groups) are appended
+ * to o joined with ", ".  *matched is set to 1 if any mailbox was stripped.
+ * Group nesting is handled by recursion: a group body is itself an address
+ * list, so nested groups are stripped to arbitrary depth. */
+static void addr_list_process(const char *s, size_t start, size_t end,
+                              const char *target, OutBuf *o, int *matched) {
+    size_t i = start;
+
+    while (i < end && !o->oom) {
+        int is_group;
+        size_t colon, semi, addr_end, elem_start;
+
+        while (i < end && (s[i] == ',' || s[i] == ' ' || s[i] == '\t')) i++;
+        if (i >= end) break;
+        elem_start = i;
+
+        addr_end = scan_address(s, elem_start, end, &is_group, &colon, &semi);
+
+        if (is_group && semi != SIZE_MAX) {
+            /* Closed group.  Require a non-empty display-name; otherwise it is
+             * a stray ':' and we fall back to keeping the element verbatim. */
+            size_t p = elem_start;
+            while (p < colon && (s[p] == ' ' || s[p] == '\t')) p++;
+            if (p < colon) {
+                OutBuf body;
+                int body_matched = 0;
+
+                ob_init(&body);
+                addr_list_process(s, colon + 1, semi, target, &body, &body_matched);
+                if (body.oom) { o->oom = 1; free(body.p); return; }
+
+                if (body.len == 0) {
+                    if (body_matched) {
+                        *matched = 1;   /* every internal mailbox stripped */
+                    } else {
+                        /* already-empty group ("Name:;"): preserve verbatim */
+                        ob_put_elem(o, s, elem_start, addr_end);
+                    }
+                } else {
+                    if (o->len > 0) ob_put_str(o, ", ");
+                    ob_put(o, s + elem_start, (colon + 1) - elem_start);
+                    ob_put_str(o, " ");
+                    ob_put(o, body.p, body.len);
+                    ob_put(o, s + semi, addr_end - semi);
+                    *matched = *matched || body_matched;
+                }
+                free(body.p);
+                i = addr_end;
+                continue;
             }
         }
-        i = end;
-        if (i < n && list[i] == ',') i++;
-    }
 
-    buf[w] = '\0';
-    if (!matched) { free(buf); *out = NULL; return 0; }
-    *out = buf;
+        if (is_group) {
+            /* Unclosed group (no ';') or empty display-name: malformed —
+             * keep the element verbatim, do not attempt to strip inside. */
+            ob_put_elem(o, s, elem_start, addr_end);
+            i = addr_end;
+            continue;
+        }
+
+        /* Plain mailbox element. */
+        if (mailbox_matches(s, elem_start, addr_end, target)) {
+            *matched = 1;
+        } else {
+            ob_put_elem(o, s, elem_start, addr_end);
+        }
+        i = addr_end;
+    }
+}
+
+/* Remove every mailbox whose addr-spec equals target from a comma-separated
+ * address list (RFC 5322 group-aware).  Returns 1 (match found; *out = new
+ * list, possibly "") with a heap buffer in *out, 0 (no match; *out = NULL), or
+ * negative on error. */
+static int addr_list_strip(const char *list, const char *target, char **out) {
+    OutBuf o;
+    int matched = 0;
+    size_t n = strlen(list);
+
+    ob_init(&o);
+    addr_list_process(list, 0, n, target, &o, &matched);
+
+    if (o.oom) {
+        free(o.p);
+        return VISAGE_ENOMEM;
+    }
+    if (!matched) {
+        free(o.p);
+        *out = NULL;
+        return 0;
+    }
+    if (o.p == NULL) {          /* matched, but nothing survived: "" */
+        o.p = malloc(1);
+        if (!o.p) return VISAGE_ENOMEM;
+        o.p[0] = '\0';
+    } else {
+        o.p[o.len] = '\0';
+    }
+    *out = o.p;
     return 1;
 }
 
