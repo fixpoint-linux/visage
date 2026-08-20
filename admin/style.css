@@ -1,0 +1,143 @@
+/* visage admin — self-contained stylesheet (no external fonts/CDN). */
+
+* { box-sizing: border-box; }
+
+:root {
+  --bg: #0f1420;
+  --panel: #181f30;
+  --border: #2a3448;
+  --text: #dde3f0;
+  --muted: #8b95ab;
+  --accent: #4c8dff;
+  --danger: #ff6b6b;
+  --ok: #4caf7d;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.45;
+}
+
+.muted { color: var(--muted); }
+.error { color: var(--danger); }
+.ok { color: var(--ok); }
+code { background: #0b0f18; padding: 1px 5px; border-radius: 4px; }
+.hidden { display: none; }
+
+button {
+  cursor: pointer;
+  background: var(--accent);
+  color: #fff;
+  border: 0;
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-size: 14px;
+}
+button.link {
+  background: none;
+  color: var(--muted);
+  padding: 4px 6px;
+}
+button.link.danger { color: var(--danger); }
+button.active { outline: 2px solid var(--accent); }
+
+input {
+  background: #0b0f18;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 14px;
+}
+input:focus { outline: none; border-color: var(--accent); }
+
+/* login gate */
+.login {
+  max-width: 380px;
+  margin: 12vh auto 0;
+  padding: 24px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.login h1 { margin-top: 0; font-size: 20px; }
+.login form { display: flex; flex-direction: column; gap: 10px; }
+.login input { width: 100%; }
+
+/* layout */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+}
+.topbar .brand { font-weight: 700; }
+.topbar .muted { flex: 1; }
+
+.tabs {
+  display: flex;
+  gap: 6px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--border);
+}
+.tabs button { background: none; color: var(--text); }
+.tabs button:hover { background: var(--panel); }
+
+main { padding: 20px; max-width: 980px; }
+.tab { display: none; }
+.tab.active { display: block; }
+h2 { font-size: 16px; margin: 0 0 12px; }
+
+/* dashboard */
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 12px;
+  margin-bottom: 24px;
+}
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+.card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
+.card .value { font-size: 15px; margin-top: 4px; word-break: break-all; }
+.queue-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
+
+/* aliases */
+.inline-form { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+.inline-form input { flex: 1; min-width: 200px; }
+.alias-block {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+.alias-head { padding: 10px 14px; background: #131a2b; border-bottom: 1px solid var(--border); }
+.alias-name { font-weight: 600; word-break: break-all; }
+.alias-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  word-break: break-all;
+}
+.alias-row:last-child { border-bottom: 0; }
+
+/* log */
+.log { width: 100%; border-collapse: collapse; font-size: 13px; }
+.log th, .log td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  word-break: break-all;
+}
+.log th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }

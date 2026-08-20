@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>visage admin</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <!-- Login gate: the operator enters Config.admin.token here.  The token is
+       stored client-side and sent as `Authorization: Bearer` on every API
+       call; it is never embedded in any server-rendered markup. -->
+  <div id="login" class="login">
+    <form id="login-form" autocomplete="off">
+      <h1>visage admin</h1>
+      <p class="muted">Enter the admin token from <code>Config.admin.token</code>.</p>
+      <input id="token" type="password" placeholder="admin token" autofocus>
+      <button type="submit">Unlock</button>
+      <p id="login-error" class="error" hidden></p>
+    </form>
+  </div>
+
+  <div id="app" hidden>
+    <header class="topbar">
+      <span class="brand">visage admin</span>
+      <span id="status-host" class="muted"></span>
+      <button id="logout" type="button" class="link">lock</button>
+    </header>
+
+    <nav class="tabs">
+      <button type="button" data-tab="dashboard" class="active">Dashboard</button>
+      <button type="button" data-tab="aliases">Aliases</button>
+      <button type="button" data-tab="log">Log</button>
+      <button type="button" data-tab="replay">Replay</button>
+    </nav>
+
+    <main>
+      <section id="tab-dashboard" class="tab active">
+        <h2>Dashboard</h2>
+        <div id="status" class="status-grid">
+          <div class="card"><div class="label">Hostname</div><div id="st-host" class="value"></div></div>
+          <div class="card"><div class="label">Domains</div><div id="st-domains" class="value"></div></div>
+          <div class="card"><div class="label">SMTP listen</div><div id="st-listen" class="value"></div></div>
+          <div class="card"><div class="label">Admin http</div><div id="st-http" class="value"></div></div>
+          <div class="card"><div class="label">Relay</div><div id="st-relay" class="value"></div></div>
+          <div class="card"><div class="label">Aliases</div><div id="st-aliases" class="value"></div></div>
+        </div>
+        <h2>Queue</h2>
+        <div id="st-queue" class="queue-grid"></div>
+        <p id="dash-error" class="error" hidden></p>
+      </section>
+
+      <section id="tab-aliases" class="tab">
+        <h2>Aliases</h2>
+        <form id="alias-form" class="inline-form">
+          <input id="alias-input" placeholder="local@domain" required>
+          <input id="dest-input" placeholder="destination@example.com" required>
+          <button type="submit">Add</button>
+        </form>
+        <p id="alias-error" class="error" hidden></p>
+        <p id="alias-msg" class="ok" hidden></p>
+        <div id="aliases"></div>
+      </section>
+
+      <section id="tab-log" class="tab">
+        <h2>Log</h2>
+        <div class="inline-form">
+          <input id="log-n" type="number" min="1" max="1000" value="100">
+          <button id="log-refresh" type="button">Refresh</button>
+        </div>
+        <table id="log-table" class="log">
+          <thead><tr><th>msgid</th><th>ts</th><th>dir</th><th>local</th><th>remote</th><th>status</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <p id="log-empty" class="muted" hidden>No log entries.</p>
+        <p id="log-error" class="error" hidden></p>
+      </section>
+
+      <section id="tab-replay" class="tab">
+        <h2>Replay</h2>
+        <p class="muted">Re-queue every retained (delivered / permfail) delivery of a message id so the queue re-drives it.</p>
+        <form id="replay-form" class="inline-form">
+          <input id="replay-msgid" type="number" min="1" placeholder="message id" required>
+          <button type="submit">Replay</button>
+        </form>
+        <p id="replay-error" class="error" hidden></p>
+        <p id="replay-msg" class="ok" hidden></p>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

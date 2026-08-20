@@ -13,19 +13,28 @@
  * returns to poll(), which also services SMTP.  A connection is closed after
  * one request (HTTP/1.0 Connection: close).
  *
- * Routes (all require `Authorization: Bearer <Config.admin.token>` except
- * /health):
- *   GET    /health   -> {"ok":true}
+ * Routes (all data routes require `Authorization: Bearer <Config.admin.token>`;
+ * /health and the embedded static UI shell are served unauthenticated — they
+ * contain no data, only client code):
+ *   GET    /health   -> {"ok":true}                          (no auth)
+ *   GET    /, /admin, /app.js, /style.css -> embedded UI     (no auth)
+ *   GET    /aliases  -> {"aliases":[{"alias","destination"},...]}
+ *   GET    /status   -> {hostname, domains, listen, http, relay,
+ *                        alias_count, queue{queued,delivering,delivered,permfail}}
  *   GET    /log?n=N  -> JSON array of the N most-recent log entries
  *   POST   /alias    -> {"alias":"a@d","destination":"x@y"}  (add)
  *   DELETE /alias    -> {"alias":"a@d","destination":"x@y"}  (remove)
  *   POST   /replay   -> {"msgid":N}  (re-queue terminal deliveries for replay)
  *
+ * The actual routing + response construction lives in the pure function
+ * admin_build_response() (src/admin.c); this file only handles the non-blocking
+ * connection / socket plumbing and flushes whatever it returns.  Content-Type
+ * is per-response (set by admin.c).
+ *
  * Bounds: the request is accumulated into a fixed per-connection buffer capped
  * at HTTP_MAX_REQ bytes (see http_parse.h); Content-Length is honored and
  * capped; every read/write is non-blocking and bounded. */
 #include "visage.h"
-#include "json.h"
 #include "http_parse.h"
 
 #include <sys/socket.h>
@@ -37,9 +46,6 @@
 #define HTTP_LISTEN_BACKLOG 16
 #define HTTP_READ_TIMEOUT_MS 5000   /* idle timeout for a registered conn (ms) */
 #define HTTP_RECV_CHUNK      4096
-
-/* Upper bound on /log?n= to keep the response bounded. */
-#define HTTP_MAX_LOG_N 1000
 
 /* Per-connection state-machine states. */
 enum { HTTP_ST_RECV = 0, HTTP_ST_RESPOND };
@@ -74,13 +80,12 @@ typedef struct HttpConn {
 
 static void http_conn_free(HttpConn *c);
 static void http_respond(HttpConn *c, int status, const char *reason,
-                         const char *body, size_t bodylen);
+                         const char *ctype, const char *body, size_t bodylen);
 static void http_respond_err(HttpConn *c, int status, const char *reason,
                              const char *msg);
 static void http_try_flush(HttpConn *c);
 static void http_process(HttpConn *c);
-static void handle_log(HttpServer *srv, HttpConn *c, const char *target);
-static void handle_request(HttpServer *srv, HttpConn *c);
+static void handle_request(HttpConn *c);
 static void http_conn_on_readable(int fd, void *user);
 static void http_conn_on_writable(int fd, void *user);
 static void http_conn_on_closed(int fd, void *user);
@@ -93,66 +98,6 @@ static void set_nonblock(int fd) {
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl < 0) return;
     (void)fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-}
-
-/* Parse "METHOD SP target SP version" from the request line. */
-static int parse_request_line(const char *req, size_t reqlen,
-                              char *method, size_t msz,
-                              char *target, size_t tsz) {
-    size_t i = 0, j;
-    while (i < reqlen && req[i] != ' ' && req[i] != '\r' && req[i] != '\n') i++;
-    if (i == 0 || i >= msz) return -1;
-    memcpy(method, req, i);
-    method[i] = '\0';
-    while (i < reqlen && req[i] == ' ') i++;
-    j = i;
-    while (i < reqlen && req[i] != ' ' && req[i] != '\r' && req[i] != '\n') i++;
-    if (i == j || i - j >= tsz) return -1;
-    memcpy(target, req + j, i - j);
-    target[i - j] = '\0';
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/* Auth                                                               */
-/* ------------------------------------------------------------------ */
-
-/* Constant-time equality of `supplied` against the configured `token`.
-   The loop bound is the FIXED secret length, so runtime is independent of the
-   supplied token's value; `supplied[i]` is only ever read while i < strlen(supplied)
-   (never past its NUL), and a length mismatch is folded into d so both shorter and
-   longer supplied tokens are rejected without any over-read.  No early exit. */
-static int token_eq_ct(const char *supplied, const char *configured) {
-    size_t ns = strlen(supplied);
-    size_t nc = strlen(configured);
-    size_t i;
-    unsigned char d = (ns == nc) ? 0 : 1;
-    for (i = 0; i < nc; i++) {
-        unsigned char ac = (i < ns) ? (unsigned char)supplied[i] : 0u;
-        d |= (unsigned char)(ac ^ (unsigned char)configured[i]);
-    }
-    return d == 0;
-}
-
-/* True if the Authorization header equals "Bearer <token>". */
-static int auth_ok(const char *req, size_t reqlen, size_t header_end,
-                   const char *token) {
-    char auth[512];
-    const char *p;
-    (void)reqlen;
-    /* auth[512] bounds the header value, so a "Bearer <token>" token longer
-       than ~505 chars is truncated and can never authenticate.  config-check
-       (main.c) enforces this ceiling via ADMIN_TOKEN_MAX_LEN (500). */
-    if (!token || !token[0]) return 0;
-    if (header_end == SIZE_MAX ||
-        http_header_value(req, header_end, "Authorization", auth, sizeof auth) != 0)
-        return 0;
-    p = auth;
-    while (*p == ' ' || *p == '\t') p++;
-    if (strlen(p) < 7 || !http_ci_eq(p, "Bearer ", 7)) return 0;
-    p += 7;
-    while (*p == ' ' || *p == '\t') p++;
-    return token_eq_ct(p, token);
 }
 
 /* ------------------------------------------------------------------ */
@@ -168,14 +113,24 @@ static void http_conn_free(HttpConn *c) {
     free(c);
 }
 
+/* Attach an already-built full response (head + body) to the connection. */
+static int http_set_response_buf(HttpConn *c, char *buf, size_t len) {
+    free(c->resp);
+    c->resp = buf;
+    c->resp_len = len;
+    c->resp_off = 0;
+    c->state = HTTP_ST_RESPOND;
+    return 0;
+}
+
 /* Build the full response (head + body) into c->resp and enter RESPOND. */
 static int http_set_response(HttpConn *c, int status, const char *reason,
-                             const char *body, size_t bodylen) {
+                             const char *ctype, const char *body, size_t bodylen) {
     char head[256];
     int hn = snprintf(head, sizeof head,
-        "HTTP/1.0 %d %s\r\nContent-Type: application/json\r\n"
-        "Content-Length: %zu\r\nConnection: close\r\n\r\n",
-        status, reason, bodylen);
+        "HTTP/1.0 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+        "Connection: close\r\n\r\n",
+        status, reason, ctype, bodylen);
     size_t headlen;
     char *nb;
     if (hn < 0) return -1;
@@ -185,18 +140,13 @@ static int http_set_response(HttpConn *c, int status, const char *reason,
     if (!nb) return -1;
     memcpy(nb, head, headlen);
     if (bodylen) memcpy(nb + headlen, body, bodylen);
-    free(c->resp);
-    c->resp = nb;
-    c->resp_len = headlen + bodylen;
-    c->resp_off = 0;
-    c->state = HTTP_ST_RESPOND;
-    return 0;
+    return http_set_response_buf(c, nb, headlen + bodylen);
 }
 
 /* Queue a response, arm writable, and attempt an immediate non-blocking flush. */
 static void http_respond(HttpConn *c, int status, const char *reason,
-                         const char *body, size_t bodylen) {
-    if (http_set_response(c, status, reason, body, bodylen) != 0) {
+                         const char *ctype, const char *body, size_t bodylen) {
+    if (http_set_response(c, status, reason, ctype, body, bodylen) != 0) {
         http_conn_free(c);
         return;
     }
@@ -211,7 +161,7 @@ static void http_respond_err(HttpConn *c, int status, const char *reason,
     int bn = snprintf(body, sizeof body, "{\"error\":\"%s\"}", msg);
     if (bn < 0) { http_conn_free(c); return; }
     if ((size_t)bn >= sizeof body) bn = (int)(sizeof body - 1);
-    http_respond(c, status, reason, body, (size_t)bn);
+    http_respond(c, status, reason, "application/json", body, (size_t)bn);
 }
 
 /* Flush as much of the pending response as the socket will accept (non-blocking).
@@ -234,219 +184,30 @@ static void http_try_flush(HttpConn *c) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Handlers                                                           */
+/* Request handling                                                   */
 /* ------------------------------------------------------------------ */
 
-static void handle_log(HttpServer *srv, HttpConn *c, const char *target) {
-    Store *s = srv->store;
-    size_t n = 100;
-    StoreLogEntry *entries = NULL;
-    size_t nentries = 0, i;
-    JsonBuilder b;
-    char *body;
-    size_t bodylen;
-    const char *q = strchr(target, '?');
+/* Route the buffered request through the pure admin_build_response() (see
+   src/admin.c), which owns all routing, auth, and Content-Type decisions, and
+   queue whatever full response it returns for flushing. */
 
-    if (q && strncmp(q, "?n=", 3) == 0) {
-        const char *p = q + 3;
-        unsigned long v = 0;
-        while (*p >= '0' && *p <= '9') {
-            if (v > (unsigned long)HTTP_MAX_LOG_N * 10) break;
-            v = v * 10 + (unsigned long)(*p - '0');
-            p++;
-        }
-        if (v > 0) n = (size_t)v;
-    }
-    if (n > HTTP_MAX_LOG_N) n = HTTP_MAX_LOG_N;
+static void handle_request(HttpConn *c) {
+    char *resp = NULL;
+    size_t resp_len = 0;
 
-    if (store_log_recent(s, n, &entries, &nentries) != VISAGE_OK) {
-        http_respond_err(c, 500, "Internal Server Error", "store error");
-        return;
-    }
-
-    jsonb_init(&b);
-    jsonb_begin_array(&b);
-    for (i = 0; i < nentries; i++) {
-        if (i) jsonb_comma(&b);
-        jsonb_begin_object(&b);
-        jsonb_key(&b, "msgid"); jsonb_u32(&b, entries[i].msgid); jsonb_comma(&b);
-        jsonb_key(&b, "ts");    jsonb_u32(&b, entries[i].ts);    jsonb_comma(&b);
-        jsonb_key(&b, "dir");   jsonb_u32(&b, entries[i].dir);   jsonb_comma(&b);
-        jsonb_key(&b, "local"); jsonb_str(&b, entries[i].local ? entries[i].local : ""); jsonb_comma(&b);
-        jsonb_key(&b, "remote"); jsonb_str(&b, entries[i].remote ? entries[i].remote : ""); jsonb_comma(&b);
-        jsonb_key(&b, "status"); jsonb_str(&b, entries[i].status ? entries[i].status : "");
-        jsonb_end_object(&b);
-    }
-    jsonb_end_array(&b);
-    body = jsonb_detach(&b, &bodylen);
-    store_log_entries_free(entries, nentries);
-    if (!body) { http_respond_err(c, 500, "Internal Server Error", "out of memory"); return; }
-    http_respond(c, 200, "OK", body, bodylen);
-    free(body);
-}
-
-static void handle_alias(HttpServer *srv, HttpConn *c, int rm) {
-    char alias[512], dest[512];
-    int rc;
-    const char *body = c->recv + c->header_end;
-
-    if (json_obj_get_str(body, "alias", alias, sizeof alias) != 0 ||
-        json_obj_get_str(body, "destination", dest, sizeof dest) != 0) {
-        http_respond_err(c, 400, "Bad Request", "expected {\"alias\",\"destination\"}");
-        return;
-    }
-
-    if (config_alias_read_only(srv->cfg, alias)) {
-        http_respond_err(c, 403, "Forbidden",
-                         "alias is declared in config (read-only)");
-        return;
-    }
-
-    rc = rm ? store_alias_rm(srv->store, alias, dest)
-            : store_alias_add(srv->store, alias, dest);
-    if (rc != VISAGE_OK) {
-        http_respond_err(c, 500, "Internal Server Error", "store error");
-        return;
-    }
-    http_respond(c, 200, "OK", "{\"ok\":true}", 11);
-}
-
-/* POST /replay { "msgid": N } — re-queue every terminal (delivered/permfail)
-   delivery for msgid whose durably-retained spool body <msgid>.<k>.out.eml
-   still exists, flipping it back to "queued" (attempts reset, next_ts 0) so the
-   queue re-drive redelivers it.  Responds {"ok":true,"replayed":K}. */
-typedef struct {
-    uint32_t msgid;
-    uint32_t k;
-} ReplayItem;
-
-typedef struct {
-    uint32_t     msgid;
-    ReplayItem  *items;
-    size_t       n, cap;
-    int          oom;
-} ReplayCollect;
-
-static int replay_collect_cb(uint32_t k, const char *from, const char *to,
-                             const char *status, void *user) {
-    ReplayCollect *c = (ReplayCollect *)user;
-    ReplayItem *it;
-    (void)from;
-    (void)to;
-    /* Only terminal states are replayable: delivered or permfail.  A
-       queued/delivering delivery is already active and must not be touched. */
-    if (strcmp(status, "delivered") != 0 && strcmp(status, "permfail") != 0)
-        return 0;
-    if (c->n == c->cap) {
-        size_t nc = c->cap ? c->cap * 2 : 4;
-        ReplayItem *na = realloc(c->items, nc * sizeof *na);
-        if (!na) { c->oom = 1; return 1; }
-        c->items = na;
-        c->cap = nc;
-    }
-    it = &c->items[c->n];
-    it->msgid = c->msgid;
-    it->k = k;
-    c->n++;
-    return 0;
-}
-
-static void handle_replay(HttpServer *srv, HttpConn *c) {
-    const char *body = c->recv + c->header_end;
-    uint32_t msgid;
-    ReplayCollect rc;
-    size_t i;
-    int replayed = 0;
-    char spoolpath[4096];
-    char resp[128];
-    int bn;
-
-    if (json_obj_get_u32(body, "msgid", &msgid) != 0) {
-        http_respond_err(c, 400, "Bad Request", "expected {\"msgid\":N}");
-        return;
-    }
-
-    /* Collect the terminal rows (READ-ONLY walk), then mutate AFTER the walk:
-       store_queue_set_status reallocs the dafsa states array. */
-    memset(&rc, 0, sizeof rc);
-    rc.msgid = msgid;
-    if (store_queue_walk_msgid(srv->store, msgid, replay_collect_cb, &rc)
-            != VISAGE_OK || rc.oom) {
-        free(rc.items);
-        http_respond_err(c, 500, "Internal Server Error", "store error");
-        return;
-    }
-
-    for (i = 0; i < rc.n; i++) {
-        int n = snprintf(spoolpath, sizeof spoolpath, "%s/%u.%u.out.eml",
-                         srv->cfg->storage.spool, rc.items[i].msgid,
-                         rc.items[i].k);
-        if (n < 0 || (size_t)n >= sizeof spoolpath) continue;
-        if (access(spoolpath, F_OK) != 0) continue;   /* no retained body */
-        if (store_queue_set_status(srv->store, rc.items[i].msgid,
-                                   rc.items[i].k, "queued", 0, 0)
-                == VISAGE_OK)
-            replayed++;
-    }
-    free(rc.items);
-
-    bn = snprintf(resp, sizeof resp, "{\"ok\":true,\"replayed\":%d}", replayed);
-    if (bn < 0 || (size_t)bn >= sizeof resp) {
+    if (admin_build_response(c->srv->cfg, c->srv->store,
+                             c->recv, c->recv_len, c->header_end,
+                             &resp, &resp_len) != VISAGE_OK) {
         http_respond_err(c, 500, "Internal Server Error", "out of memory");
         return;
     }
-    http_respond(c, 200, "OK", resp, (size_t)bn);
-}
-
-static void handle_request(HttpServer *srv, HttpConn *c) {
-    char method[16], target[1024];
-    const char *req = c->recv;
-    size_t reqlen = c->recv_len;
-    size_t header_end = c->header_end;
-
-    if (parse_request_line(req, reqlen, method, sizeof method,
-                           target, sizeof target) != 0) {
-        http_respond_err(c, 400, "Bad Request", "malformed request");
+    if (http_set_response_buf(c, resp, resp_len) != 0) {
+        free(resp);
+        http_conn_free(c);
         return;
     }
-    if (header_end == SIZE_MAX || header_end > reqlen) {
-        http_respond_err(c, 400, "Bad Request", "malformed headers");
-        return;
-    }
-
-    /* /health needs no auth. */
-    if (strcmp(method, "GET") == 0 && strcmp(target, "/health") == 0) {
-        http_respond(c, 200, "OK", "{\"ok\":true}", 11);
-        return;
-    }
-
-    /* Everything else requires the bearer token. */
-    if (!auth_ok(req, reqlen, header_end, srv->cfg->admin.token)) {
-        http_respond_err(c, 401, "Unauthorized", "missing or invalid token");
-        return;
-    }
-
-    if (strcmp(method, "GET") == 0 &&
-        (strcmp(target, "/log") == 0 || strncmp(target, "/log?", 5) == 0)) {
-        handle_log(srv, c, target);
-    } else if (strcmp(method, "POST") == 0 && strcmp(target, "/alias") == 0) {
-        handle_alias(srv, c, 0);
-    } else if (strcmp(method, "DELETE") == 0 && strcmp(target, "/alias") == 0) {
-        handle_alias(srv, c, 1);
-    } else if (strcmp(method, "POST") == 0 && strcmp(target, "/replay") == 0) {
-        handle_replay(srv, c);
-    } else if ((strcmp(method, "GET") == 0 ||
-                strcmp(method, "POST") == 0 ||
-                strcmp(method, "DELETE") == 0) &&
-               (strcmp(target, "/alias") == 0 ||
-                strcmp(target, "/replay") == 0 ||
-                strcmp(target, "/log") == 0 || strncmp(target, "/log?", 5) == 0 ||
-                strcmp(target, "/health") == 0)) {
-        /* Known path, wrong method. */
-        http_respond_err(c, 405, "Method Not Allowed", "method not allowed");
-    } else {
-        http_respond_err(c, 404, "Not Found", "unknown path");
-    }
+    smtp_in_http_set_events(c->handle, POLLOUT);
+    http_try_flush(c);
 }
 
 /* ------------------------------------------------------------------ */
@@ -473,7 +234,7 @@ static void http_process(HttpConn *c) {
     c->header_end = header_end;
     c->body_len = body_len;
     c->recv[c->recv_len] = '\0';
-    handle_request(c->srv, c);
+    handle_request(c);
 }
 
 static void http_conn_on_readable(int fd, void *user) {

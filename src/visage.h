@@ -90,6 +90,17 @@ int smtp_out_send(Store *s, const Config *c, const char *from, const char *to,
    a setup failure. */
 int http_serve(Store *s, const Config *c);
 
+/* admin (src/admin.c) — pure admin HTTP request -> response builder.  Given a
+   fully-buffered request (headers + body) and the configured token, builds the
+   complete HTTP response (head + body, correct Content-Type) into *out
+   (malloc'd; caller frees) / *outlen.  Serves /health + the embedded static UI
+   shell without auth and every data route (/aliases, /status, /log, /alias,
+   /replay) behind `Authorization: Bearer <token>`.  Returns VISAGE_OK, or a
+   negative error code. */
+int admin_build_response(const Config *cfg, Store *store,
+                         const char *req, size_t reqlen, size_t header_end,
+                         char **out, size_t *outlen);
+
 /* main (src/main.c) — CLI + daemon entry point. */
 
 #endif /* VISAGE_H */

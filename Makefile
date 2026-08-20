@@ -53,10 +53,10 @@ tests/tls_selfcheck.com: tests/tls_selfcheck.c $(MBEDTLS_OBJ) src/mbedtls_visage
 tests/verify_selfcheck.com: tests/verify_selfcheck.c $(MBEDTLS_OBJ) src/mbedtls_visage_config.h src/data/cacert_pem.c
 	$(CC) $(CFLAGS) $(MBEDTLS_FLAGS) -o $@ tests/verify_selfcheck.c $(MBEDTLS_OBJ) src/data/cacert_pem.c
 
-SRC = src/config.c src/store.c src/smtp_in.c src/smtp_out.c src/mail.c src/reply.c src/dkim.c src/http.c src/http_parse.c src/json.c src/main.c
+SRC = src/config.c src/store.c src/smtp_in.c src/smtp_out.c src/mail.c src/reply.c src/dkim.c src/http.c src/admin.c src/http_parse.c src/json.c src/main.c
 all: visage.com config_check.com store_check.com mail_check.com reply_check.com smtp_check.com http_check.com dkim_check.com tests/tls_selfcheck.com tests/verify_selfcheck.com
-visage.com: $(SRC) src/visage.h src/config.h src/store.h $(CORE_DHALL) $(CORE_DATALOG) $(MBEDTLS_OBJ) src/data/cacert_pem.c
-	$(CC) $(CFLAGS) $(MBEDTLS_FLAGS) -o $@ $(SRC) $(CORE_DHALL) $(CORE_DATALOG) $(MBEDTLS_OBJ) src/data/cacert_pem.c
+visage.com: $(SRC) src/visage.h src/config.h src/store.h $(CORE_DHALL) $(CORE_DATALOG) $(MBEDTLS_OBJ) src/data/cacert_pem.c src/data/admin_ui.c
+	$(CC) $(CFLAGS) $(MBEDTLS_FLAGS) -o $@ $(SRC) $(CORE_DHALL) $(CORE_DATALOG) $(MBEDTLS_OBJ) src/data/cacert_pem.c src/data/admin_ui.c
 config_check.com: src/config.c src/config_check.c src/config.h src/visage.h $(CORE_DHALL)
 	$(CC) $(CFLAGS) -o $@ src/config.c src/config_check.c $(CORE_DHALL)
 store_check.com: src/store.c src/store_check.c src/store.h src/visage.h $(CORE_DATALOG)
@@ -69,8 +69,11 @@ reply_check.com: src/reply.c src/reply_check.c src/reply.h src/store.c src/store
 	$(CC) $(CFLAGS) -o $@ src/reply.c src/reply_check.c src/store.c src/mail.c $(CORE_DATALOG)
 smtp_check.com: src/smtp_in.c src/smtp_out.c src/store.c src/reply.c src/dkim.c src/config.c src/smtp_check.c src/smtp.h src/store.h src/reply.h src/mail.c src/mail.h src/config.h src/visage.h $(CORE_DHALL) $(CORE_DATALOG) $(MBEDTLS_OBJ) src/data/cacert_pem.c
 	$(CC) $(CFLAGS) $(MBEDTLS_FLAGS) -o $@ src/smtp_in.c src/smtp_out.c src/store.c src/reply.c src/dkim.c src/config.c src/smtp_check.c src/mail.c $(CORE_DHALL) $(CORE_DATALOG) $(MBEDTLS_OBJ) src/data/cacert_pem.c
-http_check.com: src/http_parse.c src/http_check.c src/http_parse.h
-	$(CC) $(CFLAGS) -o $@ src/http_parse.c src/http_check.c
+http_check.com: src/http_parse.c src/http_check.c src/http_parse.h src/admin.c \
+    src/store.c src/json.c src/config.c src/visage.h src/config.h src/store.h \
+    src/data/admin_ui.c $(CORE_DATALOG) $(CORE_DHALL)
+	$(CC) $(CFLAGS) -o $@ src/admin.c src/http_parse.c src/store.c src/json.c \
+	    src/config.c src/http_check.c $(CORE_DATALOG) $(CORE_DHALL) src/data/admin_ui.c
 dkim_check.com: src/dkim.c src/dkim_check.c src/dkim.h src/mbedtls_visage_config.h $(MBEDTLS_OBJ)
 	$(CC) $(CFLAGS) $(MBEDTLS_FLAGS) -o $@ src/dkim.c src/dkim_check.c $(MBEDTLS_OBJ)
 
@@ -103,4 +106,11 @@ bench: store_bench.com
 	./store_bench.com
 	python3 tools/bench_plot.py bench.csv docs/bench-latency.svg docs/bench-size.svg
 
-.PHONY: all e2e wasm bench
+# --- admin web UI embed --------------------------------------------------
+# Regenerate src/data/admin_ui.c from the admin/ source files (index.html,
+# app.js, style.css).  Both the source and the generated file are committed;
+# this target is only needed when the UI sources change.
+gen-admin:
+	./tools/gen_admin_ui.sh
+
+.PHONY: all e2e wasm bench gen-admin

@@ -2,6 +2,7 @@
  * parser (src/http_parse.c).  No sockets: feeds requests in chunks and asserts
  * the parse verdicts (NEED_MORE -> DONE, header/body framing, oversize -> ERR,
  * malformed/absent Content-Length handling).  Returns 0 only if all pass. */
+#include "visage.h"
 #include "http_parse.h"
 
 #include <stdio.h>
@@ -174,6 +175,162 @@ static void ci_eq_test(void) {
     EXPECT(http_ci_eq("a", "a", 0) == 1, "ci_eq zero length");
 }
 
+/* ---- admin route tests (src/admin.c, via admin_build_response) ---- */
+
+static void expect_contains(const char *resp, const char *needle,
+                            const char *what) {
+    EXPECT(resp && strstr(resp, needle) != NULL, what);
+}
+
+/* Build a request + feed it through admin_build_response.  Returns the
+ * admin_build_response status; on success *resp is a malloc'd full HTTP
+ * response the caller frees. */
+static int route(const Config *cfg, Store *store, const char *req,
+                 char **resp, size_t *resplen) {
+    size_t he = SIZE_MAX, bl = 0;
+    if (http_parse_probe(req, strlen(req), HTTP_MAX_REQ, &he, &bl)
+            != HTTP_PARSE_DONE)
+        return -1;
+    return admin_build_response(cfg, store, req, strlen(req), he, resp, resplen);
+}
+
+static void build_cfg(Config *cfg) {
+    static char host[] = "mail.example.com";
+    static char dom[]  = "example.com";
+    static char *doms[] = { dom };
+    static char tok[]  = "sekret-token";
+    static char addr[] = "0.0.0.0";
+    static char relay_host[] = "relay.example.com";
+    static char tls[]  = "tls";
+    static char spool[] = "/tmp/visage_http_spool";
+    static char lock_alias[] = "locked@example.com";
+    static char lock_dest[]  = "l@realmail.example";
+    static char *lock_dests[] = { lock_dest };
+    static ConfigAlias aliases[1] = { { lock_alias, lock_dests, 1 } };
+
+    memset(cfg, 0, sizeof *cfg);
+    cfg->hostname = host;
+    cfg->domains = doms;
+    cfg->ndomains = 1;
+    cfg->listen.address = addr;
+    cfg->listen.port = 25;
+    cfg->http.address = addr;
+    cfg->http.port = 8000;
+    cfg->relay.host = relay_host;
+    cfg->relay.port = 587;
+    cfg->relay.tls = tls;
+    cfg->storage.spool = spool;
+    cfg->aliases = aliases;
+    cfg->naliases = 1;
+    cfg->admin.token = tok;
+}
+
+static void admin_routes_test(void) {
+    char tpl[] = "/tmp/visage_http_XXXXXX";
+    char *dir = mkdtemp(tpl);
+    Config cfg;
+    Store *s;
+    char *resp = NULL;
+    size_t resplen = 0;
+
+    build_cfg(&cfg);
+    EXPECT(dir != NULL, "admin: mkdtemp");
+    s = store_open(dir);
+    EXPECT(s != NULL, "admin: store_open");
+    if (!s) return;
+
+    EXPECT(store_alias_add(s, "alice@example.com", "a@realmail.example") == VISAGE_OK,
+           "admin: seed alias a");
+    EXPECT(store_alias_add(s, "alice@example.com", "b@realmail.example") == VISAGE_OK,
+           "admin: seed alias b");
+
+    /* static UI shell: no auth, correct Content-Type, real body. */
+    EXPECT(route(&cfg, s, "GET / HTTP/1.0\r\nHost: x\r\n\r\n", &resp, &resplen) == VISAGE_OK,
+           "admin: GET / builds");
+    expect_contains(resp, "HTTP/1.0 200 OK", "admin: GET / -> 200");
+    expect_contains(resp, "Content-Type: text/html; charset=utf-8", "admin: GET / -> text/html");
+    expect_contains(resp, "visage admin", "admin: GET / body has the UI");
+    free(resp); resp = NULL;
+
+    EXPECT(route(&cfg, s, "GET /app.js HTTP/1.0\r\nHost: x\r\n\r\n", &resp, &resplen) == VISAGE_OK,
+           "admin: GET /app.js builds");
+    expect_contains(resp, "Content-Type: text/javascript; charset=utf-8", "admin: /app.js -> text/javascript");
+    free(resp); resp = NULL;
+
+    EXPECT(route(&cfg, s, "GET /style.css HTTP/1.0\r\nHost: x\r\n\r\n", &resp, &resplen) == VISAGE_OK,
+           "admin: GET /style.css builds");
+    expect_contains(resp, "Content-Type: text/css; charset=utf-8", "admin: /style.css -> text/css");
+    free(resp); resp = NULL;
+
+    /* /health stays public. */
+    EXPECT(route(&cfg, s, "GET /health HTTP/1.0\r\nHost: x\r\n\r\n", &resp, &resplen) == VISAGE_OK,
+           "admin: GET /health builds");
+    expect_contains(resp, "HTTP/1.0 200 OK", "admin: /health -> 200 (no auth)");
+    expect_contains(resp, "{\"ok\":true}", "admin: /health body");
+    free(resp); resp = NULL;
+
+    /* data routes 401 without a token. */
+    EXPECT(route(&cfg, s, "GET /aliases HTTP/1.0\r\nHost: x\r\n\r\n", &resp, &resplen) == VISAGE_OK,
+           "admin: /aliases no token builds");
+    expect_contains(resp, "HTTP/1.0 401 Unauthorized", "admin: /aliases no token -> 401");
+    free(resp); resp = NULL;
+
+    EXPECT(route(&cfg, s, "GET /status HTTP/1.0\r\nHost: x\r\n\r\n", &resp, &resplen) == VISAGE_OK,
+           "admin: /status no token builds");
+    expect_contains(resp, "HTTP/1.0 401 Unauthorized", "admin: /status no token -> 401");
+    free(resp); resp = NULL;
+
+    /* wrong token also 401 (constant-time auth). */
+    EXPECT(route(&cfg, s,
+                 "GET /aliases HTTP/1.0\r\nAuthorization: Bearer wrong\r\nHost: x\r\n\r\n",
+                 &resp, &resplen) == VISAGE_OK, "admin: /aliases wrong token");
+    expect_contains(resp, "HTTP/1.0 401 Unauthorized", "admin: wrong token -> 401");
+    free(resp); resp = NULL;
+
+    /* /aliases with token -> 200 + flat JSON list. */
+    EXPECT(route(&cfg, s,
+                 "GET /aliases HTTP/1.0\r\nAuthorization: Bearer sekret-token\r\nHost: x\r\n\r\n",
+                 &resp, &resplen) == VISAGE_OK, "admin: /aliases with token");
+    expect_contains(resp, "HTTP/1.0 200 OK", "admin: /aliases with token -> 200");
+    expect_contains(resp, "Content-Type: application/json", "admin: /aliases content-type");
+    expect_contains(resp, "\"alias\":\"alice@example.com\"", "admin: /aliases lists alice");
+    expect_contains(resp, "\"destination\":\"a@realmail.example\"", "admin: /aliases lists dest a");
+    expect_contains(resp, "\"destination\":\"b@realmail.example\"", "admin: /aliases lists dest b");
+    free(resp); resp = NULL;
+
+    /* /status with token -> 200 + dashboard fields. */
+    EXPECT(route(&cfg, s,
+                 "GET /status HTTP/1.0\r\nAuthorization: Bearer sekret-token\r\nHost: x\r\n\r\n",
+                 &resp, &resplen) == VISAGE_OK, "admin: /status with token");
+    expect_contains(resp, "HTTP/1.0 200 OK", "admin: /status with token -> 200");
+    expect_contains(resp, "\"hostname\":\"mail.example.com\"", "admin: /status hostname");
+    expect_contains(resp, "\"alias_count\":2", "admin: /status alias_count == 2");
+    expect_contains(resp, "\"queued\":0", "admin: /status queue queued == 0");
+    free(resp); resp = NULL;
+
+    /* POST /alias to a config-declared alias -> 403 read-only. */
+    {
+        const char *body = "{\"alias\":\"locked@example.com\",\"destination\":\"x@y.org\"}";
+        char req[600];
+        int n = snprintf(req, sizeof req,
+                         "POST /alias HTTP/1.0\r\nAuthorization: Bearer sekret-token\r\n"
+                         "Content-Length: %zu\r\n\r\n%s", strlen(body), body);
+        EXPECT(n > 0 && route(&cfg, s, req, &resp, &resplen) == VISAGE_OK,
+               "admin: POST read-only alias builds");
+        expect_contains(resp, "HTTP/1.0 403 Forbidden", "admin: read-only alias -> 403");
+        free(resp); resp = NULL;
+    }
+
+    /* unknown path with a valid token -> 404. */
+    EXPECT(route(&cfg, s,
+                 "GET /nope HTTP/1.0\r\nAuthorization: Bearer sekret-token\r\nHost: x\r\n\r\n",
+                 &resp, &resplen) == VISAGE_OK, "admin: GET /nope");
+    expect_contains(resp, "HTTP/1.0 404 Not Found", "admin: unknown path -> 404");
+    free(resp); resp = NULL;
+
+    store_close(s);
+}
+
 int main(void) {
     ci_eq_test();
     header_value_test();
@@ -185,6 +342,7 @@ int main(void) {
     body_short_of_cap_test();
     malformed_cl_test();
     no_cl_test();
+    admin_routes_test();
 
     printf("\n%d checks, %d failed\n", nchecks, nfails);
     return nfails ? 1 : 0;

@@ -169,6 +169,42 @@ int main(void) {
     }
     store_free_strvec(dests, ndests);
 
+    /* admin list helpers: store_alias_count + store_alias_list_all.  At this
+       point the store holds 3 alias facts (jane->jane@realmail, shopping->bob,
+       "John Doe"->jd) after the earlier adds and one rm. */
+    check(store_alias_count(s) == 3, "alias_count == 3 before additions");
+    check(store_alias_add(s, "sales@example.com", "s1@realmail.example") == VISAGE_OK,
+          "alias_add for list test");
+    check(store_alias_add(s, "sales@example.com", "s2@realmail.example") == VISAGE_OK,
+          "alias_add second dest for list test");
+    check(store_alias_count(s) == 5, "alias_count == 5 after two sales dests");
+    {
+        char **la = NULL, **ld = NULL;
+        size_t ln = 0, li;
+        int has_sales_s1 = 0, has_sales_s2 = 0, has_jane = 0;
+        check(store_alias_list_all(s, &la, &ld, &ln) == VISAGE_OK,
+              "alias_list_all returns OK");
+        check(ln == (size_t)store_alias_count(s) && ln == 5,
+              "alias_list_all length == count (5)");
+        for (li = 0; li < ln; li++) {
+            if (la[li] && ld[li] && strcmp(la[li], "sales@example.com") == 0) {
+                if (strcmp(ld[li], "s1@realmail.example") == 0) has_sales_s1 = 1;
+                if (strcmp(ld[li], "s2@realmail.example") == 0) has_sales_s2 = 1;
+            }
+            if (la[li] && ld[li] && strcmp(la[li], "jane@example.com") == 0 &&
+                strcmp(ld[li], "jane@realmail.example") == 0)
+                has_jane = 1;
+        }
+        check(has_sales_s1 && has_sales_s2, "alias_list_all has both sales dests");
+        check(has_jane, "alias_list_all has the jane dest");
+        store_free_strvec(la, ln);
+        store_free_strvec(ld, ln);
+    }
+    /* remove one dest -> count + list drop in step. */
+    check(store_alias_rm(s, "sales@example.com", "s2@realmail.example") == VISAGE_OK,
+          "alias_rm for count test");
+    check(store_alias_count(s) == 4, "alias_count == 4 after rm");
+
     /* revmap round-trip. */
     check(store_revmap_add(s, "deadbeefcafe", "orig@foo.org", "jane@example.com")
               == VISAGE_OK,

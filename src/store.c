@@ -336,6 +336,92 @@ void store_free_strvec(char **vec, size_t n) {
     free(vec);
 }
 
+long store_alias_count(Store *s) {
+    CountCtx cc = {0};
+    if (!s || !s->db) return -1;
+    return dl_prefix(s->db, REL_ALIAS, NULL, 0, count_cb, &cc);
+}
+
+/* collect-cb for store_alias_list_all: copy one alias fact as a
+ * (alias, destination) pair.  Alias = "local@domain" (col 1 '@' col 0), the
+ * same reconstruction the daemon resolves by. */
+typedef struct {
+    dl_db  *db;
+    char  **aliases;
+    char  **dests;
+    size_t  n, cap;
+    int     err;
+} AliasListCtx;
+
+static int alias_list_cb(const uint32_t *cols, uint8_t arity, void *user) {
+    AliasListCtx *c = (AliasListCtx *)user;
+    const char *dom, *loc, *dst;
+    char *alias, *dup;
+    size_t ll, dl;
+    (void)arity;
+
+    dom = dl_intern_str_of(c->db, cols[0]);
+    loc = dl_intern_str_of(c->db, cols[1]);
+    dst = dl_intern_str_of(c->db, cols[2]);
+    if (!dom || !loc || !dst) { c->err = 1; return 1; }
+
+    if (c->n == c->cap) {
+        size_t nc = c->cap ? c->cap * 2 : 16;
+        char **na = realloc(c->aliases, nc * sizeof *na);
+        char **nd = realloc(c->dests, nc * sizeof *nd);
+        if (!na || !nd) {
+            free(na);   /* realloc leaves the old block untouched on failure */
+            free(nd);
+            c->err = 1;
+            return 1;
+        }
+        c->aliases = na;
+        c->dests = nd;
+        c->cap = nc;
+    }
+
+    ll = strlen(loc);
+    dl = strlen(dom);
+    alias = malloc(ll + 1 + dl + 1);
+    if (!alias) { c->err = 1; return 1; }
+    memcpy(alias, loc, ll);
+    alias[ll] = '@';
+    memcpy(alias + ll + 1, dom, dl);
+    alias[ll + 1 + dl] = '\0';
+
+    dup = strdup(dst);
+    if (!dup) { free(alias); c->err = 1; return 1; }
+
+    c->aliases[c->n] = alias;
+    c->dests[c->n] = dup;
+    c->n++;
+    return 0;
+}
+
+int store_alias_list_all(Store *s, char ***alias, char ***dest, size_t *n) {
+    AliasListCtx c;
+    long rows;
+
+    if (!s || !s->db || !alias || !dest || !n) return VISAGE_EPARAM;
+    *alias = NULL;
+    *dest = NULL;
+    *n = 0;
+
+    memset(&c, 0, sizeof c);
+    c.db = s->db;
+    rows = dl_prefix(s->db, REL_ALIAS, NULL, 0, alias_list_cb, &c);
+    if (rows < 0 || c.err) {
+        store_free_strvec(c.aliases, c.n);
+        store_free_strvec(c.dests, c.n);
+        return c.err ? VISAGE_ENOMEM : VISAGE_ESTORE;
+    }
+    if (c.n == 0) return VISAGE_OK;   /* *alias / *dest stay NULL, *n == 0 */
+    *alias = c.aliases;
+    *dest = c.dests;
+    *n = c.n;
+    return VISAGE_OK;
+}
+
 /* --- reverse-alias reply map ------------------------------------------ */
 
 int store_revmap_add_at(Store *s, const char *token, const char *sender,

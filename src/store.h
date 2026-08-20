@@ -186,6 +186,17 @@ int store_queue_walk_msgid(Store *s, uint32_t msgid,
                                      void *user),
                            void *user);
 
+/* Number of alias facts (each alias -> destination pair counts separately).
+ * Returns -1 on error. */
+long store_alias_count(Store *s);
+
+/* Enumerate every alias fact as a flat list of (alias, destination) pairs.
+ * On success returns 0 and sets *alias / *dest to parallel malloc'd arrays of
+ * malloc'd strings (free each with store_free_strvec) and *n to the number of
+ * pairs.  An alias with D destinations appears D times (JS groups them).  On
+ * success with zero facts, *alias / *dest are set to NULL and *n to 0. */
+int store_alias_list_all(Store *s, char ***alias, char ***dest, size_t *n);
+
 /* Free a string vector returned by store_resolve (n == *ndests).  Safe on a
  * NULL vector. */
 void store_free_strvec(char **vec, size_t n);
