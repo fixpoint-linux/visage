@@ -1,6 +1,8 @@
 CC      := cosmocc
-DHALL_C ?= ../dhall-c
-DATALOG ?= ../datalog-dafsa
+# dhall-c and datalog-dafsa are vendored as git submodules; override with
+# DHALL_C=../dhall-c / DATALOG=../datalog-dafsa to use sibling checkouts.
+DHALL_C ?= vendor/dhall-c
+DATALOG ?= vendor/datalog-dafsa
 CFLAGS   = -std=c11 -O2 -g -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L \
            -I $(DHALL_C)/src -I $(DATALOG)/src -I $(DATALOG)/vendor
 CORE_DHALL = $(DHALL_C)/src/arena.c $(DHALL_C)/src/lexer.c $(DHALL_C)/src/parser.c \
@@ -11,12 +13,15 @@ CORE_DATALOG = $(DATALOG)/vendor/dafsa.c $(DATALOG)/vendor/dafsa_state.c \
              $(DATALOG)/vendor/dafsa_core.c $(DATALOG)/vendor/dafsa_persist.c \
              $(DATALOG)/vendor/dafsa_view.c $(DATALOG)/vendor/dafsa_crc32.c \
              $(DATALOG)/vendor/dafsa_wal.c $(DATALOG)/vendor/dafsa_build.c \
-             $(DATALOG)/vendor/dafsa_rank.c \
+             $(DATALOG)/vendor/dafsa_rank.c $(DATALOG)/vendor/dafsa_view_rank.c \
              $(DATALOG)/src/intern.c $(DATALOG)/src/termstore.c $(DATALOG)/src/relation.c \
              $(DATALOG)/src/vrelation.c $(DATALOG)/src/tupleset.c $(DATALOG)/src/parser.c \
              $(DATALOG)/src/compiler.c $(DATALOG)/src/vm.c $(DATALOG)/src/snapshot.c \
              $(DATALOG)/src/regexwalk.c $(DATALOG)/src/permindex.c $(DATALOG)/src/util.c \
-             $(DATALOG)/src/dl.c $(DATALOG)/src/magic.c $(DATALOG)/src/topdown.c
+             $(DATALOG)/src/dl.c $(DATALOG)/src/iter.c $(DATALOG)/src/magic.c \
+             $(DATALOG)/src/topdown.c $(DATALOG)/src/analyze.c $(DATALOG)/src/schema.c \
+             $(DATALOG)/src/typecheck.c $(DATALOG)/src/txnwal.c $(DATALOG)/src/index.c \
+             $(DATALOG)/src/vector.c
 
 # --- vendored mbedTLS (relay STARTTLS) ---------------------------------------
 MBEDTLS_DIR   = vendor/mbedtls

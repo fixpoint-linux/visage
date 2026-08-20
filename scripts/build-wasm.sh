@@ -6,7 +6,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-DHALL_C="${DHALL_C:-../dhall-c}"
+# dhall-c is vendored as a git submodule; override with DHALL_C=../dhall-c to
+# use a sibling checkout instead.
+DHALL_C="${DHALL_C:-vendor/dhall-c}"
 
 EMCONF="$(mktemp)"
 cat > "$EMCONF" <<'EOF'

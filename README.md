@@ -84,8 +84,8 @@ CRITICAL). Where it stands:
 | Piece | Role |
 | --- | --- |
 | [cosmocc](https://github.com/jart/cosmopolitan) | one small `visage.com` APE binary, many OSes |
-| [dhall-c](https://github.com/jmars/dhall-c) | **typechecked** Dhall config, evaluated at startup |
-| [datalog-dafsa](https://github.com/jmars/datalog-dafsa) | compact minimal-DAFSA store: prefix-search lookups, WAL/flock + mmap reads |
+| [dhall-c](https://github.com/jmars/dhall-c) | **typechecked** Dhall config, evaluated at startup (vendored submodule) |
+| [datalog-dafsa](https://github.com/jmars/datalog-dafsa) | compact minimal-DAFSA store: prefix-search lookups, WAL/flock + mmap reads (vendored submodule) |
 | SMTP-in-C (`src/smtp_in.c`, `src/smtp_out.c`) | RFC 5321 state machine, receiver + relay |
 | STARTTLS / STARTTLS-verify (`vendor/mbedtls`) | relay to your mailbox provider, optionally cert-verified |
 | DKIM (`src/dkim.c`) | sign outbound mail from C |
@@ -94,12 +94,16 @@ CRITICAL). Where it stands:
 
 ## Build
 
-Requires `cosmocc`. The `dhall-c` interpreter core and `datalog-dafsa` store are siblings at
-`../dhall-c` and `../datalog-dafsa`; mbedTLS is vendored under `vendor/`.
+Requires `cosmocc`. `dhall-c` and `datalog-dafsa` are vendored as git submodules; mbedTLS is
+vendored under `vendor/`.
 
 ```sh
-make            # builds visage.com (APE) + visage.com.dbg (ELF) + all *_check tools
+git submodule update --init --recursive   # first checkout: fetch vendor/dhall-c + vendor/datalog-dafsa
+make                                      # builds visage.com (APE) + visage.com.dbg (ELF) + all *_check tools
 ```
+
+To use sibling `dhall-c`/`datalog-dafsa` checkouts instead of the submodules, build with
+`make DHALL_C=../dhall-c DATALOG=../datalog-dafsa` (likewise `scripts/build-wasm.sh` honors `DHALL_C`).
 
 For the browser build (needs `emscripten clang lld llvm nodejs`):
 

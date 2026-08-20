@@ -1,0 +1,6 @@
+[submodule "vendor/dhall-c"]
+	path = vendor/dhall-c
+	url = https://github.com/jmars/dhall-c
+[submodule "vendor/datalog-dafsa"]
+	path = vendor/datalog-dafsa
+	url = https://github.com/jmars/datalog-dafsa
