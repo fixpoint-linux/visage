@@ -19,6 +19,7 @@
  *   GET    /log?n=N  -> JSON array of the N most-recent log entries
  *   POST   /alias    -> {"alias":"a@d","destination":"x@y"}  (add)
  *   DELETE /alias    -> {"alias":"a@d","destination":"x@y"}  (remove)
+ *   POST   /replay   -> {"msgid":N}  (re-queue terminal deliveries for replay)
  *
  * Bounds: the request is accumulated into a fixed per-connection buffer capped
  * at HTTP_MAX_REQ bytes (see http_parse.h); Content-Length is honored and
@@ -31,6 +32,7 @@
 #include <netdb.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <unistd.h>
 
 #define HTTP_LISTEN_BACKLOG 16
 #define HTTP_READ_TIMEOUT_MS 5000   /* idle timeout for a registered conn (ms) */
@@ -77,6 +79,7 @@ static void http_respond_err(HttpConn *c, int status, const char *reason,
                              const char *msg);
 static void http_try_flush(HttpConn *c);
 static void http_process(HttpConn *c);
+static void handle_log(HttpServer *srv, HttpConn *c, const char *target);
 static void handle_request(HttpServer *srv, HttpConn *c);
 static void http_conn_on_readable(int fd, void *user);
 static void http_conn_on_writable(int fd, void *user);
@@ -308,6 +311,93 @@ static void handle_alias(HttpServer *srv, HttpConn *c, int rm) {
     http_respond(c, 200, "OK", "{\"ok\":true}", 11);
 }
 
+/* POST /replay { "msgid": N } — re-queue every terminal (delivered/permfail)
+   delivery for msgid whose durably-retained spool body <msgid>.<k>.out.eml
+   still exists, flipping it back to "queued" (attempts reset, next_ts 0) so the
+   queue re-drive redelivers it.  Responds {"ok":true,"replayed":K}. */
+typedef struct {
+    uint32_t msgid;
+    uint32_t k;
+} ReplayItem;
+
+typedef struct {
+    uint32_t     msgid;
+    ReplayItem  *items;
+    size_t       n, cap;
+    int          oom;
+} ReplayCollect;
+
+static int replay_collect_cb(uint32_t k, const char *from, const char *to,
+                             const char *status, void *user) {
+    ReplayCollect *c = (ReplayCollect *)user;
+    ReplayItem *it;
+    (void)from;
+    (void)to;
+    /* Only terminal states are replayable: delivered or permfail.  A
+       queued/delivering delivery is already active and must not be touched. */
+    if (strcmp(status, "delivered") != 0 && strcmp(status, "permfail") != 0)
+        return 0;
+    if (c->n == c->cap) {
+        size_t nc = c->cap ? c->cap * 2 : 4;
+        ReplayItem *na = realloc(c->items, nc * sizeof *na);
+        if (!na) { c->oom = 1; return 1; }
+        c->items = na;
+        c->cap = nc;
+    }
+    it = &c->items[c->n];
+    it->msgid = c->msgid;
+    it->k = k;
+    c->n++;
+    return 0;
+}
+
+static void handle_replay(HttpServer *srv, HttpConn *c) {
+    const char *body = c->recv + c->header_end;
+    uint32_t msgid;
+    ReplayCollect rc;
+    size_t i;
+    int replayed = 0;
+    char spoolpath[4096];
+    char resp[128];
+    int bn;
+
+    if (json_obj_get_u32(body, "msgid", &msgid) != 0) {
+        http_respond_err(c, 400, "Bad Request", "expected {\"msgid\":N}");
+        return;
+    }
+
+    /* Collect the terminal rows (READ-ONLY walk), then mutate AFTER the walk:
+       store_queue_set_status reallocs the dafsa states array. */
+    memset(&rc, 0, sizeof rc);
+    rc.msgid = msgid;
+    if (store_queue_walk_msgid(srv->store, msgid, replay_collect_cb, &rc)
+            != VISAGE_OK || rc.oom) {
+        free(rc.items);
+        http_respond_err(c, 500, "Internal Server Error", "store error");
+        return;
+    }
+
+    for (i = 0; i < rc.n; i++) {
+        int n = snprintf(spoolpath, sizeof spoolpath, "%s/%u.%u.out.eml",
+                         srv->cfg->storage.spool, rc.items[i].msgid,
+                         rc.items[i].k);
+        if (n < 0 || (size_t)n >= sizeof spoolpath) continue;
+        if (access(spoolpath, F_OK) != 0) continue;   /* no retained body */
+        if (store_queue_set_status(srv->store, rc.items[i].msgid,
+                                   rc.items[i].k, "queued", 0, 0)
+                == VISAGE_OK)
+            replayed++;
+    }
+    free(rc.items);
+
+    bn = snprintf(resp, sizeof resp, "{\"ok\":true,\"replayed\":%d}", replayed);
+    if (bn < 0 || (size_t)bn >= sizeof resp) {
+        http_respond_err(c, 500, "Internal Server Error", "out of memory");
+        return;
+    }
+    http_respond(c, 200, "OK", resp, (size_t)bn);
+}
+
 static void handle_request(HttpServer *srv, HttpConn *c) {
     char method[16], target[1024];
     const char *req = c->recv;
@@ -343,10 +433,13 @@ static void handle_request(HttpServer *srv, HttpConn *c) {
         handle_alias(srv, c, 0);
     } else if (strcmp(method, "DELETE") == 0 && strcmp(target, "/alias") == 0) {
         handle_alias(srv, c, 1);
+    } else if (strcmp(method, "POST") == 0 && strcmp(target, "/replay") == 0) {
+        handle_replay(srv, c);
     } else if ((strcmp(method, "GET") == 0 ||
                 strcmp(method, "POST") == 0 ||
                 strcmp(method, "DELETE") == 0) &&
                (strcmp(target, "/alias") == 0 ||
+                strcmp(target, "/replay") == 0 ||
                 strcmp(target, "/log") == 0 || strncmp(target, "/log?", 5) == 0 ||
                 strcmp(target, "/health") == 0)) {
         /* Known path, wrong method. */

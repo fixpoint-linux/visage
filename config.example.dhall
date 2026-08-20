@@ -7,7 +7,7 @@ in  let Config =
                  , cmd_timeout : Natural, data_timeout : Natural }
       , relay : { host : Text, port : Natural, auth : Auth, retries : Natural
                 , tls : Text, tls_ca : Text, max_attempts : Natural }
-      , storage : { path : Text, spool : Text }
+      , storage : { path : Text, spool : Text, retention_days : Natural }
       , reply : { prefix : Text, separator : Text }
       , catch_all : Text
       , aliases : List { alias : Text, destinations : List Text }
@@ -27,7 +27,7 @@ in  { hostname = "mx.example.com"
              -- points at an operator-provided PEM CA bundle (only consulted
              -- when tls == "starttls-verify").
              , tls_ca = "", max_attempts = 100 }
-   , storage = { path = "./var/db", spool = "./var/spool" }
+   , storage = { path = "./var/db", spool = "./var/spool", retention_days = 30 }
    , reply = { prefix = "reply", separator = "+" }
    , catch_all = ""
    , aliases = [ { alias = "jane@example.com", destinations = [ "jane@realmail.example" ] }

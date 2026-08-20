@@ -165,6 +165,27 @@ int store_queue_reset_delivering(Store *s);
  * compute the re-drive wakeup deadline.  Never returns a negative value. */
 uint32_t store_queue_next_due(Store *s);
 
+/* Return the current status of the (msgid, k) delivery.  On success returns
+ * VISAGE_OK and copies the interned status string into status[0..sz).  Returns
+ * nonzero (VISAGE_ESTORE) when no such delivery exists or on an error.  Read-only;
+ * used by the spool GC to avoid deleting a body still referenced by an active
+ * (queued/delivering) queue row. */
+int store_queue_status(Store *s, uint32_t msgid, uint32_t k,
+                       char *status, size_t sz);
+
+/* Read-only walk of every queue row for `msgid`, invoking cb(k, from, to,
+ * status, user) per row.  from/to/status are interned string pointers valid only
+ * for the duration of the callback; cb returns non-zero to stop the walk early.
+ * READ-ONLY: the relation must NOT be mutated from inside cb (dafsa add/delete
+ * realloc the states array) — collect and mutate AFTER the walk returns.  Returns
+ * 0 on success.  Used by the /replay operator endpoint to enumerate a msgid's
+ * terminal (delivered/permfail) deliveries. */
+int store_queue_walk_msgid(Store *s, uint32_t msgid,
+                           int (*cb)(uint32_t k, const char *from,
+                                     const char *to, const char *status,
+                                     void *user),
+                           void *user);
+
 /* Free a string vector returned by store_resolve (n == *ndests).  Safe on a
  * NULL vector. */
 void store_free_strvec(char **vec, size_t n);

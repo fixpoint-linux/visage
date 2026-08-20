@@ -51,6 +51,25 @@ static int due_cb(uint32_t msgid, uint32_t k, const char *from, const char *to,
     return 0;
 }
 
+/* --- replay walk_msgid collector ------------------------------------ */
+
+typedef struct {
+    int      seen;
+    uint32_t k;
+    char     status[64];
+} WalkHit;
+
+static int walk_cb(uint32_t k, const char *from, const char *to,
+                   const char *status, void *user) {
+    WalkHit *w = (WalkHit *)user;
+    (void)from;
+    (void)to;
+    w->seen++;
+    w->k = k;
+    snprintf(w->status, sizeof w->status, "%s", status);
+    return 0;
+}
+
 int main(void) {
     char tpl[] = "/tmp/visage_store_XXXXXX";
     char *dir = mkdtemp(tpl);
@@ -353,6 +372,46 @@ int main(void) {
               "self-heal: idempotent re-set_status");
         check(store_queue_count_by_status(s, "delivering") == 1,
               "self-heal: still 1 delivering row after idempotent re-set");
+
+        /* --- operator replay: walk_msgid + queue_status + set_status back --- */
+        check(store_queue_add(s, 400, 0, "a@x.org", "b@y.org") == VISAGE_OK,
+              "replay: queue_add msgid 400");
+        check(store_queue_set_status(s, 400, 0, "delivered", 1, 0) == VISAGE_OK,
+              "replay: set_status to delivered");
+        {
+            char st[64];
+            check(store_queue_status(s, 400, 0, st, sizeof st) == VISAGE_OK &&
+                  strcmp(st, "delivered") == 0,
+                  "replay: queue_status returns delivered");
+            check(store_queue_status(s, 999, 0, st, sizeof st) != VISAGE_OK,
+                  "replay: queue_status absent row fails");
+        }
+        {
+            WalkHit w;
+            memset(&w, 0, sizeof w);
+            check(store_queue_walk_msgid(s, 400, walk_cb, &w) == VISAGE_OK,
+                  "replay: walk_msgid returns OK");
+            check(w.seen == 1 && w.k == 0 && strcmp(w.status, "delivered") == 0,
+                  "replay: walk_msgid sees the delivered row");
+            memset(&w, 0, sizeof w);
+            check(store_queue_walk_msgid(s, 7777, walk_cb, &w) == VISAGE_OK,
+                  "replay: walk_msgid unknown msgid returns OK");
+            check(w.seen == 0, "replay: walk_msgid unknown msgid yields nothing");
+        }
+        /* flip back to queued (replay semantics), attempts reset, next_ts 0 */
+        check(store_queue_set_status(s, 400, 0, "queued", 0, 0) == VISAGE_OK,
+              "replay: set_status back to queued");
+        {
+            char st[64];
+            check(store_queue_status(s, 400, 0, st, sizeof st) == VISAGE_OK &&
+                  strcmp(st, "queued") == 0,
+                  "replay: queue_status returns queued after replay");
+        }
+        qhits = 0;
+        check(store_queue_due(s, 0, due_cb, NULL) == VISAGE_OK,
+              "replay: due returns OK");
+        check(qhits == 1 && qhit.msgid == 400 && qhit.k == 0,
+              "replay: replayed row is the only due item at now=0");
 
         check(store_close(s) == VISAGE_OK, "store_close after reopen");
     }

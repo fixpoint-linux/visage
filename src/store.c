@@ -881,3 +881,90 @@ uint32_t store_queue_next_due(Store *s) {
         return UINT32_MAX;
     return c.min_next;
 }
+
+int store_queue_status(Store *s, uint32_t msgid, uint32_t k,
+                       char *status, size_t sz) {
+    uint32_t leading[2];
+    QueueReadCtx qc;
+    long n;
+    const char *st;
+    size_t i, slen;
+
+    if (!s || !s->db || !status || sz == 0) return VISAGE_EPARAM;
+
+    leading[0] = msgid;
+    leading[1] = k;
+    memset(&qc, 0, sizeof qc);
+    n = dl_prefix(s->db, REL_QUEUE, leading, 2, queue_read_cb, &qc);
+    if (n < 0) return VISAGE_ESTORE;
+    if (qc.n == 0) return VISAGE_ESTORE;   /* no such delivery */
+
+    /* A crash in set_status's add-first window can leave 2+ rows sharing
+       (msgid,k).  Only the status matters here: if ANY matched row is still
+       active (queued/delivering) the body MUST be retained, regardless of
+       what rows[0] says.  Otherwise report the first (terminal) row. */
+    for (i = 0; i < qc.n; i++) {
+        st = dl_intern_str_of(s->db, qc.rows[i][6]);
+        if (st && (strcmp(st, "queued") == 0 ||
+                   strcmp(st, "delivering") == 0)) {
+            slen = strlen(st);
+            if (slen + 1 > sz) return VISAGE_ESTORE;
+            memcpy(status, st, slen + 1);
+            return VISAGE_OK;
+        }
+    }
+    st = dl_intern_str_of(s->db, qc.rows[0][6]);   /* status col (sym) */
+    if (!st) return VISAGE_ESTORE;                 /* corrupt db */
+    slen = strlen(st);
+    if (slen + 1 > sz) return VISAGE_ESTORE;       /* caller buffer too small */
+    memcpy(status, st, slen + 1);
+    return VISAGE_OK;
+}
+
+/* walk_msgid: read-only prefix walk on [msgid], handing (k, from, to, status)
+ * to the caller's callback.  Never mutates the relation (the caller must
+ * collect and re-apply AFTER the walk — dafsa add/delete realloc the states
+ * array mid-walk). */
+typedef struct {
+    Store *s;
+    int (*cb)(uint32_t k, const char *from, const char *to,
+              const char *status, void *user);
+    void *user;
+    int err;
+} QueueMsgidCtx;
+
+static int queue_msgid_cb(const uint32_t *cols, uint8_t arity, void *user) {
+    QueueMsgidCtx *c = (QueueMsgidCtx *)user;
+    const char *from, *to, *status;
+    (void)arity;
+
+    from   = dl_intern_str_of(c->s->db, cols[2]);
+    to     = dl_intern_str_of(c->s->db, cols[3]);
+    status = dl_intern_str_of(c->s->db, cols[6]);
+    if (!from || !to || !status) { c->err = 1; return 1; }
+
+    if (c->cb(cols[1], from, to, status, c->user) != 0) return 1;
+    return 0;
+}
+
+int store_queue_walk_msgid(Store *s, uint32_t msgid,
+                           int (*cb)(uint32_t k, const char *from,
+                                     const char *to, const char *status,
+                                     void *user),
+                           void *user) {
+    uint32_t leading[1];
+    QueueMsgidCtx c;
+    long n;
+
+    if (!s || !s->db || !cb) return VISAGE_EPARAM;
+
+    leading[0] = msgid;
+    memset(&c, 0, sizeof c);
+    c.s = s;
+    c.cb = cb;
+    c.user = user;
+
+    n = dl_prefix(s->db, REL_QUEUE, leading, 1, queue_msgid_cb, &c);
+    if (n < 0 || c.err) return c.err ? VISAGE_ENOMEM : VISAGE_ESTORE;
+    return VISAGE_OK;
+}

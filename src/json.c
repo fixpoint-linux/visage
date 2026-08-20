@@ -241,3 +241,40 @@ int json_obj_get_str(const char *json, const char *key, char *out, size_t outsz)
     }
     return -1;
 }
+
+/* Same shape as json_obj_get_str but for an unsigned 32-bit decimal number
+   (no surrounding quotes).  Rejects negatives and uint32 overflow. */
+int json_obj_get_u32(const char *json, const char *key, uint32_t *out) {
+    const char *p;
+    size_t klen;
+    if (!json || !key || !out) return -1;
+    klen = strlen(key);
+    p = json;
+    while (p && *p) {
+        const char *ks = strchr(p, '"');
+        const char *ke;
+        if (!ks) return -1;
+        ks++;
+        ke = strchr(ks, '"');
+        if (!ke) return -1;
+        if ((size_t)(ke - ks) == klen && memcmp(ks, key, klen) == 0) {
+            const char *q = ke + 1;
+            uint32_t v = 0;
+            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+            if (*q != ':') return -1;
+            q++;
+            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+            if (*q < '0' || *q > '9') return -1;   /* not a decimal number */
+            while (*q >= '0' && *q <= '9') {
+                uint32_t d = (uint32_t)(*q - '0');
+                if (v > (UINT32_MAX - d) / 10) return -1;   /* overflow */
+                v = v * 10 + d;
+                q++;
+            }
+            *out = v;
+            return 0;
+        }
+        p = ke + 1;
+    }
+    return -1;
+}

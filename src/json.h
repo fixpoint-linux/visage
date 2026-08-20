@@ -42,4 +42,9 @@ char  *jsonb_detach(JsonBuilder *b, size_t *len_out);
  * the key is absent, the value is not a string, or the buffer is too small. */
 int json_obj_get_str(const char *json, const char *key, char *out, size_t outsz);
 
+/* Parse a top-level JSON object string and extract the unsigned 32-bit number
+ * value of `key` into *out.  Returns 0 on success, -1 if the key is absent, the
+ * value is not a non-negative decimal number, or the number overflows uint32. */
+int json_obj_get_u32(const char *json, const char *key, uint32_t *out);
+
 #endif /* VISAGE_JSON_H */

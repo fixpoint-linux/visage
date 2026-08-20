@@ -7,9 +7,10 @@
  *   visage add-alias -c FILE --alias A@D --dest X@Y
  *   visage rm-alias  -c FILE --alias A@D --dest X@Y
  *   visage log -c FILE [-n N]
+ *   visage replay -c FILE --msgid N
  *     The CLI admin subcommands are HTTP clients to the running daemon's admin
- *     endpoint (POST/DELETE /alias, GET /log), using the bearer token from
- *     config.
+ *     endpoint (POST/DELETE /alias, GET /log, POST /replay), using the bearer
+ *     token from config.
  *   visage --help
  *   visage --version
  *
@@ -36,6 +37,9 @@ static void usage(FILE *f) {
         "  rm-alias -c FILE --alias A@D --dest X@Y\n"
         "                          remove an alias via the running daemon\n"
         "  log -c FILE [-n N]      print recent log entries via the daemon\n"
+        "  replay -c FILE --msgid N\n"
+        "                          re-queue a terminal (delivered/permfail) message\n"
+        "                          for redelivery via the daemon\n"
         "  --help                  show this help and exit\n"
         "  --version               print the version and exit\n");
 }
@@ -317,6 +321,37 @@ static int cmd_log(const Config *cfg, long n) {
     return 0;
 }
 
+/* Re-queue a terminal (delivered/permfail) message for redelivery: POST
+   /replay { "msgid": N } to the running daemon and print the replayed count. */
+static int cmd_replay(const Config *cfg, uint32_t msgid) {
+    char body[64];
+    char resp[HTTP_CLIENT_MAX_RESP];
+    int bn, st;
+    uint32_t replayed = 0;
+
+    bn = snprintf(body, sizeof body, "{\"msgid\":%u}", msgid);
+    if (bn < 0 || (size_t)bn >= sizeof body) {
+        fprintf(stderr, "visage: bad msgid\n");
+        return 2;
+    }
+
+    if (admin_request(cfg, "POST", "/replay", body, (size_t)bn,
+                      resp, sizeof resp) != 0) {
+        fprintf(stderr, "visage: cannot reach daemon at %s:%u\n",
+                cfg->http.address, cfg->http.port);
+        return 1;
+    }
+    st = resp_status(resp);
+    if (st != 200) {
+        fprintf(stderr, "visage: daemon returned HTTP %d: %s\n",
+                st, resp_body(resp));
+        return 1;
+    }
+    (void)json_obj_get_u32(resp_body(resp), "replayed", &replayed);
+    printf("replayed %u delivery(s) for msgid %u\n", replayed, msgid);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* main                                                               */
 /* ------------------------------------------------------------------ */
@@ -326,6 +361,7 @@ int main(int argc, char **argv) {
     const char *cfgpath;
     const char *alias = NULL, *dest = NULL;
     long n = 0;
+    uint32_t replay_msgid = 0;
     Config cfg;
     char err[512];
     int rc;
@@ -344,7 +380,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(cmd, "daemon") != 0 && strcmp(cmd, "config-check") != 0 &&
         strcmp(cmd, "add-alias") != 0 && strcmp(cmd, "rm-alias") != 0 &&
-        strcmp(cmd, "log") != 0) {
+        strcmp(cmd, "log") != 0 && strcmp(cmd, "replay") != 0) {
         fprintf(stderr, "visage: unknown command '%s'\n\n", cmd);
         usage(stderr);
         return 2;
@@ -370,6 +406,20 @@ int main(int argc, char **argv) {
         const char *ns = find_arg(argc, argv, 2, "-n");
         if (ns) n = atol(ns);
     }
+    if (strcmp(cmd, "replay") == 0) {
+        const char *ms = find_arg(argc, argv, 2, "--msgid");
+        long mv;
+        if (!ms) {
+            fprintf(stderr, "visage: replay requires --msgid N\n");
+            return 2;
+        }
+        mv = atol(ms);
+        if (mv <= 0 || mv > 0xFFFFFFFFL) {
+            fprintf(stderr, "visage: replay: bad --msgid value '%s'\n", ms);
+            return 2;
+        }
+        replay_msgid = (uint32_t)mv;
+    }
 
     if (config_load(cfgpath, &cfg, err, sizeof err) != 0) {
         fprintf(stderr, "visage: config error: %s\n", err[0] ? err : cfgpath);
@@ -382,6 +432,8 @@ int main(int argc, char **argv) {
         rc = cmd_config_check(&cfg);
     } else if (strcmp(cmd, "add-alias") == 0 || strcmp(cmd, "rm-alias") == 0) {
         rc = cmd_alias(&cfg, alias, dest, strcmp(cmd, "rm-alias") == 0);
+    } else if (strcmp(cmd, "replay") == 0) {
+        rc = cmd_replay(&cfg, replay_msgid);
     } else {
         rc = cmd_log(&cfg, n);
     }

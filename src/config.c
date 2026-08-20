@@ -165,6 +165,20 @@ static bool walk_config(Config *cfg, Term *nf) {
     if (!stor) { cfg_error("config missing 'storage'"); return false; }
     if (!text_dup(rec_get(stor, "path"), &cfg->storage.path)) return false;
     if (!text_dup(rec_get(stor, "spool"), &cfg->storage.spool)) return false;
+    {
+        /* storage.retention_days is optional (older configs omit it): the age
+         * in days after which the spool GC removes a spooled body that is no
+         * longer referenced by an active (queued/delivering) queue row.  A
+         * value of 0 disables GC (keep everything).  Default 30 when absent,
+         * mirroring the relay.max_attempts tolerance. */
+        Term *rd = rec_get(stor, "retention_days");
+        if (rd) {
+            if (!nat_u64(rd, &v)) return false;
+            cfg->storage.retention_days = (uint32_t)v;
+        } else {
+            cfg->storage.retention_days = 30;
+        }
+    }
 
     Term *rep = rec_get(nf, "reply");
     if (!rep) { cfg_error("config missing 'reply'"); return false; }

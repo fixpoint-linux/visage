@@ -41,10 +41,11 @@ typedef struct {
     char          *tls_ca;         /* PEM CA bundle path ("" -> embedded bundle) */
 } ConfigRelay;
 
-/* storage { path, spool } */
+/* storage { path, spool, retention_days } */
 typedef struct {
     char *path;
     char *spool;
+    uint32_t retention_days;   /* spool GC age in days (0 = GC disabled) */
 } ConfigStorage;
 
 /* reply { prefix, separator } */

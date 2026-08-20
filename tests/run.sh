@@ -143,7 +143,7 @@ in  let Config =
                  , cmd_timeout : Natural, data_timeout : Natural }
       , relay : { host : Text, port : Natural, auth : Auth, retries : Natural
                 , tls : Text, tls_ca : Text, max_attempts : Natural }
-      , storage : { path : Text, spool : Text }
+      , storage : { path : Text, spool : Text, retention_days : Natural }
       , reply : { prefix : Text, separator : Text }
       , catch_all : Text
       , aliases : List { alias : Text, destinations : List Text }
@@ -159,7 +159,7 @@ in  { hostname = "mx.example.com"
    , relay = { host = "$rhost", port = $rport
              , auth = { enabled = $authen, username = "u", password = "p" }
              , retries = 3, tls = "$rtls", tls_ca = "$rca", max_attempts = 100 }
-   , storage = { path = "$db", spool = "$spool" }
+   , storage = { path = "$db", spool = "$spool", retention_days = 30 }
    , reply = { prefix = "reply", separator = "+" }
    , catch_all = ""
    , aliases = [ { alias = "jane@example.com", destinations = [ "jane@realmail.example" ] }
@@ -489,10 +489,10 @@ verify_negative_scenario() {
 # --- durable-queue e2e scenarios (S-A3) -----------------------------------
 # These prove at-least-once DURABLE delivery via the spool-file lifecycle (the
 # observable proxy for queued->delivered).  The daemon spools the sanitized
-# outbound body to <spool>/<msgid>.<k>.out.eml at enqueue time and unlinks it
-# once the relay accepts the message (status 'delivered'); the raw inbound
-# <msgid>.eml is never removed.  There is no CLI that exposes queue status, so
-# "queued" == .out.eml present, "delivered" == .out.eml gone.
+# outbound body to <spool>/<msgid>.<k>.out.eml at enqueue time and RETAINS it
+# through the terminal 'delivered' state so an operator can audit/replay it
+# (the spool GC removes it only after storage.retention_days).  So "queued" ==
+# .out.eml present, "delivered" == .out.eml STILL present (retained).
 #
 # Print the path of the newest durable outbound spool file, or return nonzero
 # if none exists yet.
@@ -560,17 +560,19 @@ outage_redrive_scenario() {
     sleep 0.3
     if kill -0 "$rpid" 2>/dev/null; then
         pass "OUTAGE: relay_fake now listening on $RELAY"
-        # Re-drive tick cap is 30s, so allow ~45s for delivery.
+        # Re-drive tick cap is 30s, so allow ~45s for delivery.  The retained
+        # spool body stays present after delivery (retention), so the delivery
+        # signal is the relay recording the message.
         for i in $(seq 1 450); do
-            [ -s "$relay/msg-1.eml" ] && [ ! -e "$OUT" ] && break
+            [ -s "$relay/msg-1.eml" ] && break
             sleep 0.1
         done
         if [ -s "$relay/msg-1.eml" ]; then
             pass "OUTAGE: relay_fake recorded the forwarded message (re-driven)"
-            if [ ! -e "$OUT" ]; then
-                pass "OUTAGE: queue reached delivered (spool removed)"
+            if [ -e "$OUT" ]; then
+                pass "OUTAGE: queue reached delivered (spool body retained for audit/replay)"
             else
-                fail "OUTAGE: relay got the message but spool file still present"
+                fail "OUTAGE: spool body missing after delivery (retention violated)"
             fi
         else
             fail "OUTAGE: relay_fake did not record the message within the re-drive window"
@@ -659,15 +661,15 @@ restart_persistence_scenario() {
 
     # Startup drain re-drives the leftover 'queued'; allow the re-drive window.
     for i in $(seq 1 450); do
-        [ -s "$relay/msg-1.eml" ] && [ ! -e "$OUT" ] && break
+        [ -s "$relay/msg-1.eml" ] && break
         sleep 0.1
     done
     if [ -s "$relay/msg-1.eml" ]; then
         pass "RESTART: relay_fake recorded the message after restart"
-        if [ ! -e "$OUT" ]; then
-            pass "RESTART: queue reached delivered (spool removed)"
+        if [ -e "$OUT" ]; then
+            pass "RESTART: queue reached delivered (spool body retained for audit/replay)"
         else
-            fail "RESTART: relay got the message but spool file still present"
+            fail "RESTART: spool body missing after delivery (retention violated)"
         fi
     else
         fail "RESTART: relay_fake did not record the message after restart"

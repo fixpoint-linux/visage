@@ -26,6 +26,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <dirent.h>
 
 /* ------------------------------------------------------------------ */
 /* Constants                                                          */
@@ -195,6 +196,7 @@ typedef struct Server {
     uint32_t max_line, max_msg, max_rcpts, cmd_tmo, data_tmo;
     uint64_t raw_cap;          /* bounded DATA accumulation ceiling */
     time_t   next_revmap_sweep; /* next time to expire stale revmap rows */
+    time_t   next_spool_sweep;  /* next time to GC old spool bodies */
 } Server;
 
 /* ------------------------------------------------------------------ */
@@ -560,7 +562,9 @@ RcptDecision smtp_in_rcpt_ok(Store *s, const Config *cfg, const char *rcpt) {
 /* ------------------------------------------------------------------ */
 
 /* Bump attempts and either requeue (next_ts = now + backoff) or, once
-   max_attempts is exceeded, mark permfail and drop the spool body. */
+   max_attempts is exceeded, mark permfail.  The sanitized body stays spooled
+   on terminal permfail for audit/replay; the spool GC removes it once
+   retention_days elapse. */
 static void queue_requeue(Server *srv, uint32_t msgid, uint32_t k,
                           const char *from, const char *to, uint32_t attempts,
                           uint32_t now, uint32_t max_attempts,
@@ -572,7 +576,7 @@ static void queue_requeue(Server *srv, uint32_t msgid, uint32_t k,
                 != VISAGE_OK)
             fprintf(stderr, "visage: queue: set_status(permfail) failed "
                     "msgid=%u k=%u; row left in prior status\n", msgid, k);
-        (void)unlink(spoolpath);
+        (void)spoolpath;
         (void)store_log_add(s, msgid, now, LOG_DIR_OUT, from, to, "permfail");
     } else {
         if (store_queue_set_status(s, msgid, k, "queued", attempts,
@@ -656,7 +660,8 @@ static void queue_deliver_one(Server *srv, uint32_t msgid, uint32_t k,
                 != VISAGE_OK)
             fprintf(stderr, "visage: queue: set_status(delivered) failed "
                     "msgid=%u k=%u\n", msgid, k);
-        (void)unlink(spoolpath);
+        /* The sanitized body is RETAINED on delivered so an operator can
+           audit/replay it; the spool GC removes it once retention_days elapse. */
         (void)store_log_add(s, msgid, now, LOG_DIR_OUT, from, to, "delivered");
         break;
     case SMTP_PERMFAIL:
@@ -664,7 +669,7 @@ static void queue_deliver_one(Server *srv, uint32_t msgid, uint32_t k,
                 != VISAGE_OK)
             fprintf(stderr, "visage: queue: set_status(permfail) failed "
                     "msgid=%u k=%u\n", msgid, k);
-        (void)unlink(spoolpath);
+        /* Body retained for audit/replay (see delivered above). */
         (void)store_log_add(s, msgid, now, LOG_DIR_OUT, from, to, "permfail");
         break;
     default:   /* SMTP_TEMPFAIL and SMTP_ERROR: retry across attempts */
@@ -1428,6 +1433,104 @@ static void conn_readable(Server *srv, Conn *c, time_t now) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Spool GC (retention)                                               */
+/* ------------------------------------------------------------------ */
+
+/* Parse a spool filename.  Supports <msgid>.eml (inbound raw, never
+   queue-referenced) and <msgid>.<k>.out.eml (outbound sanitized body, referenced
+   by a queue row).  Returns 1 for inbound (k untouched), 2 for outbound (k set),
+   0 when the name is not a spool file we manage (directory entries, stray
+   files).  A non-numeric leading token, a msgid/k that overflows uint32, or a
+   mismatched suffix all reject the entry. */
+static int spool_name_parse(const char *name, uint32_t *msgid, uint32_t *k) {
+    const char *p = name;
+    const char *q;
+    uint64_t m = 0, kv;
+
+    if (name[0] < '0' || name[0] > '9') return 0;
+    while (*p >= '0' && *p <= '9') {
+        m = m * 10 + (uint64_t)(*p - '0');
+        if (m > UINT32_MAX) return 0;   /* msgid overflow -> not ours */
+        p++;
+    }
+    /* <msgid>.eml */
+    if (*p == '.' && strcmp(p + 1, "eml") == 0) {
+        *msgid = (uint32_t)m;
+        return 1;
+    }
+    /* <msgid>.<k>.out.eml */
+    if (*p == '.') {
+        q = p + 1;
+        if (*q < '0' || *q > '9') return 0;
+        kv = 0;
+        while (*q >= '0' && *q <= '9') {
+            kv = kv * 10 + (uint64_t)(*q - '0');
+            if (kv > UINT32_MAX) return 0;
+            q++;
+        }
+        if (*q == '.' && strcmp(q + 1, "out.eml") == 0) {
+            *msgid = (uint32_t)m;
+            *k = (uint32_t)kv;
+            return 2;
+        }
+    }
+    return 0;
+}
+
+/* Spool GC: walk the spool dir and remove files older than
+   cfg->storage.retention_days.  Inbound <msgid>.eml copies are never
+   queue-referenced, so any old one is removable.  Outbound <msgid>.<k>.out.eml
+   bodies are only removed when NO active queue row (status "queued"/"delivering")
+   still references them — a delivered/permfail body becomes eligible once its
+   retention age passes, but a queued/delivering body is always kept.  A
+   retention_days of 0 disables GC entirely (keep everything).  Best-effort: a
+   missing/unreadable spool dir, a stat error, or an unlink failure is silently
+   skipped (the next hourly sweep retries). */
+static void spool_gc(Server *srv) {
+    const Config *cfg = srv->cfg;
+    uint32_t retention = cfg->storage.retention_days;
+    time_t now;
+    DIR *d;
+    struct dirent *e;
+    char path[4096];
+
+    if (retention == 0) return;   /* GC disabled */
+    now = time(NULL);
+
+    d = opendir(cfg->storage.spool);
+    if (!d) return;
+    while ((e = readdir(d)) != NULL) {
+        uint32_t msgid, k;
+        int shape;
+        struct stat st;
+        if (e->d_name[0] == '.') continue;
+        shape = spool_name_parse(e->d_name, &msgid, &k);
+        if (shape == 0) continue;
+        if (snprintf(path, sizeof path, "%s/%s", cfg->storage.spool,
+                     e->d_name) >= (int)sizeof path)
+            continue;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        if ((now - st.st_mtime) < (time_t)retention * (time_t)86400)
+            continue;   /* younger than the retention window: keep */
+        if (shape == 2) {
+            /* Outbound: never delete a body still referenced by an active
+               delivery.  queued/delivering -> keep.  On a store read error or
+               an absent row we CANNOT prove the delivery is inactive, so keep
+               too (fail-safe): GC must never delete on uncertainty. */
+            char status[64];
+            if (store_queue_status(srv->store, msgid, k, status, sizeof status)
+                    != VISAGE_OK)
+                continue;
+            if (strcmp(status, "queued") == 0 ||
+                strcmp(status, "delivering") == 0)
+                continue;
+        }
+        (void)unlink(path);
+    }
+    closedir(d);
+}
+
+/* ------------------------------------------------------------------ */
 /* Event loop                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -1614,10 +1717,15 @@ static void server_poll(Server *srv) {
            when nothing is due (full walk, filtered). */
         queue_redrive(srv);
 
-        /* Hourly sweep: expire stale reply-token reverse-map rows. */
+        /* Hourly sweep: expire stale reply-token reverse-map rows and GC old
+           spool bodies. */
         if (now >= srv->next_revmap_sweep) {
             (void)store_revmap_expire(srv->store, (uint32_t)now);
             srv->next_revmap_sweep = now + 3600;
+        }
+        if (now >= srv->next_spool_sweep) {
+            spool_gc(srv);
+            srv->next_spool_sweep = now + 3600;
         }
 
         /* build pollfd array: [0] SMTP listen, [1..] extra listeners,
@@ -1771,6 +1879,7 @@ static void server_init(Server *srv, const Config *c, Store *s) {
     srv->data_tmo = c->limits.data_timeout ? c->limits.data_timeout : SMTP_IN_DEFAULT_TIMEOUT;
     srv->raw_cap = (uint64_t)srv->max_msg * 2 + 16;
     srv->next_revmap_sweep = time(NULL) + 3600;   /* first sweep in an hour */
+    srv->next_spool_sweep = time(NULL) + 3600;    /* first GC in an hour */
 }
 
 int smtp_in_main(const Config *c, const Store *s) {
@@ -1786,6 +1895,9 @@ int smtp_in_main(const Config *c, const Store *s) {
     /* Expire stale reverse-map rows now so a long-dormant process never keeps
        leaked reply tokens alive. */
     (void)store_revmap_expire((Store *)s, (uint32_t)time(NULL));
+    /* GC old spool bodies at startup (also fixes the inbound <msgid>.eml
+       leak: those copies are never queue-referenced). */
+    spool_gc(&srv);
     queue_redrive(&srv);
 
     server_poll(&srv);
