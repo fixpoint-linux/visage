@@ -19,7 +19,7 @@
 #   (i) cleanup
 #
 # REQUIRES live sockets (the rattan sandbox blocks socket()); run on the HOST
-# via `make e2e`.
+# via `dhake e2e`.
 #
 # Ports and paths are parametrized via env: SMTP_PORT (default 2525),
 # RELAY_PORT (default 2526), HTTP_PORT (default 8080).
@@ -828,7 +828,7 @@ echo "== visage e2e (ports smtp=$SMTP_PORT relay=$RELAY_PORT http=$HTTP_PORT)"
 echo "== workdir: $WORK"
 
 # (a) build all -------------------------------------------------------------
-(cd "$ROOT" && make visage.com config_check.com tests/smtptest.com tests/relay_fake.com >/dev/null)
+(cd "$ROOT" && ./vendor/dhake/dhake.com --quiet visage.com config_check.com tests/smtptest.com tests/relay_fake.com >/dev/null)
 echo "build ok"
 
 # (b) config-check ----------------------------------------------------------

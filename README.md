@@ -30,7 +30,7 @@ key, so the store stays tiny even as you add thousands of aliases. Strings are i
 symbol ids; each relation is one on-disk DAFSA that is mmap'd for read-only serving and durably
 WAL'd (single-writer, `flock`).
 
-**Measured** (`make bench`): on-disk store size is ~480 B/alias at 1,000 aliases and ~542 B/alias at
+**Measured** (`dhake bench`): on-disk store size is ~480 B/alias at 1,000 aliases and ~542 B/alias at
 1,000,000 — roughly **constant across three decades**, with no per-alias index bloat. The footprint
 is dominated by the string interner (every distinct address stored once), not per-alias metadata.
 See `docs/bench-size.svg`.
@@ -50,7 +50,7 @@ Email routing needs exactly two lookups, and both are native DAFSA primitives �
 Prefix enumeration is the DAFSA's second-strongest primitive (after exact-key lookup), so alias
 resolution and reply-token routing are O(prefix length) regardless of how many aliases exist.
 
-**Measured** (`make bench`): warm `store_resolve`/`store_revmap_resolve` latency is ~0.6 µs at 1,000
+**Measured** (`dhake bench`): warm `store_resolve`/`store_revmap_resolve` latency is ~0.6 µs at 1,000
 aliases and ~3 µs at 1,000,000 — **sub-linear** (≈5× over three decades of scale), i.e. the cost
 tracks address length, not alias count. See `docs/bench-latency.svg`.
 
@@ -94,23 +94,36 @@ CRITICAL). Where it stands:
 
 ## Build
 
-Requires `cosmocc`. `dhall-c` and `datalog-dafsa` are vendored as git submodules; mbedTLS is
-vendored under `vendor/`.
+Requires `cosmocc`. `dhall-c`, `datalog-dafsa`, `dhake`, `design` and `mfe-framework` are
+vendored as git submodules; mbedTLS is vendored under `vendor/`. Every build target is driven
+by **dhake** (no Make), with **hash-verified builds** — each output pins its expected sha256
+(`hash`) and every input source pins its sha256 (`depsHash`), so a tampered or drifted artifact
+fails the build.
 
 ```sh
-git submodule update --init --recursive   # first checkout: fetch vendor/dhall-c + vendor/datalog-dafsa
-make                                      # builds visage.com (APE) + visage.com.dbg (ELF) + all *_check tools
+git submodule update --init --recursive   # first checkout: fetch all vendored submodules
+./vendor/dhake/dhake.com                  # default target `all`: visage.com + all *_check tools + tests + wasm
+./vendor/dhake/dhake.com visage.com       # build one binary
+./vendor/dhake/dhake.com e2e              # host integration tests (tests/run.sh)
+./vendor/dhake/dhake.com bench            # store benchmark + docs/bench-*.svg
+./vendor/dhake/dhake.com dist/index.html  # the Elm MFE docs site
+./vendor/dhake/dhake.com --verify         # CI pre-flight: check pinned hashes + up-to-dateness
+./vendor/dhake/dhake.com --list           # list all targets
 ```
 
-To use sibling `dhall-c`/`datalog-dafsa` checkouts instead of the submodules, build with
-`make DHALL_C=../dhall-c DATALOG=../datalog-dafsa` (likewise `scripts/build-wasm.sh` honors `DHALL_C`).
+To use sibling `dhall-c`/`datalog-dafsa` checkouts instead of the submodules, point
+`scripts/build-wasm.sh` at them with `DHALL_C` (the C build reads them from `vendor/`).
 
 For the browser build (needs `emscripten clang lld llvm nodejs`):
 
 ```sh
-make wasm                # → docs/visage.js + docs/visage.wasm
-node tests/wasm-smoke.js # headless smoke test of the wasm module
+./vendor/dhake/dhake.com wasm             # → docs/visage.js + docs/visage.wasm, then runs the wasm smoke test
 ```
+
+When a pinned hash goes stale (source or toolchain changed), rebuild with
+`./vendor/dhake/dhake.com --warn-hash-mismatch TARGET` to print the new hashes, then regenerate
+`Dhakefile.dhall` with `python3 tools/gen_dhakefile.py` (committed generator that recomputes all
+pins from the built artifacts) and commit.
 
 ## Usage
 
