@@ -576,12 +576,12 @@ in  { targets = [
             , arch = None Text
             }
         }
-          ,         { mapKey = "docs/visage.js"
+          ,         { mapKey = "wasm"
         , mapValue =
             { deps = [ "src/visage-wasm.c", "src/visage-wasm-no-remote.c", "src/config.c", "src/mail.c", "scripts/build-wasm.sh", "vendor/dhall-c/src/arena.c", "vendor/dhall-c/src/lexer.c", "vendor/dhall-c/src/parser.c", "vendor/dhall-c/src/ast.c", "vendor/dhall-c/src/normalize.c", "vendor/dhall-c/src/typecheck.c", "vendor/dhall-c/src/builtins.c", "vendor/dhall-c/src/serialize.c", "vendor/dhall-c/src/import.c", "vendor/dhall-c/src/bignum.c", "vendor/dhall-c/src/sha256.c" ]
-            , phony = False
-            , recipe = [ < Shell = "./scripts/build-wasm.sh" > ]
-            , hash = "sha256:e8720591006436e28c499376e324d877ae7ea43d26b2589bd6882ee5a6aee44b"
+            , phony = True
+            , recipe = [ < Shell = "./scripts/build-wasm.sh" >,
+          < Shell = "node tests/wasm-smoke.cjs" > ]
             , depsHash = [
               { path = "src/visage-wasm.c", hash = "sha256:2fcfc0305b7624e5b6d878b72a6bf9b7939e3f2fd41a8a56f773d8a854461875" },
               { path = "src/visage-wasm-no-remote.c", hash = "sha256:1e646f8b7fd21af6c918fabf50edf91869bcc71d6d4be1732aa7a1f935a0edfb" },
@@ -599,17 +599,6 @@ in  { targets = [
               { path = "vendor/dhall-c/src/import.c", hash = "sha256:48d5014f36bac6bcbe836e612635b1954a963a7316658588c1eb4ed738b6858e" },
               { path = "vendor/dhall-c/src/bignum.c", hash = "sha256:01b43c3c980f88b80da7f26836458540c7fa611df5b5dc205f670aa5dc5188fd" },
               { path = "vendor/dhall-c/src/sha256.c", hash = "sha256:dfdd76023d85b821e735ecad9b0be3ef11129656feb018874461a00329ab279e" }
-              ]
-            , arch = None Text
-            }
-        }
-          ,         { mapKey = "wasm"
-        , mapValue =
-            { deps = [ "docs/visage.js" ]
-            , phony = True
-            , recipe = [ < Shell = "node tests/wasm-smoke.cjs" > ]
-            , depsHash = [
-              { path = "docs/visage.js", hash = "sha256:e8720591006436e28c499376e324d877ae7ea43d26b2589bd6882ee5a6aee44b" }
               ]
             , arch = None Text
             }

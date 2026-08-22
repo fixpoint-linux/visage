@@ -224,20 +224,17 @@ T.append(target("tests/relay_fake.com",
     out="tests/relay_fake.com"))
 
 # --- wasm (docs/visage.js + visage.wasm) ---
-# dhake ties a non-phony target's output file to its NAME, so the wasm build
-# target is named 'docs/visage.js' (its primary output). A phony 'wasm' alias
-# runs the smoke test after the build.
+# The wasm build needs emscripten (host-only; the CI site deploy must NOT
+# rebuild it). It is therefore a PHONY 'wasm' target (build + smoke) that is NOT
+# a dependency of dist/index.html — the docs site consumes the COMMITTED
+# docs/visage.js + docs/visage.wasm as plain source files (hashed via depsHash).
 wasm_deps = ["src/visage-wasm.c","src/visage-wasm-no-remote.c","src/config.c","src/mail.c",
              "scripts/build-wasm.sh"] + dh(*["arena.c","lexer.c","parser.c","ast.c",
              "normalize.c","typecheck.c","builtins.c","serialize.c","import.c",
              "bignum.c","sha256.c"])
-T.append(target("docs/visage.js",
-    deps=wasm_deps,
-    recipe=["./scripts/build-wasm.sh"],
-    out="docs/visage.js"))
 T.append(target("wasm",
-    deps=["docs/visage.js"],
-    recipe=["node tests/wasm-smoke.cjs"],
+    deps=wasm_deps,
+    recipe=["./scripts/build-wasm.sh", "node tests/wasm-smoke.cjs"],
     out=None))
 
 # --- bench, e2e, gen-admin (phony) ---
