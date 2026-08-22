@@ -8,3 +8,9 @@ __pycache__/
 vendor/mbedtls/build/
 bench.csv
 store_bench.com
+# --- MFE site build artifacts ---
+dist/
+node_modules/
+elm-stuff/
+vendor/@mfe/
+.cache/

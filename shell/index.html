@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>visage — a compact email alias & forwarding server in C</title>
+<meta name="description" content="visage: a compact, self-contained SMTP email alias/forwarding server — daemon and DAFSA alias store in one small APE binary. Built with Elm and the mfe-framework. Part of fixpoint-linux.">
+<script type="importmap">
+{
+  "imports": {
+    "@mfe/core": "/vendor/@mfe/core/index.js",
+    "@mfe/framework": "/vendor/@mfe/framework/index.js",
+    "visage-landing": "/visage/shell/mfe/visage-page.js",
+    "visage-compactness": "/visage/shell/mfe/visage-page.js",
+    "visage-security": "/visage/shell/mfe/visage-page.js",
+    "visage-config": "/visage/shell/mfe/visage-page.js",
+    "visage-cli": "/visage/shell/mfe/visage-page.js",
+    "visage-playground": "/visage/shell/mfe/visage-page.js",
+    "fixpoint-landing": "/shell/mfe/fixpoint-landing.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app" ssr>
+  <div class="fixpoint-root">
+    <div data-mfe="visage-landing"><!-- ssg.mjs injects --></div>
+  </div>
+</div>
+<script type="module" src="/visage/shell/shell.js"></script>
+</body>
+</html>

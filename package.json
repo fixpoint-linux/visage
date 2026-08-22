@@ -1,0 +1,32 @@
+{
+    "name": "visage",
+    "version": "1.0.0",
+    "description": "visage is a compact, self-contained SMTP email alias/forwarding server — daemon and DAFSA alias store in one small APE binary. Docs site built with Elm and the mfe-framework.",
+    "main": "index.js",
+    "directories": {
+        "doc": "dist",
+        "test": "tests"
+    },
+    "scripts": {
+        "build": "./vendor/dhake/dhake.com dist/index.html"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/fixpoint-linux/visage.git"
+    },
+    "keywords": [],
+    "type": "module",
+    "bugs": {
+        "url": "https://github.com/fixpoint-linux/visage/issues"
+    },
+    "homepage": "https://github.com/fixpoint-linux/visage#readme",
+    "devDependencies": {
+        "elm": "^0.19.2-0",
+        "elm-format": "^0.8.8",
+        "happy-dom": "^20.11.6"
+    },
+    "allowScripts": {
+        "elm@0.19.2-0": true,
+        "elm-format@0.8.8": true
+    }
+}

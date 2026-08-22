@@ -1,0 +1,9 @@
+<!--
+  shell/templates/fixpoint.html — the route template for '/'.
+  The [data-mfe="fixpoint-landing"] slot mounts the (cross-origin, via import map)
+  fixpointlinux.org Elm landing MFE. Client-only (not pre-rendered by ssg.mjs);
+  ssg.mjs copies shell/ into dist/ so this template ships automatically.
+-->
+<div class="fixpoint-root">
+  <div data-mfe="fixpoint-landing"></div>
+</div>

@@ -1,0 +1,72 @@
+# Deploy the visage docs site to fixpointlinux.org/visage (node-infra) on push.
+#
+# The site is an Elm app (src/Main.elm) rendered against the shared Fixpoint.*
+# design package (the `design` submodule at vendor/design) and pre-rendered to
+# static dist/ files by `npm run build` (dhake: elm make + scripts/ssg.mjs).
+# The workflow builds it, assembles a deploy tarball from dist/, and ships it over
+# restricted SSH to node-infra's visage-receive forced command (stages +
+# promotes to /srv/www/visage, served by Caddy on fixpointlinux.org/visage).
+name: Deploy visage site
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-visage
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # The Elm app imports the Fixpoint.* design package from the `design`
+          # git submodule, so it must be checked out for the build. dhake (the
+          # build driver) and mfe-framework are submodules too.
+          submodules: recursive
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: "Build the docs site (dhake: elm + MFE vendor + SSG)"
+        run: |
+          npm ci
+          ./vendor/dhake/dhake.com dist/index.html
+
+      - name: Assemble deploy bundle
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/visagepkg
+          mkdir -p /tmp/visagepkg/site
+          cp -r dist/. /tmp/visagepkg/site/
+          tar -czf /tmp/visagepkg/visage.tar.gz -C /tmp/visagepkg site
+          ls -la /tmp/visagepkg/visage.tar.gz
+
+      - name: Deploy via restricted SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST_KEY: ${{ secrets.DEPLOY_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p ~/.ssh
+          echo "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          echo "$DEPLOY_HOST_KEY" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/deploy_key ~/.ssh/known_hosts
+          cat /tmp/visagepkg/visage.tar.gz | ssh -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=~/.ssh/known_hosts \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" 'cat > /dev/null'
