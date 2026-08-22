@@ -2,8 +2,23 @@
  * Run from the repo root via `node tests/wasm-smoke.js` (after `make wasm`).
  */
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
-const createVisage = require(path.join(__dirname, '..', 'docs', 'visage.js'));
+
+// docs/visage.js is an emscripten UMD build that only sets `module.exports`
+// when loaded as CommonJS. The site's root package.json declares `"type":
+// "module"` (so ssg.mjs can `import` the ESM shell/pages.js), which makes Node
+// treat `docs/visage.js` as ESM and return an empty namespace on require().
+// Load it under explicit CJS semantics by copying to a temp `.cjs` file.
+const visageSrc = path.join(__dirname, '..', 'docs', 'visage.js');
+const wasmSrc = path.join(__dirname, '..', 'docs', 'visage.wasm');
+// Copy BOTH the .js and .wasm into a temp dir (emscripten resolves visage.wasm
+// relative to the script's own directory), then load the .js under CJS.
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'visage-smoke-'));
+const visageTmp = path.join(tmpDir, 'visage.cjs');
+fs.copyFileSync(visageSrc, visageTmp);
+fs.copyFileSync(wasmSrc, path.join(tmpDir, 'visage.wasm'));
+const createVisage = require(visageTmp);
 
 const config = fs.readFileSync(path.join(__dirname, '..', 'config.example.dhall'), 'utf8');
 
@@ -59,4 +74,9 @@ createVisage().then((M) => {
   expect('catch-all (edited)', 'unknown@example.com', 'accept', 'catch_all', ['jane@realmail.example']);
 
   console.log('SMOKE OK');
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+}).catch((e) => {
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+  console.error(e);
+  process.exit(1);
 });

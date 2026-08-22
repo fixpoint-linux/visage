@@ -94,7 +94,7 @@ e2e: visage.com config_check.com tests/smtptest.com tests/relay_fake.com
 # --- browser wasm build (host: requires emscripten clang lld llvm nodejs) ----
 wasm:
 	./scripts/build-wasm.sh
-	@node tests/wasm-smoke.js
+	@node tests/wasm-smoke.cjs
 
 # --- store benchmark + plots ----------------------------------------------
 # Runs the store benchmark (seeds N in {1e3..1e6}, measures load throughput,
