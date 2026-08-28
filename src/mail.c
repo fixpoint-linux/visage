@@ -577,6 +577,13 @@ int mail_sanitize_for_forward(const char *in, size_t inlen,
             goto fail;
     }
 
+    /* Strip upstream DKIM-Signature headers: the message is modified (From/
+       Received/etc.) so any signature added by the original sender no longer
+       verifies and would surface as a failed DKIM at the receiver. Leave only
+       the one visage re-signs with (its own domain). */
+    if (mail_header_remove(&cur, &curlen, "DKIM-Signature") != 0)
+        goto fail;
+
     /* 3. Prepend the Received: line. */
     if (rw->received) {
         size_t rv = strlen(rw->received);

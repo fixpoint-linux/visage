@@ -98,14 +98,14 @@ in  { targets = [
             { deps = [ "vendor/mbedtls/build/.stamp", "src/config.c", "src/store.c", "src/smtp_in.c", "src/smtp_out.c", "src/mail.c", "src/reply.c", "src/dkim.c", "src/http.c", "src/admin.c", "src/http_parse.c", "src/json.c", "src/main.c", "src/visage.h", "src/config.h", "src/store.h", "src/mail.h", "src/reply.h", "src/smtp.h", "src/dkim.h", "src/http_parse.h", "src/json.h", "vendor/dhall-c/src/arena.c", "vendor/dhall-c/src/lexer.c", "vendor/dhall-c/src/parser.c", "vendor/dhall-c/src/ast.c", "vendor/dhall-c/src/normalize.c", "vendor/dhall-c/src/typecheck.c", "vendor/dhall-c/src/builtins.c", "vendor/dhall-c/src/serialize.c", "vendor/dhall-c/src/import.c", "vendor/dhall-c/src/bignum.c", "vendor/dhall-c/src/sha256.c", "vendor/dhall-c/src/ssrf.c", "vendor/dhall-c/src/http.c", "vendor/datalog-dafsa/vendor/dafsa.c", "vendor/datalog-dafsa/vendor/dafsa_state.c", "vendor/datalog-dafsa/vendor/dafsa_core.c", "vendor/datalog-dafsa/vendor/dafsa_persist.c", "vendor/datalog-dafsa/vendor/dafsa_view.c", "vendor/datalog-dafsa/vendor/dafsa_crc32.c", "vendor/datalog-dafsa/vendor/dafsa_wal.c", "vendor/datalog-dafsa/vendor/dafsa_build.c", "vendor/datalog-dafsa/vendor/dafsa_rank.c", "vendor/datalog-dafsa/vendor/dafsa_view_rank.c", "vendor/datalog-dafsa/src/intern.c", "vendor/datalog-dafsa/src/termstore.c", "vendor/datalog-dafsa/src/relation.c", "vendor/datalog-dafsa/src/vrelation.c", "vendor/datalog-dafsa/src/tupleset.c", "vendor/datalog-dafsa/src/parser.c", "vendor/datalog-dafsa/src/compiler.c", "vendor/datalog-dafsa/src/vm.c", "vendor/datalog-dafsa/src/snapshot.c", "vendor/datalog-dafsa/src/regexwalk.c", "vendor/datalog-dafsa/src/permindex.c", "vendor/datalog-dafsa/src/util.c", "vendor/datalog-dafsa/src/dl.c", "vendor/datalog-dafsa/src/iter.c", "vendor/datalog-dafsa/src/magic.c", "vendor/datalog-dafsa/src/topdown.c", "vendor/datalog-dafsa/src/analyze.c", "vendor/datalog-dafsa/src/schema.c", "vendor/datalog-dafsa/src/typecheck.c", "vendor/datalog-dafsa/src/txnwal.c", "vendor/datalog-dafsa/src/index.c", "vendor/datalog-dafsa/src/vector.c", "src/data/cacert_pem.c", "src/data/admin_ui.c", "src/mbedtls_visage_config.h" ]
             , phony = False
             , recipe = [ < Shell = "cosmocc -std=c11 -O2 -g -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -I vendor/dhall-c/src -I vendor/datalog-dafsa/src -I vendor/datalog-dafsa/vendor -I vendor/mbedtls/include -I src -DMBEDTLS_CONFIG_FILE='\"mbedtls_visage_config.h\"' -o visage.com src/config.c src/store.c src/smtp_in.c src/smtp_out.c src/mail.c src/reply.c src/dkim.c src/http.c src/admin.c src/http_parse.c src/json.c src/main.c vendor/dhall-c/src/arena.c vendor/dhall-c/src/lexer.c vendor/dhall-c/src/parser.c vendor/dhall-c/src/ast.c vendor/dhall-c/src/normalize.c vendor/dhall-c/src/typecheck.c vendor/dhall-c/src/builtins.c vendor/dhall-c/src/serialize.c vendor/dhall-c/src/import.c vendor/dhall-c/src/bignum.c vendor/dhall-c/src/sha256.c vendor/dhall-c/src/ssrf.c vendor/dhall-c/src/http.c vendor/datalog-dafsa/vendor/dafsa.c vendor/datalog-dafsa/vendor/dafsa_state.c vendor/datalog-dafsa/vendor/dafsa_core.c vendor/datalog-dafsa/vendor/dafsa_persist.c vendor/datalog-dafsa/vendor/dafsa_view.c vendor/datalog-dafsa/vendor/dafsa_crc32.c vendor/datalog-dafsa/vendor/dafsa_wal.c vendor/datalog-dafsa/vendor/dafsa_build.c vendor/datalog-dafsa/vendor/dafsa_rank.c vendor/datalog-dafsa/vendor/dafsa_view_rank.c vendor/datalog-dafsa/src/intern.c vendor/datalog-dafsa/src/termstore.c vendor/datalog-dafsa/src/relation.c vendor/datalog-dafsa/src/vrelation.c vendor/datalog-dafsa/src/tupleset.c vendor/datalog-dafsa/src/parser.c vendor/datalog-dafsa/src/compiler.c vendor/datalog-dafsa/src/vm.c vendor/datalog-dafsa/src/snapshot.c vendor/datalog-dafsa/src/regexwalk.c vendor/datalog-dafsa/src/permindex.c vendor/datalog-dafsa/src/util.c vendor/datalog-dafsa/src/dl.c vendor/datalog-dafsa/src/iter.c vendor/datalog-dafsa/src/magic.c vendor/datalog-dafsa/src/topdown.c vendor/datalog-dafsa/src/analyze.c vendor/datalog-dafsa/src/schema.c vendor/datalog-dafsa/src/typecheck.c vendor/datalog-dafsa/src/txnwal.c vendor/datalog-dafsa/src/index.c vendor/datalog-dafsa/src/vector.c vendor/mbedtls/build/aes.o vendor/mbedtls/build/asn1parse.o vendor/mbedtls/build/asn1write.o vendor/mbedtls/build/base64.o vendor/mbedtls/build/bignum.o vendor/mbedtls/build/bignum_core.o vendor/mbedtls/build/bignum_mod.o vendor/mbedtls/build/bignum_mod_raw.o vendor/mbedtls/build/cipher.o vendor/mbedtls/build/cipher_wrap.o vendor/mbedtls/build/constant_time.o vendor/mbedtls/build/ctr_drbg.o vendor/mbedtls/build/ecdh.o vendor/mbedtls/build/ecdsa.o vendor/mbedtls/build/ecp.o vendor/mbedtls/build/ecp_curves.o vendor/mbedtls/build/entropy.o vendor/mbedtls/build/entropy_poll.o vendor/mbedtls/build/error.o vendor/mbedtls/build/gcm.o vendor/mbedtls/build/md.o vendor/mbedtls/build/oid.o vendor/mbedtls/build/pem.o vendor/mbedtls/build/pk.o vendor/mbedtls/build/pk_ecc.o vendor/mbedtls/build/pk_wrap.o vendor/mbedtls/build/pkparse.o vendor/mbedtls/build/platform.o vendor/mbedtls/build/platform_util.o vendor/mbedtls/build/rsa.o vendor/mbedtls/build/rsa_alt_helpers.o vendor/mbedtls/build/sha1.o vendor/mbedtls/build/sha256.o vendor/mbedtls/build/sha512.o vendor/mbedtls/build/ssl_cache.o vendor/mbedtls/build/ssl_ciphersuites.o vendor/mbedtls/build/ssl_client.o vendor/mbedtls/build/ssl_msg.o vendor/mbedtls/build/ssl_tls.o vendor/mbedtls/build/ssl_tls12_client.o vendor/mbedtls/build/ssl_tls12_server.o vendor/mbedtls/build/version.o vendor/mbedtls/build/x509.o vendor/mbedtls/build/x509_crt.o src/data/cacert_pem.c src/data/admin_ui.c" > ]
-            , hash = "sha256:045426002c39411dd04e6262ab7e309bbb825e5c029fa961dc60c7e0a099ee22"
+            , hash = "sha256:0d75704f3adfb77ad9ebf1667820c76f6356137ea8bef7197ed3fdfff078b7b8"
             , depsHash = [
               { path = "vendor/mbedtls/build/.stamp", hash = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
               { path = "src/config.c", hash = "sha256:19b328c91427c6aa0eee2dea50cab61537dd5905d09581f5ded589dc730d2f26" },
               { path = "src/store.c", hash = "sha256:4fcaa28952c64659de57bc9f2208948d7e880a2c4638289d97682a569a3b12d0" },
               { path = "src/smtp_in.c", hash = "sha256:84905841a9f77b335f687682d2c5ed1355d9df59bd5f368e388e6043f5eee677" },
               { path = "src/smtp_out.c", hash = "sha256:1dbe929aa90cb1f3380b4689a0b278b4738896dde4d7abe2b7830cfbf3f82e44" },
-              { path = "src/mail.c", hash = "sha256:351c2403990bdf1ff44b9b39943634a1764983d0c6e9cffb8c7056a1fc029e6c" },
+              { path = "src/mail.c", hash = "sha256:6445ee1f6174e1823ef363f8992762f1a3c8a86b4f5d6cc7beefb9c0d9a1cbfd" },
               { path = "src/reply.c", hash = "sha256:71651c5db55aae5afaf6f8e5989a330412c48ce4c5ac51f28d0ec7032f2848d7" },
               { path = "src/dkim.c", hash = "sha256:1d233c187e46f7f4f5a631b0cf124167ea022563141576dfb62a7afd2f069690" },
               { path = "src/http.c", hash = "sha256:4c71d30178fe76d7a81b5fa98140d6ba9544f57a07d2bd2f2d78b86038c0bb38" },
@@ -301,10 +301,10 @@ in  { targets = [
             { deps = [ "src/mail.c", "src/mail_check.c", "src/mail.h", "src/visage.h" ]
             , phony = False
             , recipe = [ < Shell = "cosmocc -std=c11 -O2 -g -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -I vendor/dhall-c/src -I vendor/datalog-dafsa/src -I vendor/datalog-dafsa/vendor  -o mail_check.com src/mail.c src/mail_check.c" > ]
-            , hash = "sha256:2c6efaf0fe4e47501223489451180bafd62eb51482114a06e0bac36456247751"
+            , hash = "sha256:08e110d098611d30fee9c06f42f457b9b88f2d8c277640977c526711180fb517"
             , depsHash = [
-              { path = "src/mail.c", hash = "sha256:351c2403990bdf1ff44b9b39943634a1764983d0c6e9cffb8c7056a1fc029e6c" },
-              { path = "src/mail_check.c", hash = "sha256:a56aa15936cd9c8d9a4f249c075c138ce589a03b3ca942572f8de780f399bb9b" },
+              { path = "src/mail.c", hash = "sha256:6445ee1f6174e1823ef363f8992762f1a3c8a86b4f5d6cc7beefb9c0d9a1cbfd" },
+              { path = "src/mail_check.c", hash = "sha256:152cb34705bcc421993053498e478a219cb53634a708d35911d9a51fc2d8b41d" },
               { path = "src/mail.h", hash = "sha256:6c8082d6731214465c6ec73d63b058deccf5d9c9ce43ddd2f09707846622f003" },
               { path = "src/visage.h", hash = "sha256:0a694c5970020f93c63d58134d1c36a5c1914fd04b57c01d0946f47970628e7c" }
               ]
@@ -323,7 +323,7 @@ in  { targets = [
               { path = "src/reply.h", hash = "sha256:5cbfc3dfdbcf7b4a0227b7b306ac48c3c3ca3aa1b77afdbcce493090a7543acf" },
               { path = "src/store.c", hash = "sha256:4fcaa28952c64659de57bc9f2208948d7e880a2c4638289d97682a569a3b12d0" },
               { path = "src/store.h", hash = "sha256:6c105be5dbec71c6071299eb5b33e4526ccd506c7f4b130c087eaff91c2f385b" },
-              { path = "src/mail.c", hash = "sha256:351c2403990bdf1ff44b9b39943634a1764983d0c6e9cffb8c7056a1fc029e6c" },
+              { path = "src/mail.c", hash = "sha256:6445ee1f6174e1823ef363f8992762f1a3c8a86b4f5d6cc7beefb9c0d9a1cbfd" },
               { path = "src/mail.h", hash = "sha256:6c8082d6731214465c6ec73d63b058deccf5d9c9ce43ddd2f09707846622f003" },
               { path = "src/config.h", hash = "sha256:bee64f3643ce6a01c8c4216a2c8d5e379fa9d8bd429794bb3e3783e7a1fd393c" },
               { path = "src/visage.h", hash = "sha256:0a694c5970020f93c63d58134d1c36a5c1914fd04b57c01d0946f47970628e7c" },
@@ -382,7 +382,7 @@ in  { targets = [
               { path = "src/store.h", hash = "sha256:6c105be5dbec71c6071299eb5b33e4526ccd506c7f4b130c087eaff91c2f385b" },
               { path = "src/reply.h", hash = "sha256:5cbfc3dfdbcf7b4a0227b7b306ac48c3c3ca3aa1b77afdbcce493090a7543acf" },
               { path = "src/mail.h", hash = "sha256:6c8082d6731214465c6ec73d63b058deccf5d9c9ce43ddd2f09707846622f003" },
-              { path = "src/mail.c", hash = "sha256:351c2403990bdf1ff44b9b39943634a1764983d0c6e9cffb8c7056a1fc029e6c" },
+              { path = "src/mail.c", hash = "sha256:6445ee1f6174e1823ef363f8992762f1a3c8a86b4f5d6cc7beefb9c0d9a1cbfd" },
               { path = "src/config.h", hash = "sha256:bee64f3643ce6a01c8c4216a2c8d5e379fa9d8bd429794bb3e3783e7a1fd393c" },
               { path = "src/visage.h", hash = "sha256:0a694c5970020f93c63d58134d1c36a5c1914fd04b57c01d0946f47970628e7c" },
               { path = "src/dkim.h", hash = "sha256:1202b9dddd7b9a435162e02cc66bb89f5b888b9e8cb699ec758a685921fda63c" },
@@ -586,7 +586,7 @@ in  { targets = [
               { path = "src/visage-wasm.c", hash = "sha256:2fcfc0305b7624e5b6d878b72a6bf9b7939e3f2fd41a8a56f773d8a854461875" },
               { path = "src/visage-wasm-no-remote.c", hash = "sha256:1e646f8b7fd21af6c918fabf50edf91869bcc71d6d4be1732aa7a1f935a0edfb" },
               { path = "src/config.c", hash = "sha256:19b328c91427c6aa0eee2dea50cab61537dd5905d09581f5ded589dc730d2f26" },
-              { path = "src/mail.c", hash = "sha256:351c2403990bdf1ff44b9b39943634a1764983d0c6e9cffb8c7056a1fc029e6c" },
+              { path = "src/mail.c", hash = "sha256:6445ee1f6174e1823ef363f8992762f1a3c8a86b4f5d6cc7beefb9c0d9a1cbfd" },
               { path = "scripts/build-wasm.sh", hash = "sha256:cbf8d3c3378ee5a86d8cb9dff669b0318fb337c12fb7f43150f77debd4e8b325" },
               { path = "vendor/dhall-c/src/arena.c", hash = "sha256:d025633194ecae134ce25f47ed30d025cda3633ef7df749be8f812cac85a4b5e" },
               { path = "vendor/dhall-c/src/lexer.c", hash = "sha256:2eecc4703e64d2ee186ed3b65b87f973bbc3e5dc79bfc36096bd914bf33794ce" },
@@ -621,7 +621,7 @@ in  { targets = [
             , phony = True
             , recipe = [ < Shell = "./tests/run.sh" > ]
             , depsHash = [
-              { path = "visage.com", hash = "sha256:045426002c39411dd04e6262ab7e309bbb825e5c029fa961dc60c7e0a099ee22" },
+              { path = "visage.com", hash = "sha256:0d75704f3adfb77ad9ebf1667820c76f6356137ea8bef7197ed3fdfff078b7b8" },
               { path = "config_check.com", hash = "sha256:c08f2eea39549c339c1360ec1740fc27ba31b87a16126c84aad70d0d8352173b" },
               { path = "tests/smtptest.com", hash = "sha256:33b2e8cca6228e0177a4797bd8a67da74af7c80ca0e89b7bb810b7544080b9cc" },
               { path = "tests/relay_fake.com", hash = "sha256:f11b8967d05b1eed86e93bc04c43ece1cc5a4819437a2a6150ec3cc7da8f9dbf" }
@@ -712,11 +712,11 @@ in  { targets = [
             , phony = True
             , recipe = [  ]
             , depsHash = [
-              { path = "visage.com", hash = "sha256:045426002c39411dd04e6262ab7e309bbb825e5c029fa961dc60c7e0a099ee22" },
+              { path = "visage.com", hash = "sha256:0d75704f3adfb77ad9ebf1667820c76f6356137ea8bef7197ed3fdfff078b7b8" },
               { path = "config_check.com", hash = "sha256:c08f2eea39549c339c1360ec1740fc27ba31b87a16126c84aad70d0d8352173b" },
               { path = "store_check.com", hash = "sha256:c3c109e646f428a0e65ae068d3fcbe22705eb0f996cd4dca5949a0851090b4d8" },
               { path = "store_bench.com", hash = "sha256:8b84ca35f9c52ee007d85bf0b78f95ff40b257409e23b9f5e8c16e146b6e8d64" },
-              { path = "mail_check.com", hash = "sha256:2c6efaf0fe4e47501223489451180bafd62eb51482114a06e0bac36456247751" },
+              { path = "mail_check.com", hash = "sha256:08e110d098611d30fee9c06f42f457b9b88f2d8c277640977c526711180fb517" },
               { path = "reply_check.com", hash = "sha256:9775892f9aa75ab5327ad7be2623f8445992186067c7dbd2bc7d91a43391455e" },
               { path = "smtp_check.com", hash = "sha256:a5cd335db3a7562dd01d6e4bf993cfde2ff1be017acfde1cf975cb846f2db191" },
               { path = "http_check.com", hash = "sha256:6517fa8af02545d94856cc99288f8ca7be5d9b38de674ad543e74deb5d4ff008" },

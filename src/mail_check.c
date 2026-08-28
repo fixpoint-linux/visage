@@ -274,6 +274,34 @@ static void sanitize_tests(void) {
     }
     mail_free(out);
 
+    /* Upstream DKIM-Signature headers must be stripped on forward (a
+       modified message invalidates the original sender's signature, which
+       would surface as a failed DKIM at the receiver). */
+    {
+        const char dk_in[] =
+            "DKIM-Signature: v=1; a=rsa-sha256; d=orig.example; s=sel; b=AAAA\r\n"
+            "From: a@original.example\r\n"
+            "Subject: t\r\n"
+            "DKIM-Signature: v=1; d=second.example; s=s2; b=BBBB\r\n"
+            "\r\n"
+            "body\r\n";
+        char *dout = NULL;
+        size_t doutlen = 0;
+        int drc = mail_sanitize_for_forward(dk_in, sizeof(dk_in) - 1, &rw, &dout, &doutlen);
+        bool dk_gone = true;
+        if (drc == 0 && dout) {
+            if (strstr(dout, "DKIM-Signature") || strstr(dout, "dkim-signature"))
+                dk_gone = false;
+        }
+        if (drc == 0 && dk_gone)
+            check_ok("sanitize strips upstream DKIM-Signature headers");
+        else {
+            snprintf(detail, sizeof detail, "rc=%d outlen=%zu", drc, doutlen);
+            check_fail("sanitize strips upstream DKIM-Signature headers", detail);
+        }
+        mail_free(dout);
+    }
+
     /* CRLF injection in a rewrite field must be rejected. */
     const char msgin[] = "From: a@b\r\n\r\nbody\r\n";
     MailRewrite bad = { .reply_to = "x@y\r\nBcc: evil@example.com" };
