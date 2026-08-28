@@ -162,33 +162,25 @@ int reply_route_inbound(Store *s, const Config *cfg, const char *rcpt,
 
 /* --- forward rewrite strings -------------------------------------------- */
 
-int reply_from_rewrite(char **out, const char *sender, const char *alias_addr,
-                       const char *reverse) {
-    size_t slen, alen, rlen, total;
+int reply_from_rewrite(char **out, const char *sender, const char *reverse) {
+    size_t slen, rlen, total;
     char *buf, *w;
 
     if (!out) return VISAGE_EPARAM;
     *out = NULL;
-    if (!sender || !alias_addr || !reverse) return VISAGE_EPARAM;
+    if (!sender || !reverse) return VISAGE_EPARAM;
 
     slen = strlen(sender);
-    alen = strlen(alias_addr);
     rlen = strlen(reverse);
-    /* "\"<sender> via <alias_addr>\" <reverse>" — 14 literal bytes. */
-    total = slen + alen + rlen + 14;
+    /* "\"sender\" <reverse>" — 5 literal bytes. */
+    total = slen + rlen + 5;
 
     buf = malloc(total + 1);
     if (!buf) return VISAGE_ENOMEM;
 
     w = buf;
     *w++ = '"';
-    *w++ = '<';
     memcpy(w, sender, slen); w += slen;
-    *w++ = '>';
-    memcpy(w, " via ", 5); w += 5;
-    *w++ = '<';
-    memcpy(w, alias_addr, alen); w += alen;
-    *w++ = '>';
     *w++ = '"';
     *w++ = ' ';
     *w++ = '<';
@@ -209,7 +201,7 @@ int reply_rewrite_build(const char *sender, const char *alias_addr, const char *
     memset(rw, 0, sizeof *rw);
     if (!sender || !alias_addr || !reverse) return VISAGE_EPARAM;
 
-    rc = reply_from_rewrite(&from, sender, alias_addr, reverse);
+    rc = reply_from_rewrite(&from, sender, reverse);
     if (rc != VISAGE_OK) return rc;
     rw->from = from;
 

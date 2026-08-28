@@ -111,12 +111,12 @@ int main(void) {
 
     /* --- forward From rewrite --- */
     from = NULL;
-    check(reply_from_rewrite(&from, "orig@foo.org", "jane@example.com",
+    check(reply_from_rewrite(&from, "orig@foo.org",
                              "reply+deadbeef@example.com") == VISAGE_OK,
           "from_rewrite returns OK");
     check(from != NULL && strcmp(from,
-          "\"<orig@foo.org> via <jane@example.com>\" <reply+deadbeef@example.com>") == 0,
-          "from_rewrite builds <S> via <A> form");
+          "\"orig@foo.org\" <reply+deadbeef@example.com>") == 0,
+          "from_rewrite builds <sender> display form");
     reply_free(from);
 
     /* --- full MailRewrite build --- */
@@ -126,7 +126,7 @@ int main(void) {
                                   "reply+deadbeef@example.com", &rw) == VISAGE_OK,
               "rewrite_build returns OK");
         check(rw.from != NULL && strcmp(rw.from,
-              "\"<orig@foo.org> via <jane@example.com>\" <reply+deadbeef@example.com>") == 0,
+              "\"orig@foo.org\" <reply+deadbeef@example.com>") == 0,
               "rewrite_build from value");
         check(rw.reply_to != NULL && strcmp(rw.reply_to, "reply+deadbeef@example.com") == 0,
               "rewrite_build reply_to = reverse");

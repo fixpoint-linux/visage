@@ -43,10 +43,9 @@ int reply_route_inbound(Store *s, const Config *cfg, const char *rcpt,
                         char **sender_out, char **alias_addr_out);
 
 /* Heap-build the forward "From:" display string
- *     "<sender> via <alias_addr>" <reverse>
+ *     "<sender>" <reverse>
  * into *out (NUL-terminated).  Returns 0 on success, negative on error. */
-int reply_from_rewrite(char **out, const char *sender, const char *alias_addr,
-                       const char *reverse);
+int reply_from_rewrite(char **out, const char *sender, const char *reverse);
 
 /* Fill a MailRewrite for mail_sanitize_for_forward() given the original sender
  * S and alias address A (with reverse = the reverse alias):

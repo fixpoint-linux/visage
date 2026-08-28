@@ -367,7 +367,7 @@ static bool path_clean(const char *p) {
     while (*q) {
         if (*q < 0x21 || *q > 0x7e) return false;
         /* The reverse-path flows into reply_from_rewrite()'s quoted-string
-         * display name ("<S> via <A>"), so reject the characters that would
+         * display name ("S"), so reject the characters that would
          * break out of the quotes / brackets and produce a malformed From:.
          * (CR/LF are already rejected by the 0x21..0x7e range above.) */
         if (*q == '"' || *q == '<' || *q == '>') return false;
