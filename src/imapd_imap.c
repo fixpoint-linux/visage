@@ -715,10 +715,10 @@ static int buf_appendf(char **buf, size_t *len, size_t *cap,
 /* Canonical CAPABILITY string (pure; unit-tested by imap_check.c). */
 const char *imapd_capability(bool tls_active, bool tls_avail,
                              bool plain_auth_ok) {
-    if (tls_active)   return "IMAP4rev1 AUTH=PLAIN IDLE";   /* RFC 2595: no STARTTLS once TLS is up */
-    if (!tls_avail)   return "IMAP4rev1 AUTH=PLAIN IDLE";   /* no cert: legacy plaintext default */
-    if (plain_auth_ok) return "IMAP4rev1 STARTTLS AUTH=PLAIN IDLE";
-    return "IMAP4rev1 STARTTLS LOGINDISABLED IDLE";         /* RFC 3501 11.1 */
+    if (tls_active)   return "IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS CONDSTORE";   /* RFC 2595: no STARTTLS once TLS is up */
+    if (!tls_avail)   return "IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS CONDSTORE";   /* no cert: legacy plaintext default */
+    if (plain_auth_ok) return "IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS CONDSTORE";
+    return "IMAP4rev1 STARTTLS LOGINDISABLED IDLE UIDPLUS CONDSTORE";         /* RFC 3501 11.1 */
 }
 
 /* Loopback bind-address classifier (pure; unit-tested by imap_check.c).
@@ -1031,6 +1031,8 @@ static void do_select(ImapdServer *srv, Conn *c, const char *tag,
                     c->mb.uidvalidity);
         conn_replyf(c, "* OK [UIDNEXT %u] Predicted next UID\r\n",
                     c->mb.uidnext);
+        conn_replyf(c, "* OK [HIGHESTMODSEQ %llu] Highest modseq\r\n",
+                    (unsigned long long)c->mb.highestmodseq);
         conn_reply(c, "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen "
                       "\\Draft)\r\n");
         conn_reply(c, "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted "
@@ -1579,7 +1581,7 @@ static void do_search(ImapdServer *srv, Conn *c, const char *tag,
 enum {
     FI_FLAGS = 0, FI_UID, FI_INTERNALDATE, FI_SIZE, FI_RFC822,
     FI_HEADER, FI_TEXT, FI_BODY, FI_HF, FI_HFNOT, FI_ENVELOPE,
-    FI_BODYSTRUCTURE, FI_PART
+    FI_BODYSTRUCTURE, FI_PART, FI_MODSEQ
 };
 
 /* BODY[<section>] part keywords. */
@@ -1606,6 +1608,7 @@ static int gen_puts_buf(FetchGen *g, const char *s, size_t n);
 struct FetchGen {
     char     tag[IMAPD_MAX_TAG + 1];
     bool     uid;
+    uint64_t changedsince;   /* CONDSTORE: skip msgs with modseq <= this */
     size_t  *msgs;      /* 0-based indices into mb.msgs (owned) */
     size_t   nmsgs, msg_i;
     FetchItem *items;   /* owned */
@@ -1827,6 +1830,9 @@ static int fetch_parse_items(const char **p, FetchItem **out, size_t *nout) {
                 if (item_push(&arr, &n, &cap, f) != 0) goto out;
             } else if (ascii_ieq_str(tok, "RFC822.SIZE")) {
                 f.kind = FI_SIZE;
+                if (item_push(&arr, &n, &cap, f) != 0) goto out;
+            } else if (ascii_ieq_str(tok, "MODSEQ")) {
+                f.kind = FI_MODSEQ;
                 if (item_push(&arr, &n, &cap, f) != 0) goto out;
             } else if (ascii_ieq_str(tok, "RFC822")) {
                 f.kind = FI_RFC822;
@@ -2266,6 +2272,9 @@ static int emit_item(ImapdServer *srv, Conn *c, FetchGen *g) {
     }
     case FI_SIZE:
         return gen_printf(g, "RFC822.SIZE %zu", m->size);
+    case FI_MODSEQ:
+        return gen_printf(g, "MODSEQ (%llu)",
+                          (unsigned long long)m->modseq);
     case FI_ENVELOPE: {
         char *eb = NULL;
         size_t el = 0, ec = 0;
@@ -2501,6 +2510,8 @@ static int fetch_build_msgs(Conn *c, FetchGen *g, const char *set) {
         uint32_t v = g->uid ? c->mb.msgs[i].uid : (uint32_t)(i + 1);
         size_t *nl;
         if (!imapd_seqset_has(set, v, star)) continue;
+        if (g->changedsince && c->mb.msgs[i].modseq <= g->changedsince)
+            continue;   /* CONDSTORE: unchanged since the given modseq */
         nl = realloc(g->msgs, (g->nmsgs + 1) * sizeof *nl);
         if (!nl) return -1;
         g->msgs = nl;
@@ -2534,14 +2545,6 @@ static void do_fetch(ImapdServer *srv, Conn *c, const char *tag,
     snprintf(g->tag, sizeof g->tag, "%s", tag);
     g->uid = uid;
     g->lit_fd = -1;
-    if (fetch_build_msgs(c, g, set) != 0) {
-        conn_replyf(c, "%s NO FETCH out of memory\r\n", tag);
-        imapd_fetch_free(c);
-        c->fg = g;   /* fetch_free expects it attached */
-        imapd_fetch_free(c);
-        free(set);
-        return;
-    }
     r = fetch_parse_items(&p, &g->items, &g->nitems);
     if (r != 0) {
         conn_replyf(c, "%s %s\r\n", tag,
@@ -2549,6 +2552,32 @@ static void do_fetch(ImapdServer *srv, Conn *c, const char *tag,
                             "ENVELOPE/BODYSTRUCTURE/MIME parts)"
                             : "BAD invalid FETCH items");
         c->fg = g;
+        imapd_fetch_free(c);
+        free(set);
+        return;
+    }
+    /* Optional CONDSTORE modifier: FETCH ... (CHANGEDSINCE <n> [VANISHED]).
+       Must be parsed BEFORE fetch_build_msgs so the filter applies. */
+    while (*p == ' ') p++;
+    if (*p == '(') {
+        const char *q = p + 1;
+        while (*q == ' ') q++;
+        if (ascii_strncasecmp(q, "CHANGEDSINCE", 12) == 0 &&
+            (q[12] == ' ' || q[12] == '\t')) {
+            q += 12;
+            while (*q == ' ' || *q == '\t') q++;
+            g->changedsince = 0;
+            while (*q >= '0' && *q <= '9') {
+                if (g->changedsince <= (UINT64_MAX - 9) / 10)
+                    g->changedsince = g->changedsince * 10 + (uint64_t)(*q - '0');
+                q++;
+            }
+        }
+    }
+    if (fetch_build_msgs(c, g, set) != 0) {
+        conn_replyf(c, "%s NO FETCH out of memory\r\n", tag);
+        imapd_fetch_free(c);
+        c->fg = g;   /* fetch_free expects it attached */
         imapd_fetch_free(c);
         free(set);
         return;

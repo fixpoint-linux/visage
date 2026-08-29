@@ -566,16 +566,16 @@ static void wildmat_test(void) {
 
 static void tls_test(void) {
     EXPECT(strcmp(imapd_capability(true, true, true),
-                  "IMAP4rev1 AUTH=PLAIN IDLE") == 0,
+                  "IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS CONDSTORE") == 0,
            "capability: TLS established drops STARTTLS");
     EXPECT(strcmp(imapd_capability(false, true, true),
-                  "IMAP4rev1 STARTTLS AUTH=PLAIN IDLE") == 0,
+                  "IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS CONDSTORE") == 0,
            "capability: TLS available on loopback bind");
     EXPECT(strcmp(imapd_capability(false, true, false),
-                  "IMAP4rev1 STARTTLS LOGINDISABLED IDLE") == 0,
+                  "IMAP4rev1 STARTTLS LOGINDISABLED IDLE UIDPLUS CONDSTORE") == 0,
            "capability: TLS available off-loopback => LOGINDISABLED");
     EXPECT(strcmp(imapd_capability(false, false, false),
-                  "IMAP4rev1 AUTH=PLAIN IDLE") == 0,
+                  "IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS CONDSTORE") == 0,
            "capability: no cert = legacy plaintext default");
 
     EXPECT(imapd_addr_loopback("127.0.0.1"), "loopback 127.0.0.1");

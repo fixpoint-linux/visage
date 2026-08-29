@@ -461,6 +461,7 @@ int imapd_mbox_deliver(const char *dir, const char *msg, size_t len,
 typedef struct UidEnt {
     char    *base;
     uint32_t uid;
+    uint64_t modseq;   /* CONDSTORE: persisted per-message change counter */
 } UidEnt;
 
 static void uidlist_free(UidEnt *v, size_t n) {
@@ -504,6 +505,7 @@ static UidEnt *uidlist_load(const Mbox *mb, uint32_t *uidvalidity,
         unsigned long long uid = 0;
         size_t bl;
         char *base;
+        uint64_t modseq = 1;
         if (sscanf(p, "%llu", &uid) != 1) break;
         nl = strchr(p, '\n');
         if (!nl) nl = p + strlen(p);
@@ -511,7 +513,20 @@ static UidEnt *uidlist_load(const Mbox *mb, uint32_t *uidvalidity,
         if (*p != ' ') break;   /* malformed line: keep what we have */
         p++;
         bl = (size_t)(nl - p);
-        if (bl == 0 || memchr(p, ' ', bl)) break;
+        if (bl == 0) break;
+        /* Optional trailing " <modseq>" (CONDSTORE).  Older uidlists lack it;
+           treat those messages as modseq 1. */
+        {
+            char *sp = memchr(p, ' ', bl);
+            if (sp) {
+                unsigned long long ms = 0;
+                if (sscanf(sp, " %llu", &ms) == 1) {
+                    modseq = ms;
+                    bl = (size_t)(sp - p);
+                }
+            }
+        }
+        if (bl == 0 || memchr(p, ' ', bl)) break;   /* no base, or junk */
         base = malloc(bl + 1);
         if (!base) break;
         memcpy(base, p, bl);
@@ -525,6 +540,7 @@ static UidEnt *uidlist_load(const Mbox *mb, uint32_t *uidvalidity,
         }
         v[n].base = base;
         v[n].uid = (uid == 0 || uid > UINT32_MAX) ? 0 : (uint32_t)uid;
+        v[n].modseq = modseq;
         if (v[n].uid == 0) { free(base); break; }
         n++;
         if (!*nl) break;
@@ -545,7 +561,8 @@ static int uidlist_save(const Mbox *mb, uint32_t uidvalidity,
     if (!f) return -1;
     if (fprintf(f, "%u %u\n", uidvalidity, uidnext) < 0) goto fail;
     for (i = 0; i < n; i++)
-        if (fprintf(f, "%u %s\n", v[i].uid, v[i].base) < 0) goto fail;
+        if (fprintf(f, "%u %s %llu\n", v[i].uid, v[i].base,
+                    (unsigned long long)v[i].modseq) < 0) goto fail;
     if (fclose(f) != 0) return -1;
     return 0;
 fail:
@@ -571,8 +588,8 @@ void imapd_mbox_close(Mbox *mb) {
 
 /* Append one scanned file to the view (takes ownership of base/path). */
 static int scan_add(Mbox *mb, uint32_t uid, uint8_t flags, const char *unk,
-                    bool recent, const struct stat *st, char *base,
-                    char *path) {
+                    bool recent, const struct stat *st, uint64_t modseq,
+                    char *base, char *path) {
     Imail *m;
     if (mb->nmsgs == mb->cap) {
         size_t nc = mb->cap ? mb->cap * 2 : 16;
@@ -584,6 +601,8 @@ static int scan_add(Mbox *mb, uint32_t uid, uint8_t flags, const char *unk,
     m = &mb->msgs[mb->nmsgs++];
     m->uid = uid;
     m->flags = flags;
+    m->modseq = modseq;
+    if (modseq > mb->highestmodseq) mb->highestmodseq = modseq;
     snprintf(m->unk, sizeof m->unk, "%s", unk ? unk : "");
     m->recent = recent;
     m->internal_date = st->st_mtime;
@@ -615,6 +634,7 @@ static int scan_subdir(Mbox *mb, const char *sub, bool is_new,
         const char *colon, *inf;
         struct stat st;
         uint32_t uid = 0;
+        uint64_t modseq = 1;
         uint8_t flags = 0;
         size_t i, bl;
         char *base, *fpath;
@@ -637,12 +657,14 @@ static int scan_subdir(Mbox *mb, const char *sub, bool is_new,
             if (strlen((*map)[i].base) == bl &&
                 memcmp((*map)[i].base, e->d_name, bl) == 0) {
                 uid = (*map)[i].uid;
+                modseq = (*map)[i].modseq;
                 break;
             }
         }
         if (uid == 0) {
             UidEnt *nv;
             uid = (*uidnext)++;
+            modseq = (*uidnext);   /* new message: modseq >= any prior */
             *changed = true;
             /* record the assignment so the next save persists it */
             nv = realloc(*map, (*nmap + 1) * sizeof **map);
@@ -653,6 +675,7 @@ static int scan_subdir(Mbox *mb, const char *sub, bool is_new,
                     memcpy((*map)[*nmap].base, e->d_name, bl);
                     (*map)[*nmap].base[bl] = '\0';
                     (*map)[*nmap].uid = uid;
+                    (*map)[*nmap].modseq = modseq;
                     (*nmap)++;
                 }
             }
@@ -663,7 +686,7 @@ static int scan_subdir(Mbox *mb, const char *sub, bool is_new,
         memcpy(base, e->d_name, bl);
         base[bl] = '\0';
         strcpy(fpath, path);
-        if (scan_add(mb, uid, flags, info, is_new, &st, base, fpath) != 0) {
+        if (scan_add(mb, uid, flags, info, is_new, &st, modseq, base, fpath) != 0) {
             free(base);
             free(fpath);
         }
@@ -777,6 +800,36 @@ int imapd_mbox_store(Mbox *mb, uint32_t uid, uint8_t flags) {
     m->path = strdup(dst);
     if (!m->path) return -1;
     m->flags = flags;
+    /* CONDSTORE: a flag change bumps this message's modseq.  Use the
+       mailbox's next uid as a monotonic counter (uidnext grows on every
+       delivery and is persisted); guarantee strictly-greater-than. */
+    if (++mb->highestmodseq == 0) mb->highestmodseq = 1;
+    m->modseq = mb->highestmodseq;
+    {
+        char path[4200];
+        UidEnt *map = NULL;
+        size_t nmap = 0, i;
+        uint32_t uv = mb->uidvalidity, un = mb->uidnext;
+        if (uidlist_path(mb, path, sizeof path) == 0) {
+            map = uidlist_load(mb, &uv, &un, &nmap);
+            for (i = 0; i < nmap; i++)
+                if (map[i].uid == uid) { map[i].modseq = m->modseq; break; }
+            if (i == nmap && map) {
+                UidEnt *nv = realloc(map, (nmap + 1) * sizeof *nv);
+                if (nv) {
+                    map = nv;
+                    map[nmap].base = strdup(m->base);
+                    if (map[nmap].base) {
+                        map[nmap].uid = uid;
+                        map[nmap].modseq = m->modseq;
+                        nmap++;
+                    }
+                }
+            }
+            (void)uidlist_save(mb, mb->uidvalidity, mb->uidnext, map, nmap);
+            uidlist_free(map, nmap);
+        }
+    }
     return 0;
 }
 

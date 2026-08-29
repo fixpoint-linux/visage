@@ -66,6 +66,7 @@ start_daemon() {   # start_daemon ROOT LOG EXTRA_ARGS...
 ./imapd.com passwd alice waldorf --root "$ROOT_B" >/dev/null
 ./imapd.com passwd alice waldorf --root "$ROOT_D" >/dev/null
 ./imapd.com passwd bob waldorf --root "$ROOT_A" >/dev/null  # IDLE test user
+./imapd.com passwd carol waldorf --root "$ROOT_A" >/dev/null  # CONDSTORE test user
 
 # ---- instances ----
 start_daemon "$ROOT_A" "$TMP/a.log" \
@@ -210,6 +211,68 @@ while True:
         break
 assert b"\r\nc3 OK IDLE completed\r\n" in done, done
 s.sendall(b"c4 LOGOUT\r\n")
+PYEOF
+
+# ---- (1c) CONDSTORE + UIDPLUS: HIGHESTMODSEQ on SELECT, MODSEQ fetch item,
+# CHANGEDSINCE filters unchanged messages, and UIDPLUS is advertised. ----
+python3 - "$IMAP_A" "$ROOT_A" <<'PYEOF' && pass "imap: CONDSTORE (MODSEQ/CHANGEDSINCE) + UIDPLUS" \
+                           || fail "imap: CONDSTORE (MODSEQ/CHANGEDSINCE) + UIDPLUS"
+import os, socket, sys, uuid
+
+port, root = int(sys.argv[1]), sys.argv[2]
+# seed one message into carol's INBOX so the fetch has a row
+newdir = os.path.join(root, "carol", "Inbox", "new")
+os.makedirs(newdir, exist_ok=True)
+open(os.path.join(newdir, uuid.uuid4().hex), "wb").write(
+    b"From: a@example.com\r\nSubject: condstore\r\n\r\nhi\r\n")
+
+s = socket.create_connection(("127.0.0.1", port), timeout=10)
+f = s.makefile("rb")
+assert f.readline().startswith(b"* OK")
+s.sendall(b"d1 CAPABILITY\r\n")
+cap = b""
+while True:
+    l = f.readline()
+    cap += l
+    if l.startswith(b"d1 "):
+        break
+assert b"CONDSTORE" in cap and b"UIDPLUS" in cap, cap
+s.sendall(b"d2 LOGIN carol waldorf\r\n")
+assert f.readline().startswith(b"d2 OK")
+s.sendall(b"d3 SELECT INBOX\r\n")
+sel = b""
+hm = None
+while True:
+    l = f.readline()
+    sel += l
+    if b"HIGHESTMODSEQ" in l:
+        hm = l
+    if l.startswith(b"d3 "):
+        break
+assert b"d3 OK" in sel, sel
+assert hm is not None, sel
+
+# MODSEQ fetch item returns a modseq per message
+s.sendall(b"d4 FETCH 1:1 (UID FLAGS MODSEQ)\r\n")
+ms = b""
+while True:
+    l = f.readline()
+    ms += l
+    if l.startswith(b"d4 "):
+        break
+assert b"MODSEQ (" in ms, ms
+assert b"d4 OK" in ms, ms
+
+# CHANGEDSINCE a huge modseq filters out all messages (nothing changed since)
+s.sendall(b"d5 FETCH 1:* (FLAGS) (CHANGEDSINCE 18446744073709551615)\r\n")
+cd = b""
+while True:
+    l = f.readline()
+    cd += l
+    if l.startswith(b"d5 "):
+        break
+assert b"d5 OK" in cd and b"* 1 FETCH" not in cd, cd  # no messages returned
+s.sendall(b"d6 LOGOUT\r\n")
 PYEOF
 
 # ---- (2) RFC 3501 11.1 gating on a non-loopback bind ----

@@ -105,14 +105,16 @@ typedef struct Imail {
     bool     recent;            /* arrived in new/ for this session */
     time_t   internal_date;     /* st_mtime */
     size_t   size;              /* file byte size */
-    char    *base;              /* owned: unique base name (no ":2,") */
-    char    *path;              /* owned: current full path */
+    uint64_t modseq;            /* CONDSTORE: monotonic change counter   */
+    char    *base;              /* owned: unique base name (no ":2,")    */
+    char    *path;              /* owned: current full path              */
 } Imail;
 
 typedef struct Mbox {
     char     dir[4096];         /* mailbox directory */
     uint32_t uidvalidity;
     uint32_t uidnext;
+    uint64_t highestmodseq;     /* CONDSTORE: max modseq in this mailbox */
     Imail   *msgs;              /* sorted by uid ascending */
     size_t   nmsgs, cap;
 } Mbox;
