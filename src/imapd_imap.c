@@ -1573,20 +1573,23 @@ static int section_parse(const char *s, FetchItem *it) {
     return -1;
 }
 
-/* One fetch item token (paren-aware, so BODY[..HEADER.FIELDS (a b)] stays
-   one token). */
+/* One fetch item token (paren- AND bracket-aware, so BODY[..HEADER.FIELDS
+   (a b)] stays one token). */
 static char *fetch_token(const char **p) {
     const char *s = *p, *st;
-    int depth = 0;
+    int depth = 0, bdepth = 0;
     while (*s == ' ') s++;
     if (*s == '\0' || *s == ')') { *p = s; return NULL; }
     st = s;
     while (*s) {
         if (*s == '(') depth++;
+        else if (*s == '[') bdepth++;
         else if (*s == ')') {
             if (depth == 0) break;
             depth--;
-        } else if (*s == ' ' && depth == 0) break;
+        } else if (*s == ']') {
+            if (bdepth > 0) bdepth--;
+        } else if (*s == ' ' && depth == 0 && bdepth == 0) break;
         s++;
     }
     *p = s;
