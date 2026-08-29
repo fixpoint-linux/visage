@@ -2412,7 +2412,13 @@ static void gen_flush(Conn *c, FetchGen *g) {
         return;
     }
     g->gen_len = 0;
-    conn_flush(c);
+    /* Only force an actual TLS/raw send when the output buffer is full:
+       emitting one small FETCH per message then flushing each would cost a
+       mbedtls_ssl_write syscall per message (30k messages => 30k encrypts,
+       ~30s for a 1.2MB UID FLAGS sync).  Batching into IMAPD_MAX_OUT chunks
+       makes the wire send amortized; the poll loop flushes leftovers on
+       POLLOUT and the FG_DONE path flushes the tail. */
+    if (c->out_len - c->out_off >= IMAPD_MAX_OUT / 2) conn_flush(c);
 }
 
 void imapd_fetch_pump(ImapdServer *srv, Conn *c) {
