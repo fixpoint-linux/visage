@@ -239,6 +239,15 @@ while True:
 assert b"CONDSTORE" in cap and b"UIDPLUS" in cap, cap
 s.sendall(b"d2 LOGIN carol waldorf\r\n")
 assert f.readline().startswith(b"d2 OK")
+# FairEmail sends ENABLE CONDSTORE after LOGIN; must get * ENABLED CONDSTORE
+s.sendall(b"e0 ENABLE CONDSTORE\r\n")
+en = b""
+while True:
+    l = f.readline()
+    en += l
+    if l.startswith(b"e0 "):
+        break
+assert b"* ENABLED CONDSTORE" in en and b"e0 OK" in en, en
 s.sendall(b"d3 SELECT INBOX\r\n")
 sel = b""
 hm = None

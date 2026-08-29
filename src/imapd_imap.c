@@ -2807,6 +2807,31 @@ static void dispatch(ImapdServer *srv, Conn *c) {
                loop runs the handshake and resets the session (TLS reset) */
             conn_replyf(c, "%s OK Begin TLS negotiation now\r\n", tag);
         }
+    } else if (ascii_ieq_str(word, "ENABLE")) {
+        /* RFC 5162: acknowledge the extensions we can enable (CONDSTORE).
+           FairEmail sends ENABLE CONDSTORE after LOGIN; a bare BAD here can
+           make it give up / drop the connection. */
+        const char *q = p;
+        bool ok = true, enabled_condstore = false;
+        while (*q == ' ') q++;
+        if (*q == '\0') ok = false;
+        while (ok && *q) {
+            char *cap = NULL;
+            size_t cl;
+            int r = imapd_next_astring(&q, &cap, &cl);
+            if (r != 1 || cl == 0) { ok = false; free(cap); break; }
+            if (ascii_ieq_str(cap, "CONDSTORE")) enabled_condstore = true;
+            free(cap);
+            while (*q == ' ') q++;
+        }
+        if (!ok) {
+            conn_replyf(c, "%s BAD ENABLE requires at least one capability\r\n",
+                        tag);
+        } else {
+            conn_replyf(c, "* ENABLED%s\r\n",
+                        enabled_condstore ? " CONDSTORE" : "");
+            conn_replyf(c, "%s OK ENABLE completed\r\n", tag);
+        }
     } else if (ascii_ieq_str(word, "LOGIN")) {
         do_login(srv, c, tag, p);
     } else if (ascii_ieq_str(word, "AUTHENTICATE")) {
