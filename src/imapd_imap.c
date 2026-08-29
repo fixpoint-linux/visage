@@ -240,6 +240,7 @@ int imapd_next_astring(const char **p, char **out, size_t *outlen) {
             if (buf_append(&buf, &n, &cap, &ch, 1) != 0) { free(buf); return -1; }
         }
         *p = s;
+        if (!buf) { buf = strdup(""); if (!buf) return -1; }  /* empty string */
         *out = buf;
         *outlen = n;
         return 1;

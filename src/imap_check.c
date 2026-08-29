@@ -187,8 +187,8 @@ static void tokenizer_test(void) {
     free(s);
 
     p = "\"\"";
-    EXPECT(imapd_next_astring(&p, &s, &n) == 1 && n == 0,
-           "astring empty quoted");
+    EXPECT(imapd_next_astring(&p, &s, &n) == 1 && n == 0 && s != NULL && s[0] == '\0',
+           "astring empty quoted yields non-NULL empty string");
     free(s);
 
     p = "\"unterminated";
