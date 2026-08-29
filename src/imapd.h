@@ -446,3 +446,9 @@ void imapd_ingest_tls_reset(ImapdServer *srv, Conn *c);
 /* Build the RFC 3501 BODYSTRUCTURE string for a full message. Heap-allocates
    *out (NUL-terminated); *outlen excludes the NUL. */
 int imapd_bodystructure(const char *msg, size_t len, char **out, size_t *outlen);
+
+/* Resolve a 1-based MIME part path against a full message; fills the part's
+   byte range [start,end) and header/body boundary hdr_end. Returns 0 on
+   success, -1 if the path does not resolve. */
+int imapd_mime_part(const char *msg, size_t len, const int *path, int npath,
+                    size_t *start, size_t *end, size_t *hdr_end);

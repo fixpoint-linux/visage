@@ -649,6 +649,50 @@ static void bodystructure_test(void) {
     }
 }
 
+static void mime_part_test(void) {
+    const char *m =
+        "Content-Type: multipart/mixed; boundary=Z\r\n"
+        "\r\n"
+        "--Z\r\nContent-Type: text/plain\r\n"
+        "\r\n"
+        "body\r\n"
+        "--Z\r\nContent-Type: application/pdf\r\n"
+        "\r\n"
+        "%PDF\r\n"
+        "--Z--\r\n";
+    int path[2];
+    size_t s, e, he;
+    path[0] = 1;
+    EXPECT(imapd_mime_part(m, strlen(m), path, 1, &s, &e, &he) == 0 &&
+               e - he == 4 && strncmp(m + he, "body", 4) == 0,
+           "mime_part part 1 body");
+    path[0] = 2;
+    EXPECT(imapd_mime_part(m, strlen(m), path, 1, &s, &e, &he) == 0 &&
+               e - he == 4 && strncmp(m + he, "%PDF", 4) == 0,
+           "mime_part part 2 body");
+    path[0] = 3;
+    EXPECT(imapd_mime_part(m, strlen(m), path, 1, &s, &e, &he) != 0,
+           "mime_part part 3 does not exist");
+    /* nested: multipart/alternative inside multipart/mixed */
+    const char *m2 =
+        "Content-Type: multipart/mixed; boundary=A\r\n"
+        "\r\n"
+        "--A\r\nContent-Type: multipart/alternative; boundary=B\r\n"
+        "\r\n"
+        "--B\r\nContent-Type: text/plain\r\n"
+        "\r\n"
+        "plain\r\n"
+        "--B\r\nContent-Type: text/html\r\n"
+        "\r\n"
+        "<b>h</b>\r\n"
+        "--B--\r\n"
+        "--A--\r\n";
+    int p2[2] = { 1, 2 };
+    EXPECT(imapd_mime_part(m2, strlen(m2), p2, 2, &s, &e, &he) == 0 &&
+               e - he == 8 && strncmp(m2 + he, "<b>h</b>", 8) == 0,
+           "mime_part nested part 1.2");
+}
+
 int main(void) {
     char *root = mk_tmpdir();
 
@@ -660,6 +704,7 @@ int main(void) {
     wildmat_test();
     tls_test();
     bodystructure_test();
+    mime_part_test();
 
     if (root) {
         ImapdConfig cfg;

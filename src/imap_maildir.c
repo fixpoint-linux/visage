@@ -1353,3 +1353,77 @@ int imapd_bodystructure(const char *msg, size_t len, char **out, size_t *outlen)
     *outlen = bl;
     return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/* MIME part resolution (BODY[<section>] fetch)                       */
+/* ------------------------------------------------------------------ */
+
+static size_t mime_hdr_end(const char *msg, size_t len) {
+    size_t i;
+    for (i = 0; i + 4 <= len; i++)
+        if (msg[i] == '\r' && msg[i + 1] == '\n' && msg[i + 2] == '\r' &&
+            msg[i + 3] == '\n') return i + 4;
+    for (i = 0; i + 2 <= len; i++)
+        if (msg[i] == '\n' && msg[i + 1] == '\n') return i + 2;
+    return len;
+}
+
+/* Return the 1-based k-th part's byte range [ps,pe) within a multipart body
+   [bs,be) delimited by `boundary`. */
+static int mime_kth_part(const char *msg, size_t bs, size_t be,
+                         const char *boundary, int k, size_t *ps, size_t *pe) {
+    char delim[1024];
+    size_t dlen, blen = strlen(boundary), pos;
+    int idx = 0;
+    snprintf(delim, sizeof delim, "--%s", boundary);
+    dlen = strlen(delim);
+    pos = bs;
+    while (pos + dlen <= be) {
+        size_t i, d = be;
+        for (i = pos; i + dlen <= be; i++)
+            if (msg[i] == '-' && msg[i + 1] == '-' &&
+                memcmp(msg + i + 2, boundary, blen) == 0) { d = i; break; }
+        if (d == be) break;
+        if (d + dlen + 2 <= be && msg[d + dlen] == '-' && msg[d + dlen + 1] == '-')
+            break;                       /* closing delimiter */
+        pos = d + dlen;
+        if (pos + 1 < be && msg[pos] == '\r' && msg[pos + 1] == '\n') pos += 2;
+        else if (pos < be && (msg[pos] == '\n' || msg[pos] == '\r')) pos++;
+        {
+            size_t j, e = be;
+            for (j = pos; j + dlen <= be; j++)
+                if (msg[j] == '-' && msg[j + 1] == '-' &&
+                    memcmp(msg + j + 2, boundary, blen) == 0) { e = j; break; }
+            while (e > pos && (msg[e - 1] == '\n' || msg[e - 1] == '\r')) e--;
+            idx++;
+            if (idx == k) { *ps = pos; *pe = e; return 0; }
+            pos = e;
+        }
+    }
+    return -1;
+}
+
+/* Resolve a MIME part path (1-based numbers) against a full message. Fills
+   the part's byte range [start,end) and its header/body boundary hdr_end. */
+int imapd_mime_part(const char *msg, size_t len, const int *path, int npath,
+                    size_t *start, size_t *end, size_t *hdr_end) {
+    size_t cs = 0, ce = len, he;
+    int i;
+    he = mime_hdr_end(msg, len);
+    if (npath <= 0) { *start = 0; *end = len; *hdr_end = he; return 0; }
+    for (i = 0; i < npath; i++) {
+        char ct[1024], type[64], sub[64], boundary[512];
+        if (bs_hdr(msg + cs, he - cs, "Content-Type", ct, sizeof ct) != 0)
+            return -1;
+        bs_ct_parse(ct, type, sizeof type, sub, sizeof sub, boundary,
+                    sizeof boundary);
+        if (!ascii_ieq_str(type, "multipart") || !boundary[0]) return -1;
+        if (mime_kth_part(msg, he, ce, boundary, path[i], &cs, &ce) != 0)
+            return -1;
+        he = mime_hdr_end(msg + cs, ce - cs) + cs;
+    }
+    *start = cs;
+    *end = ce;
+    *hdr_end = he;
+    return 0;
+}

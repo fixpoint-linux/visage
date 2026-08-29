@@ -1078,6 +1078,44 @@ static void do_delete(ImapdServer *srv, Conn *c, const char *tag,
     free(name);
 }
 
+static void do_rename(ImapdServer *srv, Conn *c, const char *tag,
+                      const char *rest) {
+    char *oldname = NULL, *newname = NULL;
+    size_t ol = 0, nl = 0;
+    char odir[4096], ndir[4096];
+    struct stat st;
+    if (c->ist == IST_NOT_AUTH) {
+        conn_replyf(c, "%s BAD RENAME not allowed now\r\n", tag);
+        return;
+    }
+    if (imapd_next_astring(&rest, &oldname, &ol) != 1 ||
+        imapd_next_astring(&rest, &newname, &nl) != 1) {
+        conn_replyf(c, "%s BAD RENAME requires old and new mailbox\r\n", tag);
+        goto out;
+    }
+    if (ascii_ieq_str(oldname, "INBOX")) {
+        conn_replyf(c, "%s NO INBOX cannot be renamed\r\n", tag);
+    } else if (ascii_ieq_str(newname, "INBOX")) {
+        conn_replyf(c, "%s NO INBOX is a reserved name\r\n", tag);
+    } else if (imapd_mbox_dir(&srv->cfg, c->user, oldname, odir,
+                              sizeof odir) != 0 ||
+               imapd_mbox_dir(&srv->cfg, c->user, newname, ndir,
+                              sizeof ndir) != 0) {
+        conn_replyf(c, "%s NO Invalid mailbox name\r\n", tag);
+    } else if (stat(odir, &st) != 0) {
+        conn_replyf(c, "%s NO Source mailbox does not exist\r\n", tag);
+    } else if (stat(ndir, &st) == 0) {
+        conn_replyf(c, "%s NO Destination mailbox already exists\r\n", tag);
+    } else if (rename(odir, ndir) != 0) {
+        conn_replyf(c, "%s NO RENAME failed\r\n", tag);
+    } else {
+        conn_replyf(c, "%s OK RENAME completed\r\n", tag);
+    }
+out:
+    free(oldname);
+    free(newname);
+}
+
 static void do_subscribe(ImapdServer *srv, Conn *c, const char *tag,
                          const char *rest, bool add) {
     char *name = NULL;
@@ -1457,8 +1495,11 @@ static void do_search(ImapdServer *srv, Conn *c, const char *tag,
 enum {
     FI_FLAGS = 0, FI_UID, FI_INTERNALDATE, FI_SIZE, FI_RFC822,
     FI_HEADER, FI_TEXT, FI_BODY, FI_HF, FI_HFNOT, FI_ENVELOPE,
-    FI_BODYSTRUCTURE
+    FI_BODYSTRUCTURE, FI_PART
 };
+
+/* BODY[<section>] part keywords. */
+enum { PS_WHOLE = 0, PS_HEADER, PS_TEXT, PS_MIME };
 
 typedef struct FetchItem {
     int    kind;
@@ -1468,6 +1509,10 @@ typedef struct FetchItem {
     size_t nhf;
     bool   partial;     /* <o.n> present */
     size_t p_off, p_len;
+    int    part[8];     /* MIME part path (BODY[<section>]) */
+    int    npart;
+    int    psec;        /* PS_* keyword */
+    char   sec[64];     /* echoed section, e.g. "2.MIME" */
 } FetchItem;
 
 enum { FG_MSGSTART = 0, FG_ITEMS, FG_LIT, FG_DONE };
@@ -1561,15 +1606,41 @@ static int section_parse(const char *s, FetchItem *it) {
         while (*q == ' ') q++;
         return *q == '\0' ? 0 : -1;
     }
-    /* MIME part (all digits): unsupported in v1 */
+    /* MIME part section: "1", "1.2", "1.TEXT", "2.MIME", "1.HEADER",
+       "1.2.TEXT", with optional "<o.n>" partial handled by the caller. */
     {
-        const char *d = s;
-        bool digits = *d != '\0';
-        while (*d) {
-            if (*d < '0' || *d > '9') { digits = false; break; }
-            d++;
+        const char *p = s;
+        int npart = 0;
+        while (npart < 8) {
+            int v = 0;
+            if (*p < '0' || *p > '9') return -1;
+            while (*p >= '0' && *p <= '9') {
+                v = v * 10 + (unsigned)(*p - '0');
+                p++;
+            }
+            if (v <= 0) return -1;
+            it->part[npart++] = v;
+            if (*p == '.' && p[1] >= '0' && p[1] <= '9') {
+                p++;
+                continue;
+            }
+            break;
         }
-        if (digits) return -2;
+        it->npart = npart;
+        it->psec = PS_WHOLE;
+        if (*p == '.') p++;
+        if (*p && ascii_ieq_str(p, "TEXT")) {
+            it->psec = PS_TEXT;
+        } else if (*p && ascii_ieq_str(p, "MIME")) {
+            it->psec = PS_MIME;
+        } else if (*p && ascii_ieq_str(p, "HEADER")) {
+            it->psec = PS_HEADER;
+        } else if (*p) {
+            return -1;   /* unsupported part keyword (e.g. HEADER.FIELDS) */
+        }
+        snprintf(it->sec, sizeof it->sec, "%s", s);
+        it->kind = FI_PART;
+        return 0;
     }
     return -1;
 }
@@ -1865,6 +1936,49 @@ static int lit_region(ImapdServer *srv, Conn *c, FetchGen *g,
         }
         snprintf(namebuf + strlen(namebuf), namebufsz - strlen(namebuf),
                  ")]");
+        *name = namebuf;
+        break;
+    }
+    case FI_PART: {
+        char *msg = NULL;
+        size_t got = 0, ps = 0, pe = 0, phe = 0;
+        int fd = -1, r;
+        if (m->size > 0) {
+            msg = malloc(m->size);
+            if (!msg) return -1;
+            fd = open(m->path, O_RDONLY);
+            if (fd < 0) { free(msg); return -1; }
+            while (got < m->size) {
+                ssize_t n = read(fd, msg + got, m->size - got);
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+                if (n == 0) break;
+                got += (size_t)n;
+            }
+            close(fd);
+        }
+        r = imapd_mime_part(msg ? msg : "", got, it->part, it->npart,
+                            &ps, &pe, &phe);
+        free(msg);
+        if (r != 0) return -1;
+        switch (it->psec) {
+        case PS_HEADER:
+        case PS_MIME:
+            *skip = ps;
+            *len = phe > ps ? phe - ps : 0;
+            break;
+        case PS_TEXT:
+            *skip = phe;
+            *len = pe > phe ? pe - phe : 0;
+            break;
+        default:
+            *skip = ps;
+            *len = pe > ps ? pe - ps : 0;
+            break;
+        }
+        snprintf(namebuf, namebufsz, "BODY[%s]", it->sec);
         *name = namebuf;
         break;
     }
@@ -2555,7 +2669,7 @@ static void dispatch(ImapdServer *srv, Conn *c) {
     } else if (ascii_ieq_str(word, "DELETE")) {
         do_delete(srv, c, tag, p);
     } else if (ascii_ieq_str(word, "RENAME")) {
-        conn_replyf(c, "%s NO RENAME not supported\r\n", tag);
+        do_rename(srv, c, tag, p);
     } else if (ascii_ieq_str(word, "SUBSCRIBE")) {
         do_subscribe(srv, c, tag, p, true);
     } else if (ascii_ieq_str(word, "UNSUBSCRIBE")) {

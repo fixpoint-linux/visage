@@ -287,6 +287,11 @@ sel = tagged(tls2, "SELECT INBOX", "d3")
 assert b"d3 OK" in sel and b"1 EXISTS" in sel, sel
 fetch = tagged(tls2, "FETCH 1 (BODY[])", "d4")
 assert b"secret-tls-body" in fetch, fetch[:300]
+tagged(tls2, "CREATE OldFolder", "d6")
+rn = tagged(tls2, "RENAME OldFolder Renamed", "d7")
+assert b"d7 OK" in rn, rn
+lst = tagged(tls2, "LIST \"\" \"*\"", "d8")
+assert b"Renamed" in lst and b"OldFolder" not in lst, lst
 tagged(tls2, "LOGOUT", "d5")
 PYEOF
 
