@@ -780,6 +780,33 @@ int imapd_mbox_peek(const ImapdConfig *cfg, const char *user,
     return mbox_scan(mb, cfg, user, name, false);
 }
 
+/* Cheap "did anything land in new/ ?" probe.  Unlike a full mbox scan (which
+   stats every message and is O(n^2) on a large mailbox via scan_subdir's
+   linear uidlist lookup), this just checks whether the new/ subdir has any
+   files.  Used to gate refresh_selected so an IDLE/NOOP tick does not re-scan
+   a 30k-message mailbox every second. */
+bool imapd_mbox_has_new(const ImapdConfig *cfg, const char *user,
+                        const char *name) {
+    char sub_dir[4096 + 8];
+    DIR *d;
+    struct dirent *e;
+    bool any = false;
+    if (imapd_mbox_dir(cfg, user, name, sub_dir, sizeof sub_dir) != 0)
+        return false;
+    if (snprintf(sub_dir + strlen(sub_dir), sizeof sub_dir - strlen(sub_dir),
+                 "/new") >= (int)(sizeof sub_dir - strlen(sub_dir)))
+        return false;
+    d = opendir(sub_dir);
+    if (!d) return false;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        any = true;
+        break;
+    }
+    closedir(d);
+    return any;
+}
+
 Imail *imapd_mbox_find(Mbox *mb, uint32_t uid) {
     size_t i;
     if (!mb) return NULL;

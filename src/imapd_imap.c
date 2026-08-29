@@ -636,6 +636,13 @@ static void close_selected(Conn *c) {
 static void refresh_selected(ImapdServer *srv, Conn *c) {
     Mbox mb;
     if (!c->mb_open || c->fg) return;
+    /* Skip the expensive full re-scan unless something actually arrived in
+       new/: on a 30k-message mailbox re-scanning every IDLE/NOOP tick is
+       O(n^2) (scan_subdir linear uidlist lookup) and pins the CPU.  When the
+       client is NOT in IDLE (plain NOOP/CHECK), fall through so a full
+       refresh still catches changes. */
+    if (c->idle && !imapd_mbox_has_new(&srv->cfg, c->user, c->mbname))
+        return;
     if (imapd_mbox_open(&srv->cfg, c->user, c->mbname, &mb) != 0) return;
     {
         size_t old_n = c->mb.nmsgs, old_r = 0, new_r = 0, i;

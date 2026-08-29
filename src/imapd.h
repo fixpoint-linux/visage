@@ -57,7 +57,7 @@
 #define IMAPD_DEFAULT_MAX_MSG     (32u * 1024u * 1024u)
 #define IMAPD_DEFAULT_CMD_TMO     300
 #define IMAPD_DEFAULT_DATA_TMO    600
-#define IMAPD_IDLE_SCAN_MS        1000   /* RFC 2177: cadence for IDLE re-scan */
+#define IMAPD_IDLE_SCAN_MS        5000   /* RFC 2177: cadence for IDLE re-scan */
 #define IMAPD_IDLE_TMO            1800   /* RFC 2177 §4: server-side IDLE cap */
 
 #define IMAPD_PASSWD_FILE  "imapd.passwd"       /* under <root>, 0600 */
@@ -343,6 +343,10 @@ int imapd_mbox_open(const ImapdConfig *cfg, const char *user,
                     const char *name, Mbox *mb);
 int imapd_mbox_peek(const ImapdConfig *cfg, const char *user,
                     const char *name, Mbox *mb);
+
+/* Cheap new-mail probe (see imap_maildir.c). */
+bool imapd_mbox_has_new(const ImapdConfig *cfg, const char *user,
+                        const char *name);
 void imapd_mbox_close(Mbox *mb);
 
 /* Find a message by uid (NULL when absent). */
