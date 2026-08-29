@@ -1060,3 +1060,296 @@ int imapd_auth_set(const ImapdConfig *cfg, const char *user,
     free(buf);
     return 0;
 }
+
+/* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/* BODYSTRUCTURE (RFC 3501)                                           */
+/* ------------------------------------------------------------------ */
+
+static int mb_append(char **b, size_t *l, size_t *c, const void *s, size_t n) {
+    size_t need, nc;
+    char *nb;
+    if (n == 0) return 0;
+    need = *l + n;
+    if (need + 1 > *c) {
+        nc = *c ? *c : 256;
+        while (nc < need + 1) nc *= 2;
+        nb = realloc(*b, nc);
+        if (!nb) return -1;
+        *b = nb;
+        *c = nc;
+    }
+    memcpy(*b + *l, s, n);
+    *l = need;
+    (*b)[*l] = '\0';
+    return 0;
+}
+
+static int bs_nstr(char **b, size_t *l, size_t *c, const char *s, size_t n) {
+    size_t i;
+    if (n == 0) return mb_append(b, l, c, "NIL", 3);
+    if (mb_append(b, l, c, "\"", 1) != 0) return -1;
+    for (i = 0; i < n; i++) {
+        char ch = s[i];
+        if (ch == '"' || ch == '\\')
+            if (mb_append(b, l, c, "\\", 1) != 0) return -1;
+        if (mb_append(b, l, c, &ch, 1) != 0) return -1;
+    }
+    return mb_append(b, l, c, "\"", 1);
+}
+
+static int bs_hdr(const char *hdr, size_t hdrlen, const char *name,
+                  char *out, size_t outsz) {
+    return mail_header_get(hdr, hdrlen, name, out, outsz) == 0 ? 0 : -1;
+}
+
+/* Parse a Content-Type value into type/subtype/boundary (no output). */
+static void bs_ct_parse(const char *val, char *type, size_t tsz, char *sub,
+                        size_t ssz, char *boundary, size_t bsz) {
+    char tmp[1024];
+    const char *p, *slash, *semi;
+    size_t nl;
+    strncpy(tmp, val, sizeof tmp - 1);
+    tmp[sizeof tmp - 1] = '\0';
+    if (type) type[0] = '\0';
+    if (sub) sub[0] = '\0';
+    if (boundary) boundary[0] = '\0';
+    p = tmp;
+    slash = strchr(p, '/');
+    semi = strchr(p, ';');
+    if (type) {
+        const char *e = slash ? slash : (semi ? semi : p + strlen(p));
+        nl = (size_t)(e - p);
+        if (nl >= tsz) nl = tsz - 1;
+        memcpy(type, p, nl); type[nl] = '\0';
+    }
+    if (sub && slash) {
+        p = slash + 1;
+        const char *e = semi ? semi : p + strlen(p);
+        nl = (size_t)(e - p);
+        if (nl >= ssz) nl = ssz - 1;
+        memcpy(sub, p, nl); sub[nl] = '\0';
+    }
+    p = tmp;
+    while (boundary && (p = strchr(p, ';')) != NULL) {
+        char name[64];
+        const char *eq, *vs, *ve;
+        size_t nl2, vlen;
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        eq = strchr(p, '=');
+        if (!eq) break;
+        nl2 = (size_t)(eq - p);
+        while (nl2 && (p[nl2 - 1] == ' ' || p[nl2 - 1] == '\t')) nl2--;
+        if (nl2 == 0) break;
+        if (nl2 >= sizeof name) nl2 = sizeof name - 1;
+        memcpy(name, p, nl2); name[nl2] = '\0';
+        vs = eq + 1;
+        while (*vs == ' ' || *vs == '\t') vs++;
+        if (*vs == '"') {
+            vs++;
+            ve = strchr(vs, '"');
+            if (!ve) ve = vs + strlen(vs);
+        } else {
+            ve = vs;
+            while (*ve && *ve != ';' && *ve != ' ' && *ve != '\t') ve++;
+        }
+        vlen = (size_t)(ve - vs);
+        if (ascii_ieq_str(name, "boundary") && vlen < bsz) {
+            memcpy(boundary, vs, vlen); boundary[vlen] = '\0';
+        }
+        p = eq;
+    }
+}
+
+/* Emit `( "name" "value" ... )` params for a Content-Type value (NIL when
+   none); skip the boundary param when skip_b. */
+static int bs_ct_params(char **b, size_t *l, size_t *c, const char *val,
+                        bool skip_b) {
+    char tmp[1024];
+    const char *p;
+    bool started = false;
+    strncpy(tmp, val, sizeof tmp - 1);
+    tmp[sizeof tmp - 1] = '\0';
+    p = tmp;
+    while ((p = strchr(p, ';')) != NULL) {
+        char name[64], vbuf[512];
+        const char *eq, *vs, *ve;
+        size_t nl, vlen;
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        eq = strchr(p, '=');
+        if (!eq) break;
+        nl = (size_t)(eq - p);
+        while (nl && (p[nl - 1] == ' ' || p[nl - 1] == '\t')) nl--;
+        if (nl == 0) break;
+        if (nl >= sizeof name) nl = sizeof name - 1;
+        memcpy(name, p, nl); name[nl] = '\0';
+        vs = eq + 1;
+        while (*vs == ' ' || *vs == '\t') vs++;
+        if (*vs == '"') {
+            vs++;
+            ve = strchr(vs, '"');
+            if (!ve) ve = vs + strlen(vs);
+        } else {
+            ve = vs;
+            while (*ve && *ve != ';' && *ve != ' ' && *ve != '\t') ve++;
+        }
+        vlen = (size_t)(ve - vs);
+        if (vlen >= sizeof vbuf) vlen = sizeof vbuf - 1;
+        memcpy(vbuf, vs, vlen); vbuf[vlen] = '\0';
+        if (!(skip_b && ascii_ieq_str(name, "boundary"))) {
+            if (!started) {
+                if (mb_append(b, l, c, "(", 1) != 0) return -1;
+                started = true;
+            } else if (mb_append(b, l, c, " ", 1) != 0) return -1;
+            if (bs_nstr(b, l, c, name, strlen(name)) != 0) return -1;
+            if (mb_append(b, l, c, " ", 1) != 0) return -1;
+            if (bs_nstr(b, l, c, vbuf, vlen) != 0) return -1;
+        }
+        p = eq;
+    }
+    if (started) return mb_append(b, l, c, ")", 1);
+    return mb_append(b, l, c, "NIL", 3);
+}
+
+/* Content-Disposition -> ("inline"|"attachment" (params)) or NIL. */
+static int bs_disposition(char **b, size_t *l, size_t *c, const char *hdr,
+                          size_t hdrlen) {
+    char v[256], disp[64], pv[512];
+    const char *semi, *p;
+    size_t dl;
+    if (bs_hdr(hdr, hdrlen, "Content-Disposition", v, sizeof v) != 0)
+        return mb_append(b, l, c, "NIL", 3);
+    semi = strchr(v, ';');
+    p = v;
+    dl = semi ? (size_t)(semi - v) : strlen(v);
+    while (dl && (p[dl - 1] == ' ' || p[dl - 1] == '\t')) dl--;
+    if (dl >= sizeof disp) dl = sizeof disp - 1;
+    memcpy(disp, p, dl); disp[dl] = '\0';
+    if (mb_append(b, l, c, "(\"", 2) != 0) return -1;
+    if (mb_append(b, l, c, disp, dl) != 0) return -1;
+    if (mb_append(b, l, c, "\" ", 2) != 0) return -1;
+    if (semi) {
+        strncpy(pv, semi, sizeof pv - 1); pv[sizeof pv - 1] = '\0';
+        if (bs_ct_params(b, l, c, pv, false) != 0) return -1;
+    } else if (mb_append(b, l, c, "NIL", 3) != 0) return -1;
+    return mb_append(b, l, c, ")", 1);
+}
+
+static int bs_encoding(char **b, size_t *l, size_t *c, const char *hdr,
+                       size_t hdrlen) {
+    char v[64];
+    char *sp;
+    if (bs_hdr(hdr, hdrlen, "Content-Transfer-Encoding", v, sizeof v) != 0)
+        strcpy(v, "7BIT");
+    sp = strchr(v, ' ');
+    if (sp) *sp = '\0';
+    return bs_nstr(b, l, c, v, strlen(v));
+}
+
+static int bs_part(char **b, size_t *l, size_t *c, const char *msg, size_t msglen,
+                   size_t start, size_t end);
+
+/* Multipart body [bs,be): split on boundary, recurse into each part, emit
+   `( part1 part2 ... "subtype" (params) NIL NIL NIL )`. */
+static int bs_multipart(char **b, size_t *l, size_t *c, const char *msg,
+                        size_t msglen, size_t bs, size_t be, const char *boundary,
+                        const char *subtype, const char *ctval) {
+    char delim[1024];
+    size_t dlen, pos;
+    int npart = 0;
+    size_t blen = strlen(boundary);
+    snprintf(delim, sizeof delim, "--%s", boundary);
+    dlen = strlen(delim);
+    if (mb_append(b, l, c, "(", 1) != 0) return -1;
+    pos = bs;
+    while (pos + dlen <= be) {
+        size_t i, d = be;
+        for (i = pos; i + dlen <= be; i++)
+            if (msg[i] == '-' && msg[i + 1] == '-' &&
+                memcmp(msg + i + 2, boundary, blen) == 0) { d = i; break; }
+        if (d == be) break;
+        if (d + dlen + 2 <= be && msg[d + dlen] == '-' && msg[d + dlen + 1] == '-')
+            break;                       /* closing delimiter */
+        pos = d + dlen;                  /* part starts after delimiter line */
+        if (pos + 1 < be && msg[pos] == '\r' && msg[pos + 1] == '\n') pos += 2;
+        else if (pos < be && (msg[pos] == '\n' || msg[pos] == '\r')) pos++;
+        {
+            size_t j, e = be;
+            for (j = pos; j + dlen <= be; j++)
+                if (msg[j] == '-' && msg[j + 1] == '-' &&
+                    memcmp(msg + j + 2, boundary, blen) == 0) { e = j; break; }
+            while (e > pos && (msg[e - 1] == '\n' || msg[e - 1] == '\r')) e--;
+            if (e > pos) {
+                if (npart && mb_append(b, l, c, " ", 1) != 0) return -1;
+                if (bs_part(b, l, c, msg, msglen, pos, e) != 0) return -1;
+                npart++;
+            }
+            pos = e;
+        }
+    }
+    if (mb_append(b, l, c, ") \"", 3) != 0) return -1;
+    if (mb_append(b, l, c, subtype, strlen(subtype)) != 0) return -1;
+    if (mb_append(b, l, c, "\" ", 2) != 0) return -1;
+    if (bs_ct_params(b, l, c, ctval, true) != 0) return -1;
+    return mb_append(b, l, c, " NIL NIL NIL", 11);
+}
+
+/* One part occupying [start,end) of msg. */
+static int bs_part(char **b, size_t *l, size_t *c, const char *msg, size_t msglen,
+                   size_t start, size_t end) {
+    size_t hdr_end, i;
+    char ct[1024], type[64], sub[64], boundary[512];
+    hdr_end = end;
+    for (i = start; i + 4 <= end; i++)
+        if (msg[i] == '\r' && msg[i + 1] == '\n' && msg[i + 2] == '\r' &&
+            msg[i + 3] == '\n') { hdr_end = i + 4; break; }
+    if (hdr_end == end)
+        for (i = start; i + 2 <= end; i++)
+            if (msg[i] == '\n' && msg[i + 1] == '\n') { hdr_end = i + 2; break; }
+    if (bs_hdr(msg + start, hdr_end - start, "Content-Type", ct, sizeof ct) != 0)
+        strcpy(ct, "text/plain");
+    bs_ct_parse(ct, type, sizeof type, sub, sizeof sub, boundary, sizeof boundary);
+    if (ascii_ieq_str(type, "multipart")) {
+        /* bs_multipart emits the whole structure: ((parts) "subtype" ...). */
+        return bs_multipart(b, l, c, msg, msglen, hdr_end, end, boundary, sub, ct);
+    }
+    /* single part: ("type" "subtype" (params) id desc enc octets
+       md5 disposition language location) */
+    if (mb_append(b, l, c, "\"", 1) != 0) return -1;
+    if (mb_append(b, l, c, type, strlen(type)) != 0) return -1;
+    if (mb_append(b, l, c, "\" \"", 3) != 0) return -1;
+    if (mb_append(b, l, c, sub, strlen(sub)) != 0) return -1;
+    if (mb_append(b, l, c, "\" ", 2) != 0) return -1;
+    if (bs_ct_params(b, l, c, ct, false) != 0) return -1;
+    if (mb_append(b, l, c, " NIL NIL ", 9) != 0) return -1;   /* id, description */
+    if (bs_encoding(b, l, c, msg + start, hdr_end - start) != 0) return -1;
+    if (mb_append(b, l, c, " ", 1) != 0) return -1;
+    {
+        char sz[32];
+        snprintf(sz, sizeof sz, "%zu", end > hdr_end ? end - hdr_end : 0);
+        if (mb_append(b, l, c, sz, strlen(sz)) != 0) return -1;
+    }
+    if (mb_append(b, l, c, " NIL ", 5) != 0) return -1;        /* md5 */
+    if (bs_disposition(b, l, c, msg + start, hdr_end - start) != 0) return -1;
+    return mb_append(b, l, c, " NIL NIL", 8);                  /* lang, loc */
+}
+
+int imapd_bodystructure(const char *msg, size_t len, char **out, size_t *outlen) {
+    char *b = NULL;
+    size_t bl = 0, bc = 0;
+    if (!msg || !out || !outlen) return -1;
+    *out = NULL;
+    *outlen = 0;
+    if (bs_part(&b, &bl, &bc, msg, len, 0, len) != 0) {
+        free(b);
+        return -1;
+    }
+    *out = b;
+    *outlen = bl;
+    return 0;
+}

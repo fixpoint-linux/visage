@@ -586,6 +586,69 @@ static void tls_test(void) {
     EXPECT(!imapd_addr_loopback("192.168.1.5"), "non-loopback 192.168.1.5");
 }
 
+static void bodystructure_test(void) {
+    /* single-part text/plain with a charset param */
+    {
+        const char *m = "Content-Type: text/plain; charset=utf-8\r\n"
+                        "Content-Transfer-Encoding: 7bit\r\n"
+                        "\r\nhello";
+        char *out = NULL; size_t len = 0;
+        int r = imapd_bodystructure(m, strlen(m), &out, &len);
+        EXPECT(r == 0 && out && strcmp(out,
+              "\"text\" \"plain\" (\"charset\" \"utf-8\") NIL NIL \"7bit\" 5 NIL NIL NIL NIL") == 0,
+              "bodystructure single text");
+        free(out);
+    }
+    /* multipart/alternative with an HTML part */
+    {
+        const char *m =
+            "Content-Type: multipart/alternative; boundary=X\r\n"
+            "\r\n"
+            "--X\r\n"
+            "Content-Type: text/plain\r\n"
+            "\r\n"
+            "plain\r\n"
+            "--X\r\n"
+            "Content-Type: text/html\r\n"
+            "\r\n"
+            "<b>hi</b>\r\n"
+            "--X--\r\n";
+        char *out = NULL; size_t len = 0;
+        int r = imapd_bodystructure(m, strlen(m), &out, &len);
+        EXPECT(r == 0 && out, "bodystructure multipart parses");
+        if (out)
+            EXPECT(strstr(out, "\"alternative\" NIL NIL NIL") != NULL &&
+                   strstr(out, "\"text\" \"plain\" NIL NIL NIL \"7BIT\" 5") != NULL &&
+                   strstr(out, "\"text\" \"html\" NIL NIL NIL \"7BIT\" 9") != NULL,
+                   "bodystructure multipart parts present");
+        free(out);
+    }
+    /* attachment with disposition */
+    {
+        const char *m =
+            "Content-Type: multipart/mixed; boundary=Y\r\n"
+            "\r\n"
+            "--Y\r\n"
+            "Content-Type: text/plain\r\n"
+            "\r\n"
+            "body\r\n"
+            "--Y\r\n"
+            "Content-Type: application/pdf; name=\"doc.pdf\"\r\n"
+            "Content-Disposition: attachment; filename=\"doc.pdf\"\r\n"
+            "Content-Transfer-Encoding: base64\r\n"
+            "\r\n"
+            "JVBERg==\r\n"
+            "--Y--\r\n";
+        char *out = NULL; size_t len = 0;
+        int r = imapd_bodystructure(m, strlen(m), &out, &len);
+        EXPECT(r == 0 && out, "bodystructure attachment parses");
+        if (out)
+            EXPECT(strstr(out, "(\"attachment\" (\"filename\" \"doc.pdf\"))") != NULL,
+                   "bodystructure attachment disposition present");
+        free(out);
+    }
+}
+
 int main(void) {
     char *root = mk_tmpdir();
 
@@ -596,6 +659,7 @@ int main(void) {
     b64_test();
     wildmat_test();
     tls_test();
+    bodystructure_test();
 
     if (root) {
         ImapdConfig cfg;

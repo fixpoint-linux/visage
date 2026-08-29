@@ -442,3 +442,7 @@ void imapd_imap_tls_reset(ImapdServer *srv, Conn *c);
 void imapd_ingest_tls_reset(ImapdServer *srv, Conn *c);
 
 #endif /* VISAGE_IMAPD_H */
+
+/* Build the RFC 3501 BODYSTRUCTURE string for a full message. Heap-allocates
+   *out (NUL-terminated); *outlen excludes the NUL. */
+int imapd_bodystructure(const char *msg, size_t len, char **out, size_t *outlen);

@@ -1456,7 +1456,8 @@ static void do_search(ImapdServer *srv, Conn *c, const char *tag,
 
 enum {
     FI_FLAGS = 0, FI_UID, FI_INTERNALDATE, FI_SIZE, FI_RFC822,
-    FI_HEADER, FI_TEXT, FI_BODY, FI_HF, FI_HFNOT, FI_ENVELOPE
+    FI_HEADER, FI_TEXT, FI_BODY, FI_HF, FI_HFNOT, FI_ENVELOPE,
+    FI_BODYSTRUCTURE
 };
 
 typedef struct FetchItem {
@@ -1648,8 +1649,12 @@ static int fetch_parse_items(const char **p, FetchItem **out, size_t *nout) {
             memset(&f, 0, sizeof f);
             f.kind = FI_ENVELOPE;
             if (item_push(&arr, &n, &cap, f) != 0) goto out;
-        } else if (ascii_ieq_str(tok, "BODYSTRUCTURE") ||
-                   ascii_ieq_str(tok, "BODY")) {
+        } else if (ascii_ieq_str(tok, "BODYSTRUCTURE")) {
+            FetchItem f;
+            memset(&f, 0, sizeof f);
+            f.kind = FI_BODYSTRUCTURE;
+            if (item_push(&arr, &n, &cap, f) != 0) goto out;
+        } else if (ascii_ieq_str(tok, "BODY")) {
             rc = -2;
             goto out;
         } else {
@@ -2070,6 +2075,34 @@ static int emit_item(ImapdServer *srv, Conn *c, FetchGen *g) {
         if (emit_envelope(g, m, &eb, &el, &ec) != 0) { free(eb); return -1; }
         r = gen_puts_buf(g, eb, el);
         free(eb);
+        return r;
+    }
+    case FI_BODYSTRUCTURE: {
+        char *msg = NULL, *bs = NULL;
+        size_t bslen = 0, got = 0;
+        int fd = -1, r;
+        if (m->size > 0) {
+            msg = malloc(m->size);
+            if (!msg) return -1;
+            fd = open(m->path, O_RDONLY);
+            if (fd < 0) { free(msg); return -1; }
+            while (got < m->size) {
+                ssize_t n = read(fd, msg + got, m->size - got);
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    break;
+                }
+                if (n == 0) break;
+                got += (size_t)n;
+            }
+            close(fd);
+        }
+        r = imapd_bodystructure(msg ? msg : "", got, &bs, &bslen);
+        free(msg);
+        if (r != 0) return -1;
+        r = gen_puts(g, "BODYSTRUCTURE ");
+        if (r == 0) r = gen_puts_buf(g, bs, bslen);
+        free(bs);
         return r;
     }
     default:
