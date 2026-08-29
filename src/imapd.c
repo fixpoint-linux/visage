@@ -332,7 +332,15 @@ static void server_poll(ImapdServer *srv) {
                 continue;
             }
             if (c->fg) {
-                if (rev & POLLOUT) imapd_fetch_pump(srv, c);
+                if (rev & POLLOUT) {
+                    imapd_fetch_pump(srv, c);
+                    /* The pump buffers output into c->out and only flushes
+                       when it reaches IMAPD_MAX_OUT/2; drain any remainder
+                       here or a full-but-unflushed buffer leaves poll()
+                       reporting POLLOUT forever and the loop spins at 100%
+                       CPU without ever sending. */
+                    conn_flush(c);
+                }
                 continue;
             }
             if (imapd_tls_pending(c)) {
