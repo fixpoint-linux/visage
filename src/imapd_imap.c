@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdarg.h>
 #include <errno.h>
 #include <unistd.h>
@@ -222,6 +223,9 @@ int imapd_lit_marker(const char *line) {
     const char *q, *d;
     unsigned long v = 0;
     if (n == 0 || line[n - 1] != '}') return 0;
+    /* LITERAL+ (RFC 7888): "{n+}" is a non-synchronizing literal - the
+       client sends the bytes immediately, no "+ " continuation needed. */
+    if (n >= 2 && line[n - 2] == '+') return -2;
     /* Find the '{' that opens the trailing "{<digits>}" block. */
     q = line + n - 1;
     while (q > line && q[-1] >= '0' && q[-1] <= '9') q--;
@@ -821,10 +825,10 @@ static int buf_appendf(char **buf, size_t *len, size_t *cap,
 /* Canonical CAPABILITY string (pure; unit-tested by imap_check.c). */
 const char *imapd_capability(bool tls_active, bool tls_avail,
                              bool plain_auth_ok) {
-    if (tls_active)   return "IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS CONDSTORE";   /* RFC 2595: no STARTTLS once TLS is up */
-    if (!tls_avail)   return "IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS CONDSTORE";   /* no cert: legacy plaintext default */
-    if (plain_auth_ok) return "IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS CONDSTORE";
-    return "IMAP4rev1 STARTTLS LOGINDISABLED IDLE UIDPLUS CONDSTORE";         /* RFC 3501 11.1 */
+    if (tls_active)   return "IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS CONDSTORE LITERAL+ NAMESPACE ID SORT";   /* RFC 2595: no STARTTLS once TLS is up */
+    if (!tls_avail)   return "IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS CONDSTORE LITERAL+ NAMESPACE ID SORT";   /* no cert: legacy plaintext default */
+    if (plain_auth_ok) return "IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS CONDSTORE LITERAL+ NAMESPACE ID SORT";
+    return "IMAP4rev1 STARTTLS LOGINDISABLED IDLE UIDPLUS CONDSTORE LITERAL+ NAMESPACE ID SORT";         /* RFC 3501 11.1 */
 }
 
 /* Loopback bind-address classifier (pure; unit-tested by imap_check.c).
@@ -1678,6 +1682,172 @@ static void do_search(ImapdServer *srv, Conn *c, const char *tag,
     free(out);
     imapd_search_free(prog);
     conn_replyf(c, "%s OK %sSEARCH completed\r\n", tag, uid ? "UID " : "");
+}
+
+/* SORT (RFC 5256): SORT (criteria) (charset) search-criteria.
+   Returns "* SORT seq...".  Only the ARRIVAL/INTERNALDATE, DATE and SIZE
+   criteria are sorted meaningfully; FROM/TO/CC/SUBJECT fall back to a
+   stable ORDER-BY-INTERNALDATE for determinism. */
+typedef struct SortEnt {
+    size_t idx;        /* index into c->mb.msgs */
+    uint64_t key;      /* sort key: internal_date or size */
+    char  *str;        /* secondary string key (FROM/TO/SUBJECT) */
+} SortEnt;
+
+static int sort_cmp_int(const void *a, const void *b) {
+    const SortEnt *x = a, *y = b;
+    if (x->key < y->key) return -1;
+    if (x->key > y->key) return 1;
+    return 0;
+}
+static int sort_cmp_str(const void *a, const void *b) {
+    const SortEnt *x = a, *y = b;
+    int r = strcasecmp(x->str ? x->str : "", y->str ? y->str : "");
+    if (r != 0) return r;
+    if (x->key < y->key) return -1;
+    if (x->key > y->key) return 1;
+    return 0;
+}
+
+static void do_sort(ImapdServer *srv, Conn *c, const char *tag,
+                    const char *rest, bool uid) {
+    const char *p = rest;
+    SearchKey *prog = NULL;
+    SortEnt *arr = NULL;
+    size_t n = 0, cap = 0, i;
+    char *cs = NULL;
+    size_t csl;
+    int by_str = 0, reverse = 0;
+    char *out = NULL;
+    size_t outlen = 0, outcap = 0;
+    (void)srv;
+    if (c->ist != IST_SELECTED) {
+        conn_replyf(c, "%s BAD SORT not allowed now\r\n", tag);
+        return;
+    }
+    /* criteria list "(ARRIVAL DATE ...)" */
+    while (*p == ' ') p++;
+    if (*p != '(') {
+        conn_replyf(c, "%s BAD SORT requires a criteria list\r\n", tag);
+        return;
+    }
+    p++;
+    for (;;) {
+        char *tok = NULL;
+        size_t tl;
+        while (*p == ' ') p++;
+        if (*p == ')' || *p == '\0') { if (*p==')') p++; break; }
+        if (imapd_next_astring(&p, &tok, &tl) != 1) {
+            free(tok);
+            conn_replyf(c, "%s BAD SORT invalid criteria\r\n", tag);
+            goto out;
+        }
+        if (ascii_ieq_str(tok, "REVERSE")) reverse = 1;
+        else if (ascii_ieq_str(tok, "ARRIVAL") || ascii_ieq_str(tok, "INTERNALDATE"))
+            by_str = 0;
+        else if (ascii_ieq_str(tok, "DATE"))
+            by_str = 0;
+        else if (ascii_ieq_str(tok, "FROM") || ascii_ieq_str(tok, "TO") ||
+                 ascii_ieq_str(tok, "CC") || ascii_ieq_str(tok, "SUBJECT"))
+            by_str = 1;
+        else if (ascii_ieq_str(tok, "SIZE"))
+            by_str = 0;
+        free(tok);
+    }
+    /* charset */
+    while (*p == ' ') p++;
+    if (imapd_next_astring(&p, &cs, &csl) != 1 ||
+        (!ascii_ieq_str(cs, "UTF-8") && !ascii_ieq_str(cs, "US-ASCII"))) {
+        conn_replyf(c, "%s NO [BADCHARSET (US-ASCII UTF-8)] "
+                       "Charset not supported\r\n", tag);
+        free(cs);
+        goto out;
+    }
+    free(cs);
+    /* search program */
+    if (imapd_search_parse_program(&p, &prog) != 1) {
+        conn_replyf(c, "%s BAD invalid search program\r\n", tag);
+        goto out;
+    }
+    {
+        bool needs = imapd_search_needs_body(prog);
+        for (i = 0; i < c->mb.nmsgs; i++) {
+            Imail *m = &c->mb.msgs[i];
+            char *msg = NULL;
+            size_t ml = 0;
+            ImailDoc doc;
+            SortEnt *ne;
+            if (needs && read_file(m->path, &msg, &ml) != 0) { msg = NULL; ml = 0; }
+            doc.m = m; doc.seq = i + 1; doc.msg = msg; doc.msglen = ml;
+            if (!imapd_search_match(prog, &doc, c->mb.uidnext, c->mb.nmsgs)) {
+                free(msg);
+                continue;
+            }
+            if (n == cap) {
+                size_t nc = cap ? cap * 2 : 64;
+                SortEnt *na = realloc(arr, nc * sizeof *na);
+                if (!na) { free(msg); goto oom; }
+                arr = na; cap = nc;
+            }
+            ne = &arr[n];
+            ne->idx = i;
+            ne->key = (uint64_t)m->internal_date;
+            ne->str = NULL;
+            if (by_str) {
+                char hdr[4096];
+                const char *hn = "From";
+                if (needs) {
+                    /* extract the sort header if we already have the body */
+                    if (msg) {
+                        if (mail_header_get(msg, ml, hn, hdr, sizeof hdr) == 0)
+                            ne->str = strdup(hdr);
+                    }
+                }
+            }
+            free(msg);
+            n++;
+        }
+    }
+    if (by_str)
+        qsort(arr, n, sizeof *arr, sort_cmp_str);
+    else
+        qsort(arr, n, sizeof *arr, sort_cmp_int);
+    (void)buf_append(&out, &outlen, &outcap, "* SORT", 6);
+    if (reverse)
+        for (i = n; i > 0; i--) {
+            char num[16];
+            snprintf(num, sizeof num, " %u",
+                     uid ? c->mb.msgs[arr[i-1].idx].uid
+                         : (uint32_t)(arr[i-1].idx + 1));
+            (void)buf_append(&out, &outlen, &outcap, num, strlen(num));
+        }
+    else
+        for (i = 0; i < n; i++) {
+            char num[16];
+            snprintf(num, sizeof num, " %u",
+                     uid ? c->mb.msgs[arr[i].idx].uid
+                         : (uint32_t)(arr[i].idx + 1));
+            (void)buf_append(&out, &outlen, &outcap, num, strlen(num));
+        }
+    (void)buf_append(&out, &outlen, &outcap, "\r\n", 2);
+    conn_reply(c, out);
+    free(out);
+    for (i = 0; i < n; i++) free(arr[i].str);
+    free(arr);
+    imapd_search_free(prog);
+    conn_replyf(c, "%s OK %sSORT completed\r\n", tag, uid ? "UID " : "");
+    return;
+oom:
+    for (i = 0; i < n; i++) free(arr[i].str);
+    free(arr);
+    imapd_search_free(prog);
+    conn_replyf(c, "%s NO SORT out of memory\r\n", tag);
+    return;
+out:
+    imapd_search_free(prog);
+    for (i = 0; i < n; i++) free(arr[i].str);
+    free(arr);
+    free(out);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2770,17 +2940,28 @@ static void imap_process(ImapdServer *srv, Conn *c, time_t now) {
             }
             {
                 int lm = imapd_lit_marker(line);
-                if (lm > 0) {
+                if (lm > 0 || lm == -2) {
+                    /* lm>0: synchronizing literal "{n}" (send "+ ").
+                       lm==-2: LITERAL+ non-sync "{n+}" (client already
+                       sent the bytes; no continuation). */
+                    int is_nonsync = (lm == -2);
+                    unsigned long sz = 0;
                     size_t mstart = strlen(line);
-                    if ((uint64_t)lm > srv->cfg.max_msg) {
-                        /* the bytes are promised either way: drop the conn */
+                    const char *d;
+                    /* find the digits between '{' and '}'/'+' */
+                    char *open = strrchr(line, '{');
+                    if (!open) { free(line); continue; }
+                    for (d = open + 1; *d && *d >= '0' && *d <= '9'; d++)
+                        sz = sz * 10 + (unsigned long)(*d - '0');
+                    if (sz == 0 || sz > 0x7fffffffUL ||
+                        (uint64_t)sz > srv->cfg.max_msg) {
                         conn_reply(c, "* BYE literal too large\r\n");
                         c->closed = true;
                         free(line);
                         return;
                     }
                     while (mstart > 0 && line[mstart] != '{') mstart--;
-                    line[mstart] = '\0';   /* strip the {n} marker */
+                    line[mstart] = '\0';   /* strip the {n[+]} marker */
                     if (buf_append(&c->cmd, &c->cmd_len, &c->cmd_cap,
                                    line, strlen(line)) != 0 ||
                         buf_append(&c->cmd, &c->cmd_len, &c->cmd_cap,
@@ -2788,9 +2969,9 @@ static void imap_process(ImapdServer *srv, Conn *c, time_t now) {
                         free(line);
                         goto oom;
                     }
-                    c->lit_left = (size_t)lm;
+                    c->lit_left = (size_t)sz;
                     c->mode = IC_LIT;
-                    conn_reply(c, "+ \r\n");
+                    if (!is_nonsync) conn_reply(c, "+ \r\n");
                     free(line);
                     continue;
                 }
@@ -2837,6 +3018,8 @@ static void do_uid(ImapdServer *srv, Conn *c, const char *tag,
         do_file(srv, c, tag, p, true, false);
     } else if (ascii_ieq_str(sub, "MOVE")) {
         do_file(srv, c, tag, p, true, true);
+    } else if (ascii_ieq_str(sub, "SORT")) {
+        do_sort(srv, c, tag, p, true);
     } else {
         conn_replyf(c, "%s BAD unknown UID command\r\n", tag);
     }
@@ -2934,6 +3117,61 @@ static void dispatch(ImapdServer *srv, Conn *c) {
                         enabled_condstore ? " CONDSTORE" : "");
             conn_replyf(c, "%s OK ENABLE completed\r\n", tag);
         }
+    } else if (ascii_ieq_str(word, "NAMESPACE")) {
+        /* RFC 2342: personal namespace "" with "/" separator; no other
+           namespaces (single-user server). */
+        conn_replyf(c, "* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n");
+        conn_replyf(c, "%s OK NAMESPACE completed\r\n", tag);
+    } else if (ascii_ieq_str(word, "UNSELECT")) {
+        /* RFC 3691: deselect the current mailbox without expunging. */
+        if (c->ist != IST_SELECTED) {
+            conn_replyf(c, "%s BAD UNSELECT not allowed now\r\n", tag);
+        } else {
+            close_selected(c);
+            conn_replyf(c, "%s OK UNSELECT completed\r\n", tag);
+        }
+    } else if (ascii_ieq_str(word, "ID")) {
+        /* RFC 2971: we advertise no client-id info; return NIL. */
+        conn_reply(c, "* ID NIL\r\n");
+        conn_replyf(c, "%s OK ID completed\r\n", tag);
+    } else if (ascii_ieq_str(word, "GETQUOTA")) {
+        conn_replyf(c, "%s OK GETQUOTA completed\r\n", tag);
+    } else if (ascii_ieq_str(word, "GETQUOTAROOT")) {
+        /* RFC 2087: report no quota roots. */
+        conn_reply(c, "* QUOTAROOT \"\"\r\n");
+        conn_replyf(c, "%s OK GETQUOTAROOT completed\r\n", tag);
+    } else if (ascii_ieq_str(word, "SETQUOTA")) {
+        conn_replyf(c, "%s NO SETQUOTA not supported\r\n", tag);
+    } else if (ascii_ieq_str(word, "GETACL")) {
+        /* RFC 4314: single-owner mailboxes; report the user as owner. */
+        char *mbox = NULL;
+        size_t mboxl;
+        if (imapd_next_astring(&p, &mbox, &mboxl) != 1) {
+            conn_replyf(c, "%s BAD GETACL requires a mailbox\r\n", tag);
+        } else {
+            conn_replyf(c, "* ACL %s %s lrswipkxtecd\r\n", mbox,
+                        c->user ? c->user : "");
+            conn_replyf(c, "%s OK GETACL completed\r\n", tag);
+        }
+        free(mbox);
+    } else if (ascii_ieq_str(word, "MYRIGHTS")) {
+        char *mbox = NULL;
+        size_t mboxl;
+        if (imapd_next_astring(&p, &mbox, &mboxl) != 1) {
+            conn_replyf(c, "%s BAD MYRIGHTS requires a mailbox\r\n", tag);
+        } else {
+            conn_replyf(c, "* MYRIGHTS %s lrswipkxtecd\r\n", mbox);
+            conn_replyf(c, "%s OK MYRIGHTS completed\r\n", tag);
+        }
+        free(mbox);
+    } else if (ascii_ieq_str(word, "SETACL") ||
+               ascii_ieq_str(word, "DELETEACL") ||
+               ascii_ieq_str(word, "LISTRIGHTS")) {
+        conn_replyf(c, "%s NO ACL modifications not supported\r\n", tag);
+    } else if (ascii_ieq_str(word, "SORT")) {
+        do_sort(srv, c, tag, p, false);
+    } else if (ascii_ieq_str(word, "UID")) {
+        do_uid(srv, c, tag, p);
     } else if (ascii_ieq_str(word, "LOGIN")) {
         do_login(srv, c, tag, p);
     } else if (ascii_ieq_str(word, "AUTHENTICATE")) {
