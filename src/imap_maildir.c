@@ -1428,7 +1428,7 @@ static int bs_multipart(char **b, size_t *l, size_t *c, const char *msg,
             pos = e;
         }
     }
-    if (mb_append(b, l, c, ") \"", 3) != 0) return -1;
+    if (mb_append(b, l, c, " \"", 2) != 0) return -1;
     if (mb_append(b, l, c, subtype, strlen(subtype)) != 0) return -1;
     if (mb_append(b, l, c, "\" ", 2) != 0) return -1;
     if (bs_ct_params(b, l, c, ctval, true) != 0) return -1;
