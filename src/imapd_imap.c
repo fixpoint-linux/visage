@@ -2943,11 +2943,11 @@ void imapd_imap_readable(ImapdServer *srv, Conn *c, time_t now) {
             int n = imapd_tls_recv(c, tmp, sizeof tmp);
             if (n < 0) { c->closed = true; return; }
             if (n == 0) {
-                /* mbedtls wants more TLS bytes but the peer has half-closed
-                   (FIN pending): keep the session from spinning the poll
-                   loop at 100% CPU on a connection that will never deliver
-                   a complete record. */
-                if (imapd_tls_eof(c)) c->closed = true;
+                /* mbedtls wants more TLS bytes; leave the connection open.
+                   (Do NOT treat a pending FIN as EOF here: MSG_PEEK on the
+                   raw socket can false-positive when mbedtls has buffered a
+                   whole record but poll also reports POLLIN, causing a
+                   graceful connection to be reset with an RST.) */
                 return;
             }
             c->last_act = now;

@@ -453,13 +453,6 @@ int  imapd_tls_handshake_step(Conn *c, time_t now);
    the peer closed (caller sets c->closed). */
 int  imapd_tls_recv(Conn *c, char *buf, size_t len);
 
-/* True when the raw fd has reached EOF (peer sent FIN) even though mbedtls
-   has not surfaced it as a TLS error yet.  Used to break a poll busy-loop:
-   a half-closed peer keeps poll() reporting POLLIN, but mbedtls_ssl_read
-   returns WANT_READ (0) forever on it, so the readable loop must close
-   explicitly or the daemon spins at 100% CPU. */
-bool imapd_tls_eof(const Conn *c);
-
 /* Encrypted write: >0 n plaintext bytes accepted, 0 socket would block
    (retry on POLLOUT), -1 fatal. */
 int  imapd_tls_send(Conn *c, const char *buf, size_t len);

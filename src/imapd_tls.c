@@ -211,23 +211,6 @@ int imapd_tls_recv(Conn *c, char *buf, size_t len) {
     return -1;
 }
 
-bool imapd_tls_eof(const Conn *c) {
-    char b;
-    ssize_t r;
-    if (!c->tls || c->tls->state != TLS_ESTABLISHED) return false;
-    /* MSG_PEEK does not consume; a 0 return means the peer's FIN has
-       reached us (half-closed), which mbedtls may not yet report as an
-       error when it is still waiting for a complete TLS record. */
-    for (;;) {
-        r = recv(c->fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return false;   /* EAGAIN = still open, no EOF yet */
-        }
-        return r == 0;
-    }
-}
-
 int imapd_tls_send(Conn *c, const char *buf, size_t len) {
     ImapdTls *t = c->tls;
     int r;
