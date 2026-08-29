@@ -208,7 +208,8 @@ T.append(target("dkim_check.com",
 
 # --- imapd.com (companion IMAP mailbox server; STARTTLS via mbedTLS) ---
 IMAPD_SRCS = ["src/imapd.c","src/imapd_ingest.c","src/imapd_imap.c",
-              "src/imapd_tls.c","src/imap_maildir.c","src/mail.c"]
+              "src/imapd_tls.c","src/imap_maildir.c","src/mail.c",
+              "src/pop3d.c"]
 IMAPD_HDRS = ["src/imapd.h","src/mail.h","src/visage.h"]
 T.append(target("imapd.com",
     deps=[STAMP] + IMAPD_SRCS + IMAPD_HDRS + [MBEDTLS_CONFIG],
@@ -263,8 +264,10 @@ T.append(target("bench",
     out=None))
 T.append(target("e2e",
     deps=["visage.com","config_check.com","tests/smtptest.com","tests/relay_fake.com",
-          "imapd.com","tests/imapd_tls.sh","tests/smtp_starttls.sh"],
-    recipe=["./tests/run.sh", "./tests/imapd_tls.sh", "./tests/smtp_starttls.sh"],
+          "imapd.com","tests/imapd_tls.sh","tests/pop3d_tls.sh",
+          "tests/smtp_starttls.sh"],
+    recipe=["./tests/run.sh", "./tests/imapd_tls.sh", "./tests/pop3d_tls.sh",
+            "./tests/smtp_starttls.sh"],
     out=None))
 T.append(target("gen-admin",
     deps=["tools/gen_admin_ui.sh"],

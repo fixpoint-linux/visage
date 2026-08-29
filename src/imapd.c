@@ -138,6 +138,12 @@ static void conn_destroy(Conn *c) {
         for (i = 0; i < c->nrcpts; i++) free(c->rcpts[i]);
         free(c->rcpts);
         free(c->data);
+    } else if (c->kind == CONN_POP3) {
+        imapd_pop3_free(c);
+        free(c->user);
+        free(c->pend_user);
+        free(c->del);
+        if (c->mb_open) imapd_mbox_close(&c->mb);
     } else {
         free(c->user);
         if (c->mb_open) imapd_mbox_close(&c->mb);
@@ -190,8 +196,10 @@ static void tls_advance(ImapdServer *srv, Conn *c, time_t now) {
            final flight and the first app bytes often land in one TCP
            segment, so POLLIN may never fire for them). */
         if (c->kind == CONN_INGEST) imapd_ingest_tls_reset(srv, c);
+        else if (c->kind == CONN_POP3) imapd_pop3_tls_reset(srv, c);
         else imapd_imap_tls_reset(srv, c);
         if (c->kind == CONN_INGEST) imapd_ingest_readable(srv, c, now);
+        else if (c->kind == CONN_POP3) imapd_pop3_readable(srv, c, now);
         else imapd_imap_readable(srv, c, now);
     }
 }
@@ -220,6 +228,11 @@ static void server_poll(ImapdServer *srv) {
                     c->out_len = c->out_off = 0;
                     continue;
                 }
+                if (c->kind == CONN_POP3) {
+                    /* RFC 1939: no mandated timeout message; just drop */
+                    c->closed = true;
+                    continue;
+                }
                 (void)buf_append(&c->out, &c->out_len, &c->out_cap,
                                  bye, strlen(bye));
                 conn_flush(c);
@@ -228,8 +241,8 @@ static void server_poll(ImapdServer *srv) {
         }
 
         /* build pollfd array: [0] ingest listener, [1] imap listener,
-           then conns */
-        nfds = 2 + srv->nconns;
+           [2] pop3 listener, then conns */
+        nfds = 3 + srv->nconns;
         if (nfds > pfds_cap) {
             free(pfds);
             pfds = malloc(nfds * sizeof *pfds);
@@ -242,26 +255,31 @@ static void server_poll(ImapdServer *srv) {
         pfds[1].fd = srv->listen_imap;
         pfds[1].events = POLLIN;
         pfds[1].revents = 0;
+        pfds[2].fd = srv->listen_pop3;
+        pfds[2].events = POLLIN;
+        pfds[2].revents = 0;
         for (i = 0; i < srv->nconns; i++) {
             Conn *c = srv->conns[i];
-            pfds[2 + i].fd = c->fd;
+            pfds[3 + i].fd = c->fd;
             if (!c->closed && imapd_tls_handshaking(c)) {
                 /* STARTTLS: PENDING drains the plaintext reply (POLLOUT);
                    the handshake polls whichever way mbedtls asked for last */
-                pfds[2 + i].events = imapd_tls_pending(c) ? POLLOUT
+                pfds[3 + i].events = imapd_tls_pending(c) ? POLLOUT
                                      : (imapd_tls_wants_write(c) ? POLLOUT
                                                                  : POLLIN);
             } else if (c->closed) {
-                pfds[2 + i].events = (c->out_off < c->out_len) ? POLLOUT : 0;
+                pfds[3 + i].events = (c->out_off < c->out_len) ? POLLOUT : 0;
+            } else if (c->kind == CONN_POP3 && c->pg) {
+                pfds[3 + i].events = POLLOUT;   /* POP3 stream owns the conn */
             } else if (c->fg) {
-                pfds[2 + i].events = POLLOUT;   /* fetch owns the conn */
+                pfds[3 + i].events = POLLOUT;   /* fetch owns the conn */
             } else {
                 /* backpressure: stop reading while the reply backlog is high */
-                pfds[2 + i].events =
+                pfds[3 + i].events =
                     (c->out_len < IMAPD_MAX_OUT / 2) ? POLLIN : 0;
-                if (c->out_off < c->out_len) pfds[2 + i].events |= POLLOUT;
+                if (c->out_off < c->out_len) pfds[3 + i].events |= POLLOUT;
             }
-            pfds[2 + i].revents = 0;
+            pfds[3 + i].revents = 0;
         }
 
         {
@@ -279,12 +297,18 @@ static void server_poll(ImapdServer *srv) {
             server_accept(srv, srv->listen_ingest, CONN_INGEST, now);
         if (pfds[1].revents & POLLIN)
             server_accept(srv, srv->listen_imap, CONN_IMAP, now);
+        if (pfds[2].revents & POLLIN)
+            server_accept(srv, srv->listen_pop3, CONN_POP3, now);
 
         for (i = 0; i < n_before; i++) {
             Conn *c = srv->conns[i];
-            short rev = pfds[2 + i].revents;
+            short rev = pfds[3 + i].revents;
             if (c->closed) {
                 if (rev & POLLOUT) conn_flush(c);
+                continue;
+            }
+            if (c->kind == CONN_POP3 && c->pg) {
+                if (rev & POLLOUT) imapd_pop3_pump(srv, c);
                 continue;
             }
             if (c->fg) {
@@ -309,6 +333,8 @@ static void server_poll(ImapdServer *srv) {
             if (rev & (POLLIN | POLLHUP | POLLERR)) {
                 if (c->kind == CONN_INGEST)
                     imapd_ingest_readable(srv, c, now);
+                else if (c->kind == CONN_POP3)
+                    imapd_pop3_readable(srv, c, now);
                 else
                     imapd_imap_readable(srv, c, now);
             }
@@ -339,16 +365,17 @@ static void server_accept(ImapdServer *srv, int lfd, int kind, time_t now) {
         const char *busy = (kind == CONN_INGEST)
             ? "421 4.7.0 Too many connections\r\n"
             : "* BYE too many connections\r\n";
-
         if (fd < 0) {
             if (errno == EINTR) continue;
             return;   /* EAGAIN/EWOULDBLOCK or error */
         }
         set_nonblock(fd);
 
-        /* connection limits are enforced BEFORE any greeting */
+        /* connection limits are enforced BEFORE any greeting; POP3 gets no
+           message (RFC 1939 has no busy reply), just a silent close */
         if (srv->nconns >= IMAPD_MAX_CONNS) {
-            (void)send(fd, busy, strlen(busy), MSG_NOSIGNAL);
+            if (kind != CONN_POP3)
+                (void)send(fd, busy, strlen(busy), MSG_NOSIGNAL);
             close(fd);
             continue;
         }
@@ -358,7 +385,8 @@ static void server_accept(ImapdServer *srv, int lfd, int kind, time_t now) {
             (void)peer_ip_of(&sa, salen, ip, &iplen);
             if (iplen != 0 &&
                 count_peer_conns(srv, ip, iplen) >= IMAPD_MAX_CONNS_PER_IP) {
-                (void)send(fd, busy, strlen(busy), MSG_NOSIGNAL);
+                if (kind != CONN_POP3)
+                    (void)send(fd, busy, strlen(busy), MSG_NOSIGNAL);
                 close(fd);
                 continue;
             }
@@ -370,6 +398,7 @@ static void server_accept(ImapdServer *srv, int lfd, int kind, time_t now) {
         c->kind = kind;
         c->st = ST_INIT;
         c->ist = IST_NOT_AUTH;
+        c->pst = PO_AUTH;
         c->last_act = now;
         (void)peer_ip_of(&sa, salen, c->peer_ip, &c->peer_ip_len);
 
@@ -384,6 +413,8 @@ static void server_accept(ImapdServer *srv, int lfd, int kind, time_t now) {
 
         if (kind == CONN_INGEST)
             imapd_ingest_greeting(srv, c);
+        else if (kind == CONN_POP3)
+            imapd_pop3_greeting(srv, c);
         else
             imapd_imap_greeting(srv, c);
     }
@@ -454,6 +485,9 @@ static void config_defaults(ImapdConfig *cfg) {
     cfg->imap_addr = env_or("IMAPD_IMAP_ADDR", "127.0.0.1");
     cfg->imap_port = (uint16_t)env_num("IMAPD_IMAP_PORT",
                                        IMAPD_DEFAULT_IMAP_PORT);
+    cfg->pop3_addr = env_or("IMAPD_POP3_ADDR", "127.0.0.1");
+    cfg->pop3_port = (uint16_t)env_num("IMAPD_POP3_PORT",
+                                       IMAPD_DEFAULT_POP3_PORT);
     cfg->hostname = env_or("IMAPD_HOSTNAME", "localhost");
     cfg->max_msg = (uint32_t)env_num("IMAPD_MAX_MSG", IMAPD_DEFAULT_MAX_MSG);
     cfg->cmd_tmo = IMAPD_DEFAULT_CMD_TMO;
@@ -486,6 +520,7 @@ static int config_from_args(ImapdConfig *cfg, int argc, char **argv,
     if ((v = find_arg(argc, argv, "--root"))) cfg->root = v;
     if ((v = find_arg(argc, argv, "--ingest-addr"))) cfg->ingest_addr = v;
     if ((v = find_arg(argc, argv, "--imap-addr"))) cfg->imap_addr = v;
+    if ((v = find_arg(argc, argv, "--pop3-addr"))) cfg->pop3_addr = v;
     if ((v = find_arg(argc, argv, "--hostname"))) cfg->hostname = v;
     if ((v = find_arg(argc, argv, "--cert"))) cfg->cert = v;
     if ((v = find_arg(argc, argv, "--key"))) cfg->key = v;
@@ -493,6 +528,8 @@ static int config_from_args(ImapdConfig *cfg, int argc, char **argv,
         parse_u16(v, &cfg->ingest_port) != 0) return -1;
     if ((v = find_arg(argc, argv, "--imap-port")) &&
         parse_u16(v, &cfg->imap_port) != 0) return -1;
+    if ((v = find_arg(argc, argv, "--pop3-port")) &&
+        parse_u16(v, &cfg->pop3_port) != 0) return -1;
     if ((v = find_arg(argc, argv, "--max-msg"))) {
         unsigned long n;
         char *end;
@@ -521,15 +558,18 @@ static void usage(FILE *f) {
         "                       set visage's relay.host/port to this)\n"
         "  --imap-addr ADDR     IMAP bind address (IMAPD_IMAP_ADDR)\n"
         "  --imap-port N        IMAP port (IMAPD_IMAP_PORT, default %u)\n"
+        "  --pop3-addr ADDR     POP3 bind address (IMAPD_POP3_ADDR)\n"
+        "  --pop3-port N        POP3 port (IMAPD_POP3_PORT, default %u)\n"
         "  --hostname H         greeted hostname (IMAPD_HOSTNAME)\n"
         "  --max-msg BYTES      max message size (IMAPD_MAX_MSG, default %u)\n"
         "  --cert PATH          TLS certificate PEM (IMAPD_CERT; with --key,\n"
-        "                       enables STARTTLS on both listeners)\n"
+        "                       enables STARTTLS on all listeners)\n"
         "  --key PATH           TLS private key PEM (IMAPD_KEY)\n"
         "  --help               show this help and exit\n"
         "  --version            print the version and exit\n",
         IMAPD_DEFAULT_ROOT, IMAPD_DEFAULT_INGEST_PORT,
-        IMAPD_DEFAULT_IMAP_PORT, IMAPD_DEFAULT_MAX_MSG);
+        IMAPD_DEFAULT_IMAP_PORT, IMAPD_DEFAULT_POP3_PORT,
+        IMAPD_DEFAULT_MAX_MSG);
 }
 
 static int cmd_passwd(ImapdConfig *cfg, int argc, char **argv) {
@@ -614,16 +654,26 @@ int main(int argc, char **argv) {
                 cfg.imap_addr, cfg.imap_port);
         return 1;
     }
+    srv.listen_pop3 = make_listener(cfg.pop3_addr, cfg.pop3_port);
+    if (srv.listen_pop3 < 0) {
+        fprintf(stderr, "imapd: cannot listen on %s:%u\n",
+                cfg.pop3_addr, cfg.pop3_port);
+        return 1;
+    }
 
     /* STARTTLS: load cert/key (fail-closed => exit) and pin the RFC 3501
-       11.1 gating bind (cleartext auth only on loopback when TLS is on). */
+       11.1 / RFC 2595 gating binds (cleartext auth only on loopback when
+       TLS is on). */
     srv.imap_loopback = imapd_addr_loopback(cfg.imap_addr);
+    srv.pop3_loopback = imapd_addr_loopback(cfg.pop3_addr);
     if (imapd_tls_global_init(&srv) != 0) return 1;
 
-    printf("imapd %s: smtp ingest on %s:%u, imap on %s:%u, root %s, tls %s\n",
+    printf("imapd %s: smtp ingest on %s:%u, imap on %s:%u, pop3 on %s:%u, "
+           "root %s, tls %s\n",
            VISAGE_VERSION,
            cfg.ingest_addr, cfg.ingest_port,
-           cfg.imap_addr, cfg.imap_port, cfg.root,
+           cfg.imap_addr, cfg.imap_port,
+           cfg.pop3_addr, cfg.pop3_port, cfg.root,
            srv.tls_ready ? "on (STARTTLS)" : "off");
     fflush(stdout);
 
@@ -631,5 +681,6 @@ int main(int argc, char **argv) {
 
     close(srv.listen_ingest);
     close(srv.listen_imap);
+    close(srv.listen_pop3);
     return 0;
 }

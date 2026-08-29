@@ -24,6 +24,8 @@ PORT_BASE="${IMAPD_TLS_PORT_BASE:-14430}"
 IMAP_A=$((PORT_BASE));      INGEST_A=$((PORT_BASE + 1))
 IMAP_B=$((PORT_BASE + 2));  INGEST_B=$((PORT_BASE + 3))
 IMAP_D=$((PORT_BASE + 4));  INGEST_D=$((PORT_BASE + 5))
+POP3_A=$((PORT_BASE + 6));  POP3_B=$((PORT_BASE + 7))
+POP3_D=$((PORT_BASE + 8))
 CERT=tests/visage-test-cert.pem
 KEY=tests/visage-test-key.pem
 
@@ -67,13 +69,14 @@ start_daemon() {   # start_daemon ROOT LOG EXTRA_ARGS...
 # ---- instances ----
 start_daemon "$ROOT_A" "$TMP/a.log" \
     --cert "$CERT" --key "$KEY" --hostname imap.test \
-    --imap-port "$IMAP_A" --ingest-port "$INGEST_A"
+    --imap-port "$IMAP_A" --ingest-port "$INGEST_A" --pop3-port "$POP3_A"
 start_daemon "$ROOT_B" "$TMP/b.log" \
     --cert "$CERT" --key "$KEY" --hostname imap.test \
-    --imap-addr 0.0.0.0 --imap-port "$IMAP_B" --ingest-port "$INGEST_B"
+    --imap-addr 0.0.0.0 --imap-port "$IMAP_B" --ingest-port "$INGEST_B" \
+    --pop3-addr 0.0.0.0 --pop3-port "$POP3_B"
 start_daemon "$ROOT_D" "$TMP/d.log" \
     --hostname imap.test \
-    --imap-port "$IMAP_D" --ingest-port "$INGEST_D"
+    --imap-port "$IMAP_D" --ingest-port "$INGEST_D" --pop3-port "$POP3_D"
 
 wait_port "$IMAP_A" "imap A"
 wait_port "$INGEST_A" "ingest A"
@@ -82,7 +85,7 @@ wait_port "$IMAP_D" "imap D"
 
 # ---- (0) fail-closed: cert without key must refuse to start ----
 if ./imapd.com --root "$TMP/bad" --cert "$CERT" \
-        --imap-port "$IMAP_D" --ingest-port "$INGEST_D" \
+        --imap-port "$IMAP_D" --ingest-port "$INGEST_D" --pop3-port "$POP3_D" \
         >"$TMP/bad.log" 2>&1; then
     fail "cert without key must exit nonzero"
 else

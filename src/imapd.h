@@ -53,6 +53,7 @@
 #define IMAPD_DEFAULT_ROOT        "./var/mail"
 #define IMAPD_DEFAULT_INGEST_PORT 2526   /* config.example.dhall relay target */
 #define IMAPD_DEFAULT_IMAP_PORT   143
+#define IMAPD_DEFAULT_POP3_PORT   110
 #define IMAPD_DEFAULT_MAX_MSG     (32u * 1024u * 1024u)
 #define IMAPD_DEFAULT_CMD_TMO     300
 #define IMAPD_DEFAULT_DATA_TMO    600
@@ -72,6 +73,8 @@ typedef struct ImapdConfig {
     uint16_t    ingest_port;
     const char *imap_addr;    /* IMAP bind address */
     uint16_t    imap_port;
+    const char *pop3_addr;    /* POP3 bind address */
+    uint16_t    pop3_port;
     const char *hostname;     /* greeted hostname */
     uint32_t    max_msg;      /* max message bytes (ingest + APPEND) */
     uint32_t    cmd_tmo;      /* idle timeout, seconds */
@@ -153,19 +156,25 @@ typedef struct ImapdServer {
     size_t      ncreds;
     int         listen_ingest;   /* SMTP ingest listener */
     int         listen_imap;     /* IMAP listener */
+    int         listen_pop3;     /* POP3 listener */
     struct Conn **conns;
     size_t      nconns, conn_cap;
     bool        tls_ready;       /* cert+key loaded: STARTTLS is offered  */
     bool        imap_loopback;   /* IMAP listener bound to a loopback addr */
+    bool        pop3_loopback;   /* POP3 listener bound to a loopback addr */
 } ImapdServer;
 
 typedef struct FetchGen FetchGen;   /* opaque: imapd_imap.c */
+typedef struct Pop3Gen  Pop3Gen;    /* opaque: pop3d.c */
 typedef struct ImapdTls ImapdTls;   /* opaque: imapd_tls.c (mbedTLS) */
 
 /* Session states. */
 enum { IST_NOT_AUTH = 0, IST_AUTH, IST_SELECTED };
 
-enum { CONN_INGEST = 0, CONN_IMAP };
+enum { CONN_INGEST = 0, CONN_IMAP, CONN_POP3 };
+
+/* POP3 session states (RFC 1939). */
+enum { PO_AUTH = 0, PO_TRANS };
 
 /* Ingest SMTP session states (mirroring smtp_in.c). */
 enum { ST_INIT = 0, ST_HELO, ST_MAIL, ST_DATA };
@@ -206,6 +215,12 @@ typedef struct Conn {
     size_t cmd_len, cmd_cap;
     FetchGen *fg;              /* active streaming FETCH (owned) */
     ImapdTls *tls;             /* STARTTLS state (NULL = plaintext conn)  */
+    /* pop3-only (kind == CONN_POP3) */
+    int    pst;                /* PO_AUTH / PO_TRANS */
+    char  *pend_user;          /* USER from authorization (owned) */
+    bool  *del;                /* deleted marks, len = mb.nmsgs (owned) */
+    size_t ndel;               /* count of marked-deleted messages */
+    Pop3Gen *pg;               /* active streaming RETR/TOP (owned) */
 } Conn;
 
 /* ------------------------------------------------------------------ */
@@ -372,17 +387,24 @@ int imapd_main(ImapdServer *srv);   /* daemon: bind + poll loop */
 /* Queue the greeting on a freshly accepted connection. */
 void imapd_ingest_greeting(ImapdServer *srv, Conn *c);
 void imapd_imap_greeting(ImapdServer *srv, Conn *c);
+void imapd_pop3_greeting(ImapdServer *srv, Conn *c);
 
 /* Feed readable bytes into the state machine (also drains pending output).
    Both close c->closed on fatal errors; the caller handles the rest. */
 void imapd_ingest_readable(ImapdServer *srv, Conn *c, time_t now);
 void imapd_imap_readable(ImapdServer *srv, Conn *c, time_t now);
+void imapd_pop3_readable(ImapdServer *srv, Conn *c, time_t now);
 
 /* Generate more of an active streaming FETCH into c->out (POLLOUT drain). */
 void imapd_fetch_pump(ImapdServer *srv, Conn *c);
 
 /* Free a streaming FETCH generator (NULL-safe). */
 void imapd_fetch_free(Conn *c);
+
+/* POP3 (pop3d.c) */
+void imapd_pop3_tls_reset(ImapdServer *srv, Conn *c);
+void imapd_pop3_pump(ImapdServer *srv, Conn *c);
+void imapd_pop3_free(Conn *c);
 
 /* ------------------------------------------------------------------ */
 /* STARTTLS (imapd_tls.c; mbedTLS SERVER role over the non-block fds).  */
