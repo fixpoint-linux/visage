@@ -2270,8 +2270,13 @@ static int emit_item(ImapdServer *srv, Conn *c, FetchGen *g) {
 }
 
 /* Move up to one chunk of the pending literal straight into c->out. */
+static void gen_flush(Conn *c, FetchGen *g);
 static void stream_lit(Conn *c, FetchGen *g) {
     char chunk[16384];
+    /* emit_item left the "BODY[...] {N}\r\n" header in the gen buffer; it
+       must go out BEFORE the literal bytes, or the response has no framing
+       and clients abort on the raw content. */
+    gen_flush(c, g);
     while (g->lit_left > 0) {
         size_t used = c->out_len - c->out_off;
         size_t room, want, got = 0;
