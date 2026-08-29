@@ -1456,7 +1456,7 @@ static void do_search(ImapdServer *srv, Conn *c, const char *tag,
 
 enum {
     FI_FLAGS = 0, FI_UID, FI_INTERNALDATE, FI_SIZE, FI_RFC822,
-    FI_HEADER, FI_TEXT, FI_BODY, FI_HF, FI_HFNOT
+    FI_HEADER, FI_TEXT, FI_BODY, FI_HF, FI_HFNOT, FI_ENVELOPE
 };
 
 typedef struct FetchItem {
@@ -1643,8 +1643,12 @@ static int fetch_parse_items(const char **p, FetchItem **out, size_t *nout) {
             if (item_push(&arr, &n, &cap, f) != 0) goto out;
             f.kind = FI_SIZE;
             if (item_push(&arr, &n, &cap, f) != 0) goto out;
-        } else if (ascii_ieq_str(tok, "ENVELOPE") ||
-                   ascii_ieq_str(tok, "BODYSTRUCTURE") ||
+        } else if (ascii_ieq_str(tok, "ENVELOPE")) {
+            FetchItem f;
+            memset(&f, 0, sizeof f);
+            f.kind = FI_ENVELOPE;
+            if (item_push(&arr, &n, &cap, f) != 0) goto out;
+        } else if (ascii_ieq_str(tok, "BODYSTRUCTURE") ||
                    ascii_ieq_str(tok, "BODY")) {
             rc = -2;
             goto out;
@@ -1917,6 +1921,125 @@ static void fetch_set_seen(ImapdServer *srv, Conn *c, const FetchItem *it,
 
 /* Emit one item: small values go to the gen buffer; large literals switch
    the generator into its streaming phase. */
+/* --- ENVELOPE (RFC 3501) ----------------------------------------------- */
+
+/* nstring from a byte slice: quoted string, or NIL when empty. */
+static int env_nstr(char **b, size_t *l, size_t *c, const char *s, size_t n) {
+    size_t i;
+    if (n == 0) return buf_append(b, l, c, "NIL", 3);
+    if (buf_append(b, l, c, "\"", 1) != 0) return -1;
+    for (i = 0; i < n; i++) {
+        char ch = s[i];
+        if (ch == '"' || ch == '\\')
+            if (buf_append(b, l, c, "\\", 1) != 0) return -1;
+        if (buf_append(b, l, c, &ch, 1) != 0) return -1;
+    }
+    return buf_append(b, l, c, "\"", 1);
+}
+
+/* One address "[(name) NIL mailbox host]". Handles "Name <a@b>" and bare
+   "a@b"; no routes (adl=NIL), no group syntax in v1. */
+static int env_addr(char **b, size_t *l, size_t *c, const char *a,
+                    const char *aend) {
+    const char *p, *lt = NULL, *at = NULL;
+    const char *mail, *dom;
+    if (buf_append(b, l, c, "(", 1) != 0) return -1;
+    for (p = a; p < aend; p++) if (*p == '<') lt = p;
+    if (lt) {
+        const char *gt = lt + 1, *ns = a, *ne = lt;
+        while (gt < aend && *gt != '>') gt++;
+        if (gt >= aend) return -1;
+        while (ns < ne && (*ns == ' ' || *ns == '\t')) ns++;
+        while (ne > ns && (ne[-1] == ' ' || ne[-1] == '\t')) ne--;
+        if (ns < ne && *ns == '"' && ne[-1] == '"') { ns++; ne--; }
+        if (ns < ne) {
+            if (env_nstr(b, l, c, ns, (size_t)(ne - ns)) != 0) return -1;
+        } else if (buf_append(b, l, c, "NIL", 3) != 0) return -1;
+        if (buf_append(b, l, c, " NIL ", 5) != 0) return -1;
+        mail = lt + 1; dom = gt;
+    } else {
+        if (buf_append(b, l, c, "NIL NIL ", 8) != 0) return -1;
+        mail = a; dom = aend;
+    }
+    for (p = mail; p < dom; p++) if (*p == '@') at = p;
+    if (at) {
+        if (env_nstr(b, l, c, mail, (size_t)(at - mail)) != 0) return -1;
+        if (buf_append(b, l, c, " ", 1) != 0) return -1;
+        if (env_nstr(b, l, c, at + 1, (size_t)(dom - (at + 1))) != 0) return -1;
+    } else {
+        if (env_nstr(b, l, c, mail, (size_t)(dom - mail)) != 0) return -1;
+        if (buf_append(b, l, c, " NIL", 4) != 0) return -1;
+    }
+    return buf_append(b, l, c, ")", 1);
+}
+
+/* Address-list -> "( (addr) (addr) ... )" (NIL-safe). Splits on top-level
+   commas (ignoring those inside quoted strings / <angle>). */
+static int env_addrlist(char **b, size_t *l, size_t *c, const char *val) {
+    const char *start, *p;
+    int count = 0, inq = 0, inang = 0;
+    if (buf_append(b, l, c, "(", 1) != 0) return -1;
+    if (!val) return buf_append(b, l, c, ")", 1);
+    start = val;
+    for (p = val;; p++) {
+        char ch = *p;
+        if (ch == '\0' || (ch == ',' && !inq && !inang)) {
+            const char *e = p;
+            while (e > start && (e[-1] == ' ' || e[-1] == '\t')) e--;
+            if (e > start) {
+                if (count && buf_append(b, l, c, " ", 1) != 0) return -1;
+                if (env_addr(b, l, c, start, e) != 0) return -1;
+                count++;
+            }
+            if (ch == '\0') break;
+            start = p + 1;
+        } else if (ch == '"' && !inang) {
+            inq = !inq;
+        } else if (ch == '<' && !inq) {
+            inang = 1;
+        } else if (ch == '>' && inang) {
+            inang = 0;
+        }
+    }
+    return buf_append(b, l, c, ")", 1);
+}
+
+/* Build the full ENVELOPE (...) response for a message. */
+static int emit_envelope(FetchGen *g, Imail *m, char **out, size_t *ol,
+                         size_t *oc) {
+    static const char *alist[6] = {
+        "From", "Sender", "Reply-To", "To", "Cc", "Bcc" };
+    char val[4096];
+    int i;
+    if (ensure_hdr(g, m) != 0) return -1;
+    if (buf_appendf(out, ol, oc, "ENVELOPE (") != 0) return -1;
+    if (mail_header_get(g->hdrbuf, g->hdr_end, "Date", val, sizeof val) == 0)
+        (void)env_nstr(out, ol, oc, val, strlen(val));
+    else if (buf_append(out, ol, oc, "NIL", 3) != 0) return -1;
+    if (buf_append(out, ol, oc, " ", 1) != 0) return -1;
+    if (mail_header_get(g->hdrbuf, g->hdr_end, "Subject", val, sizeof val) == 0)
+        (void)env_nstr(out, ol, oc, val, strlen(val));
+    else if (buf_append(out, ol, oc, "NIL", 3) != 0) return -1;
+    for (i = 0; i < 6; i++) {
+        if (buf_append(out, ol, oc, " ", 1) != 0) return -1;
+        if (mail_header_get(g->hdrbuf, g->hdr_end, alist[i], val,
+                            sizeof val) == 0)
+            (void)env_addrlist(out, ol, oc, val);
+        else if (buf_append(out, ol, oc, "NIL", 3) != 0) return -1;
+    }
+    if (buf_append(out, ol, oc, " ", 1) != 0) return -1;
+    if (mail_header_get(g->hdrbuf, g->hdr_end, "In-Reply-To", val,
+                        sizeof val) == 0)
+        (void)env_nstr(out, ol, oc, val, strlen(val));
+    else if (buf_append(out, ol, oc, "NIL", 3) != 0) return -1;
+    if (buf_append(out, ol, oc, " ", 1) != 0) return -1;
+    if (mail_header_get(g->hdrbuf, g->hdr_end, "Message-ID", val,
+                        sizeof val) == 0)
+        (void)env_nstr(out, ol, oc, val, strlen(val));
+    else if (buf_append(out, ol, oc, "NIL", 3) != 0) return -1;
+    return buf_append(out, ol, oc, ")", 1);
+}
+
 static int emit_item(ImapdServer *srv, Conn *c, FetchGen *g) {
     Imail *m = &c->mb.msgs[g->msgs[g->msg_i]];
     FetchItem *it = &g->items[g->item_i];
@@ -1940,6 +2063,15 @@ static int emit_item(ImapdServer *srv, Conn *c, FetchGen *g) {
     }
     case FI_SIZE:
         return gen_printf(g, "RFC822.SIZE %zu", m->size);
+    case FI_ENVELOPE: {
+        char *eb = NULL;
+        size_t el = 0, ec = 0;
+        int r;
+        if (emit_envelope(g, m, &eb, &el, &ec) != 0) { free(eb); return -1; }
+        r = gen_puts_buf(g, eb, el);
+        free(eb);
+        return r;
+    }
     default:
         break;
     }
