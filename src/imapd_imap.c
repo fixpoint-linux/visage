@@ -31,6 +31,28 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+
+/* Debug tracing: enabled by IMAPD_DEBUG=1.  Logs every IMAP command and
+   every connection close to stderr (systemd journal), so a client's exact
+   command sequence and the moment a connection is dropped are visible. */
+static int imapd_debug_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("IMAPD_DEBUG");
+        v = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return v;
+}
+static void imapd_dbg(const char *fmt, ...) {
+    va_list ap;
+    if (!imapd_debug_on()) return;
+    fprintf(stderr, "imapd ");
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/stat.h>
@@ -427,6 +449,18 @@ int imapd_search_parse(const char **p, SearchKey **out) {
         k = sk_new(SK_TEXT);
     } else if (ascii_ieq_str(tok, "HEADER")) {
         k = sk_new(SK_HEADER);
+    } else if (ascii_ieq_str(tok, "SINCE")) {
+        k = sk_new(SK_SINCE);
+    } else if (ascii_ieq_str(tok, "BEFORE")) {
+        k = sk_new(SK_BEFORE);
+    } else if (ascii_ieq_str(tok, "ON")) {
+        k = sk_new(SK_ON);
+    } else if (ascii_ieq_str(tok, "SENTSINCE")) {
+        k = sk_new(SK_SENTSINCE);
+    } else if (ascii_ieq_str(tok, "SENTBEFORE")) {
+        k = sk_new(SK_SENTBEFORE);
+    } else if (ascii_ieq_str(tok, "SENTON")) {
+        k = sk_new(SK_SENTON);
     } else if (ascii_ieq_str(tok, "NOT")) {
         k = sk_new(SK_NOT);
     } else if (ascii_ieq_str(tok, "OR")) {
@@ -482,6 +516,51 @@ int imapd_search_parse(const char **p, SearchKey **out) {
         }
         k->hdr = hdr;
         k->str = str;
+        break;
+    }
+    case SK_SINCE:
+    case SK_BEFORE:
+    case SK_ON:
+    case SK_SENTSINCE:
+    case SK_SENTBEFORE:
+    case SK_SENTON: {
+        /* Parse a "dd-Mon-yyyy" date into a UTC time_t at midnight. */
+        char *ds = NULL;
+        size_t dl;
+        int dd = 0, yy = 0;
+        char mon[4] = {0};
+        static const char *mons[12] = { "Jan","Feb","Mar","Apr","May","Jun",
+            "Jul","Aug","Sep","Oct","Nov","Dec" };
+        int mi = -1, j;
+        r = imapd_next_astring(p, &ds, &dl);
+        if (r != 1 ||
+            sscanf(ds, "%2d-%3s-%4d", &dd, mon, &yy) != 3) {
+            free(ds);
+            imapd_search_free(k);
+            free(tok);
+            return -1;
+        }
+        for (j = 0; j < 12; j++)
+            if (ascii_ieq_str(mon, mons[j])) { mi = j; break; }
+        if (mi < 0 || dd < 1 || dd > 31 || yy < 1970) {
+            free(ds);
+            imapd_search_free(k);
+            free(tok);
+            return -1;
+        }
+        /* days from epoch to Jan 1 of `yy`, then add day-of-year */
+        {
+            long y = yy - 1900;
+            long days = 365 * (y - 70) + (y - 69 + (yy % 4 == 0)) / 4
+                        - ((yy % 100 == 0) ? ((yy - 70 + 99) / 100) : 0)
+                        + ((yy % 400 == 0) ? ((yy - 70 + 399) / 400) : 0);
+            static const int mdays[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+            int dm = 0, leap = (yy % 4 == 0 && yy % 100 != 0) || yy % 400 == 0;
+            for (j = 0; j < mi; j++) dm += mdays[j];
+            if (leap && mi > 1) dm++;
+            k->date = (time_t)((days + dm + (dd - 1)) * 86400L);
+        }
+        free(ds);
         break;
     }
     case SK_NOT:
@@ -606,6 +685,24 @@ bool imapd_search_match(const SearchKey *k, const ImailDoc *d,
     case SK_TEXT:
         if (!d->msg) return false;
         return ci_strstr(d->msg, d->msglen, k->str) != NULL;
+    /* Date keys: compare the message's internal date (UTC midnight) against
+       the search date.  SINCE/ON/BEFORE and SENT* are both matched on the
+       internal date here (the maildir migration stored each message's
+       original date as its internal date, so they are equivalent). */
+    case SK_SINCE:
+        return d->m->internal_date >= k->date;
+    case SK_ON:
+        return d->m->internal_date >= k->date &&
+               d->m->internal_date < k->date + 86400;
+    case SK_BEFORE:
+        return d->m->internal_date < k->date;
+    case SK_SENTSINCE:
+        return d->m->internal_date >= k->date;
+    case SK_SENTON:
+        return d->m->internal_date >= k->date &&
+               d->m->internal_date < k->date + 86400;
+    case SK_SENTBEFORE:
+        return d->m->internal_date < k->date;
     case SK_NOT:
         return !imapd_search_match(k->a, d, uidnext, nmsgs);
     case SK_OR:
@@ -2778,6 +2875,9 @@ static void dispatch(ImapdServer *srv, Conn *c) {
         goto out;
     }
     while (*p == ' ') p++;
+
+    imapd_dbg("CMD user=%s tag=%s word=%s rest=%s",
+              c->user ? c->user : "(preauth)", tag, word, p);
 
     if (ascii_ieq_str(word, "CAPABILITY")) {
         conn_replyf(c, "* CAPABILITY %s\r\n", cap_of(srv, c));

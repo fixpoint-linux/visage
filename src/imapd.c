@@ -131,6 +131,10 @@ static size_t count_peer_conns(const ImapdServer *srv, const unsigned char *ip,
 
 static void conn_destroy(Conn *c) {
     size_t i;
+    if (c->kind == CONN_IMAP && getenv("IMAPD_DEBUG") &&
+        getenv("IMAPD_DEBUG")[0] && getenv("IMAPD_DEBUG")[0] != '0')
+        fprintf(stderr, "imapd CLOSE user=%s kind=%d out_len=%zu out_off=%zu\n",
+                c->user ? c->user : "(preauth)", c->kind, c->out_len, c->out_off);
     imapd_tls_conn_free(c);   /* close_notify while the fd is still open */
     if (c->fd >= 0) close(c->fd);
     if (c->kind == CONN_INGEST) {
