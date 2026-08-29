@@ -184,6 +184,7 @@ typedef struct Conn {
     time_t last_act;           /* last activity (idle-timeout clock) */
     unsigned char peer_ip[16];  /* peer address bytes (4 IPv4 / 16 IPv6) */
     uint8_t       peer_ip_len;  /* 0 = not set */
+    SmtpTls *tls;              /* inbound STARTTLS ctx (NULL = plaintext) */
 } Conn;
 
 typedef struct Server {
@@ -382,6 +383,22 @@ static bool path_clean(const char *p) {
 
 /* Flush as much of the pending output buffer as the socket will accept. */
 static void conn_flush(Conn *c) {
+    if (c->tls && !smtp_in_tls_pending(c->tls)) {
+        /* TLS up (or mid-handshake): the backlog must go out encrypted. */
+        while (c->out_off < c->out_len) {
+            int n = smtp_in_tls_send(c->tls, c->out + c->out_off,
+                                     c->out_len - c->out_off);
+            if (n < 0) {
+                c->closed = true;
+                c->out_len = c->out_off = 0;   /* undeliverable: let it die */
+                return;
+            }
+            if (n == 0) return;   /* socket full: retry on POLLOUT */
+            c->out_off += (size_t)n;
+        }
+        c->out_len = c->out_off = 0;
+        return;
+    }
     while (c->out_off < c->out_len) {
         ssize_t n = send(c->fd, c->out + c->out_off, c->out_len - c->out_off,
                          MSG_NOSIGNAL);
@@ -434,6 +451,7 @@ static void conn_reset(Conn *c, int new_state) {
 
 static void conn_destroy(Conn *c) {
     size_t i;
+    smtp_in_tls_conn_free(c->tls);   /* close_notify while the fd is still open */
     if (c->fd >= 0) close(c->fd);
     free(c->from);
     for (i = 0; i < c->nrcpts; i++) free(c->rcpts[i]);
@@ -1167,11 +1185,15 @@ static void do_helo(Server *srv, Conn *c, bool ehlo) {
                          ? srv->cfg->hostname : "localhost";
     conn_reset(c, ST_HELO);
     if (ehlo) {
-        size_t cap = strlen(hn) + 64;
+        size_t cap = strlen(hn) + 96;
         char *buf = malloc(cap);
         if (!buf) { conn_reply(c, "250 OK\r\n"); return; }
-        snprintf(buf, cap, "250-%s\r\n250-8BITMIME\r\n250-SIZE %u\r\n250 OK\r\n",
-                 hn, srv->max_msg);
+        snprintf(buf, cap,
+                 "250-%s\r\n250-8BITMIME\r\n250-SIZE %u%s\r\n250 OK\r\n",
+                 hn, srv->max_msg,
+                 /* RFC 3207: advertise only before TLS is up; once active it
+                    MUST NOT reappear. */
+                 (!c->tls && smtp_in_tls_available()) ? "\r\n250-STARTTLS" : "");
         conn_reply(c, buf);
         free(buf);
     } else {
@@ -1332,8 +1354,25 @@ static void handle_command(Server *srv, Conn *c, char *line) {
         conn_reply(c, "252 2.5.2 Cannot VRFY user\r\n");
     } else if (vlen == 4 && ascii_strncasecmp(p, "EXPN", 4) == 0) {
         conn_reply(c, "252 2.5.2 Cannot EXPN list\r\n");
-    } else if ((vlen == 8 && ascii_strncasecmp(p, "STARTTLS", 8) == 0) ||
-               (vlen == 4 && ascii_strncasecmp(p, "AUTH", 4) == 0)) {
+    } else if (vlen == 8 && ascii_strncasecmp(p, "STARTTLS", 8) == 0) {
+        /* RFC 3207: only after EHLO, never twice, no parameters, and no
+           pipelined bytes (c->in is plaintext but the next reader is TLS). */
+        if (c->tls || c->state != ST_HELO) {
+            conn_reply(c, "503 5.5.1 Error: TLS already active or no EHLO\r\n");
+        } else if (*rest) {
+            conn_reply(c, "501 5.5.4 Syntax: STARTTLS\r\n");
+        } else if (c->in_len != 0) {
+            conn_reply(c, "500 5.5.2 Pipelined data before STARTTLS\r\n");
+        } else if (!smtp_in_tls_available()) {
+            conn_reply(c, "502 5.5.1 Command not implemented\r\n");
+        } else if (!(c->tls = smtp_in_tls_start(c->fd))) {
+            conn_reply(c, "451 4.3.0 Storage allocation failure\r\n");
+        } else {
+            /* the 220 drains in the clear (PENDING), then the poll loop
+               runs the handshake and resets the session to ST_INIT */
+            conn_reply(c, "220 2.0.0 Ready to start TLS\r\n");
+        }
+    } else if (vlen == 4 && ascii_strncasecmp(p, "AUTH", 4) == 0) {
         conn_reply(c, "502 5.5.1 Command not implemented\r\n");
     } else {
         conn_reply(c, "500 5.5.2 Command not recognized\r\n");
@@ -1366,11 +1405,24 @@ static void process_commands(Server *srv, Conn *c, time_t now) {
         }
         linelen = i;
         if (linelen > 0 && c->in[linelen - 1] == '\r') linelen--;
-        c->in[linelen] = '\0';
-        handle_command(srv, c, c->in);
-        consumed = i + 1;
-        memmove(c->in, c->in + consumed, c->in_len - consumed);
-        c->in_len -= consumed;
+        /* Copy the line out and consume it BEFORE dispatch, so a handler
+           sees c->in_len == 0 unless the client pipelined more bytes after
+           it (STARTTLS relies on this; mirrors imapd_ingest.c). */
+        {
+            char *line = malloc(linelen + 1);
+            if (!line) {
+                conn_reply(c, "451 4.3.0 Storage allocation failure\r\n");
+                c->closed = true;
+                return;
+            }
+            memcpy(line, c->in, linelen);
+            line[linelen] = '\0';
+            consumed = i + 1;
+            memmove(c->in, c->in + consumed, c->in_len - consumed);
+            c->in_len -= consumed;
+            handle_command(srv, c, line);
+            free(line);
+        }
 
         /* Once DATA starts, every remaining buffered byte is MESSAGE DATA,
            not commands (a pipelining client that sent the body in the same
@@ -1396,39 +1448,65 @@ static void process_commands(Server *srv, Conn *c, time_t now) {
     }
 }
 
-static void conn_readable(Server *srv, Conn *c, time_t now) {
-    char tmp[SMTP_IN_RECV_CHUNK];
-    ssize_t n = recv(c->fd, tmp, sizeof tmp, 0);
-    if (n < 0) {
-        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return;
-        c->closed = true;
-        return;
-    }
-    if (n == 0) {
-        c->closed = true;
-        return;
-    }
-    c->last_act = now;
-
+/* Ingest one received chunk: route it to the DATA or command buffer and run
+   the parser.  Factored so the TLS drain loop and the plaintext single recv
+   share the exact same semantics. */
+static void conn_take_bytes(Server *srv, Conn *c, char *tmp, size_t n,
+                            time_t now) {
     if (c->state == ST_DATA) {
         if ((uint64_t)c->data_len + (uint64_t)n > srv->raw_cap) {
             conn_reply(c, "552 5.3.4 Message exceeds fixed limit\r\n");
             c->closed = true;
             return;
         }
-        if (buf_append(&c->data, &c->data_len, &c->data_cap, tmp, (size_t)n) != 0) {
+        if (buf_append(&c->data, &c->data_len, &c->data_cap, tmp, n) != 0) {
             conn_reply(c, "451 4.3.0 Storage allocation failure\r\n");
             c->closed = true;
             return;
         }
         process_data(srv, c, now);
     } else {
-        if (buf_append(&c->in, &c->in_len, &c->in_cap, tmp, (size_t)n) != 0) {
+        if (buf_append(&c->in, &c->in_len, &c->in_cap, tmp, n) != 0) {
             conn_reply(c, "500 5.5.2 Line too long\r\n");
             c->closed = true;
             return;
         }
         process_commands(srv, c, now);
+    }
+}
+
+static void conn_readable(Server *srv, Conn *c, time_t now) {
+    char tmp[SMTP_IN_RECV_CHUNK];
+
+    if (c->tls) {   /* STARTTLS: the poll loop drives the handshake; we drain */
+        if (!smtp_in_tls_established(c->tls)) return;
+        for (;;) {
+            /* Drain LOOP, not once: mbedtls buffers decrypted plaintext
+               internally, so a single read per POLLIN can stall the session
+               when several records arrived in one segment. */
+            int n = smtp_in_tls_recv(c->tls, tmp, sizeof tmp);
+            if (n < 0) { c->closed = true; return; }
+            if (n == 0) return;
+            c->last_act = now;
+            conn_take_bytes(srv, c, tmp, (size_t)n, now);
+            if (c->closed) return;
+            if (c->state == ST_DATA) return;   /* bulk DATA: next POLLIN */
+        }
+    }
+
+    {
+        ssize_t n = recv(c->fd, tmp, sizeof tmp, 0);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return;
+            c->closed = true;
+            return;
+        }
+        if (n == 0) {
+            c->closed = true;
+            return;
+        }
+        c->last_act = now;
+        conn_take_bytes(srv, c, tmp, (size_t)n, now);
     }
 }
 
@@ -1536,6 +1614,28 @@ static void spool_gc(Server *srv) {
 
 static uint32_t conn_timeout(const Server *srv, const Conn *c) {
     return (c->state == ST_DATA) ? srv->data_tmo : srv->cmd_tmo;
+}
+
+/* Advance one STARTTLS handshake round (PENDING -> HANDSHAKE ->
+   ESTABLISHED).  A fatal round drops the conn WITHOUT queueing any reply:
+   the wire is mid-TLS and plaintext would be garbage to the peer. */
+static void tls_advance(Server *srv, Conn *c, time_t now) {
+    int r;
+    c->last_act = now;              /* handshake traffic counts as activity */
+    r = smtp_in_tls_handshake_step(c->tls);
+    if (r < 0) {
+        c->closed = true;
+        c->out_len = c->out_off = 0;
+        return;
+    }
+    if (r > 0) {
+        /* TLS is up: restart the session clean (RFC 3207 4: the client must
+           EHLO again), then drain immediately (the final handshake flight
+           and the first app bytes often land in one TCP segment, so POLLIN
+           may never fire for them). */
+        conn_reset(c, ST_INIT);
+        conn_readable(srv, c, now);
+    }
 }
 
 static int poll_timeout_ms(const Server *srv, time_t now) {
@@ -1699,6 +1799,12 @@ static void server_poll(Server *srv) {
             uint32_t tmo = conn_timeout(srv, c);
             if (tmo != 0 && now > c->last_act &&
                 (now - c->last_act) >= (time_t)tmo) {
+                if (smtp_in_tls_handshaking(c->tls)) {
+                    /* mid-TLS: a plaintext 421 would corrupt the stream */
+                    c->closed = true;
+                    c->out_len = c->out_off = 0;
+                    continue;
+                }
                 conn_reply(c, "421 4.4.2 Timeout - closing connection\r\n");
                 c->closed = true;
             }
@@ -1748,7 +1854,13 @@ static void server_poll(Server *srv) {
         for (i = 0; i < srv->nconns; i++) {
             Conn *c = srv->conns[i];
             pfds[1 + s_nextra + i].fd = c->fd;
-            if (c->closed) {
+            if (!c->closed && smtp_in_tls_handshaking(c->tls)) {
+                /* STARTTLS: PENDING drains the plaintext 220 reply (POLLOUT);
+                   the handshake polls whichever way mbedtls asked for last */
+                pfds[1 + s_nextra + i].events = smtp_in_tls_pending(c->tls)
+                    ? POLLOUT
+                    : (smtp_in_tls_wants_write(c->tls) ? POLLOUT : POLLIN);
+            } else if (c->closed) {
                 pfds[1 + s_nextra + i].events = (c->out_off < c->out_len) ? POLLOUT : 0;
             } else {
                 /* stop reading new commands while the reply backlog is high:
@@ -1791,6 +1903,21 @@ static void server_poll(Server *srv) {
             short rev = pfds[1 + s_nextra + i].revents;
             if (c->closed) {
                 if (rev & POLLOUT) conn_flush(c);
+                continue;
+            }
+            if (smtp_in_tls_pending(c->tls)) {
+                /* the queued plaintext 220 reply is still draining; the
+                   handshake starts only once it is fully on the wire */
+                if (rev & POLLOUT) {
+                    conn_flush(c);
+                    if (!c->closed && c->out_off >= c->out_len)
+                        tls_advance(srv, c, now);
+                }
+                continue;
+            }
+            if (smtp_in_tls_handshaking(c->tls)) {
+                if (rev & (POLLIN | POLLOUT | POLLHUP | POLLERR))
+                    tls_advance(srv, c, now);
                 continue;
             }
             if (rev & (POLLIN | POLLHUP | POLLERR))

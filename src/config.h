@@ -88,6 +88,13 @@ typedef struct {
     char *private_key;
 } ConfigDkim;
 
+/* tls { cert, key } — inbound STARTTLS (RFC 3207).  Both paths are required
+   when the record is present; absent or empty paths mean TLS is disabled. */
+typedef struct {
+    char *cert;
+    char *key;
+} ConfigTls;
+
 /* Top-level config record. Strings and arrays are heap-owned; release with
    config_free(). */
 typedef struct Config {
@@ -104,6 +111,7 @@ typedef struct Config {
     size_t       naliases;
     ConfigHttp   http;
     ConfigAdmin  admin;
+    ConfigTls    tls;            /* inbound STARTTLS ("" paths = disabled) */
     ConfigDkim  *dkim;           /* DKIM signing configs (may be empty) */
     size_t       ndkim;
 } Config;

@@ -223,6 +223,22 @@ static bool walk_config(Config *cfg, Term *nf) {
     if (!text_dup(rec_get(adm, "token"), &cfg->admin.token)) return false;
 
     {
+        /* tls is optional (older configs omit it): { cert, key } for inbound
+         * STARTTLS.  Present -> BOTH paths are required (checked at load so
+         * config-check fails closed too); absent -> NULL/NULL = disabled.
+         * Empty-string paths are also treated as disabled by the TLS init. */
+        Term *tl = rec_get(nf, "tls");
+        if (tl) {
+            if (!text_dup(rec_get(tl, "cert"), &cfg->tls.cert)) return false;
+            if (!text_dup(rec_get(tl, "key"), &cfg->tls.key)) return false;
+            if (!cfg->tls.cert[0] != !cfg->tls.key[0]) {
+                cfg_error("tls requires both 'cert' and 'key'");
+                return false;
+            }
+        }
+    }
+
+    {
         /* dkim is optional (older configs omit it): a list of signing configs
          * { domain, selector, private_key }.  Mirror the relay.tls_ca optional
          * field precedent — absent defaults to an empty list. */
@@ -363,6 +379,8 @@ void config_free(Config *cfg) {
     free(cfg->aliases);
     free(cfg->http.address);
     free(cfg->admin.token);
+    free(cfg->tls.cert);
+    free(cfg->tls.key);
     for (size_t i = 0; i < cfg->ndkim; i++) {
         free(cfg->dkim[i].domain);
         free(cfg->dkim[i].selector);

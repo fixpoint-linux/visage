@@ -373,7 +373,7 @@ in  let Config =
 in  { hostname = "mx.example.com"
    , domains = [ "example.com" ]
    , listen = { address = "0.0.0.0", port = 2525 }
-   , relay = { host = "127.0.0.1", port = 2526, tls = "none", max_attempts = 100, … }
+   , relay = { host = "127.0.0.1", port = 2526, tls = "starttls-verify", max_attempts = 100, … }
    , catch_all = ""
    , aliases = [ { alias = "jane@example.com", destinations = [ "jane@realmail.example" ] }
                , { alias = "shopping@example.com", destinations = [ "jane@realmail.example", "bob@realmail.example" ] }

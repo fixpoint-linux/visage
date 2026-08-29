@@ -70,8 +70,8 @@ MBEDTLS_CONFIG = "src/mbedtls_visage_config.h"
 DATA_CACERT = "src/data/cacert_pem.c"
 DATA_ADMIN = "src/data/admin_ui.c"
 
-SRC = ["src/config.c","src/store.c","src/smtp_in.c","src/smtp_out.c","src/mail.c",
-       "src/reply.c","src/dkim.c","src/http.c","src/admin.c","src/http_parse.c",
+SRC = ["src/config.c","src/store.c","src/smtp_in.c","src/smtp_in_tls.c","src/smtp_out.c",
+       "src/mail.c","src/reply.c","src/dkim.c","src/http.c","src/admin.c","src/http_parse.c",
        "src/json.c","src/main.c"]
 HDRS = ["src/visage.h","src/config.h","src/store.h","src/mail.h","src/reply.h",
         "src/smtp.h","src/dkim.h","src/http_parse.h","src/json.h"]
@@ -183,12 +183,14 @@ T.append(target("reply_check.com",
                 "src/mail.c"] + CORE_DATALOG)],
     out="reply_check.com"))
 T.append(target("smtp_check.com",
-    deps=[STAMP] + ["src/smtp_in.c","src/smtp_out.c","src/store.c","src/reply.c",
-          "src/dkim.c","src/config.c","src/smtp_check.c","src/smtp.h","src/store.h",
-          "src/reply.h","src/mail.h","src/mail.c","src/config.h","src/visage.h","src/dkim.h"]
+    deps=[STAMP] + ["src/smtp_in.c","src/smtp_in_tls.c","src/smtp_out.c","src/store.c",
+          "src/reply.c","src/dkim.c","src/config.c","src/smtp_check.c","src/smtp.h",
+          "src/store.h","src/reply.h","src/mail.h","src/mail.c","src/config.h",
+          "src/visage.h","src/dkim.h"]
           + CORE_DHALL + CORE_DATALOG + [DATA_CACERT, MBEDTLS_CONFIG],
-    recipe=[link_cmd("smtp_check.com", ["src/smtp_in.c","src/smtp_out.c","src/store.c",
-                "src/reply.c","src/dkim.c","src/config.c","src/smtp_check.c","src/mail.c"]
+    recipe=[link_cmd("smtp_check.com", ["src/smtp_in.c","src/smtp_in_tls.c","src/smtp_out.c",
+                "src/store.c","src/reply.c","src/dkim.c","src/config.c","src/smtp_check.c",
+                "src/mail.c"]
                 + CORE_DHALL + CORE_DATALOG + mbtls_objs + [DATA_CACERT], MBFLAGS)],
     out="smtp_check.com"))
 T.append(target("http_check.com",
@@ -203,6 +205,23 @@ T.append(target("dkim_check.com",
     deps=[STAMP] + ["src/dkim.c","src/dkim_check.c","src/dkim.h", MBEDTLS_CONFIG],
     recipe=[link_cmd("dkim_check.com", ["src/dkim.c","src/dkim_check.c"] + mbtls_objs, MBFLAGS)],
     out="dkim_check.com"))
+
+# --- imapd.com (companion IMAP mailbox server; STARTTLS via mbedTLS) ---
+IMAPD_SRCS = ["src/imapd.c","src/imapd_ingest.c","src/imapd_imap.c",
+              "src/imapd_tls.c","src/imap_maildir.c","src/mail.c"]
+IMAPD_HDRS = ["src/imapd.h","src/mail.h","src/visage.h"]
+T.append(target("imapd.com",
+    deps=[STAMP] + IMAPD_SRCS + IMAPD_HDRS + [MBEDTLS_CONFIG],
+    recipe=[link_cmd("imapd.com", IMAPD_SRCS + mbtls_objs, MBFLAGS)],
+    out="imapd.com"))
+T.append(target("imap_check.com",
+    deps=[STAMP] + ["src/imap_maildir.c","src/imapd_imap.c","src/imapd_tls.c",
+                    "src/mail.c","src/imap_check.c"]
+         + IMAPD_HDRS + [MBEDTLS_CONFIG],
+    recipe=[link_cmd("imap_check.com", ["src/imap_maildir.c","src/imapd_imap.c",
+                "src/imapd_tls.c","src/mail.c","src/imap_check.c"] + mbtls_objs,
+                MBFLAGS)],
+    out="imap_check.com"))
 
 # --- tests ---
 T.append(target("tests/tls_selfcheck.com",
@@ -243,8 +262,9 @@ T.append(target("bench",
     recipe=["./store_bench.com", "python3 tools/bench_plot.py bench.csv docs/bench-latency.svg docs/bench-size.svg"],
     out=None))
 T.append(target("e2e",
-    deps=["visage.com","config_check.com","tests/smtptest.com","tests/relay_fake.com"],
-    recipe=["./tests/run.sh"],
+    deps=["visage.com","config_check.com","tests/smtptest.com","tests/relay_fake.com",
+          "imapd.com","tests/imapd_tls.sh","tests/smtp_starttls.sh"],
+    recipe=["./tests/run.sh", "./tests/imapd_tls.sh", "./tests/smtp_starttls.sh"],
     out=None))
 T.append(target("gen-admin",
     deps=["tools/gen_admin_ui.sh"],
@@ -283,7 +303,8 @@ T.append(target("dist/index.html",
 # --- `all` aggregate (default): all C binaries + wasm; site reachable by name ---
 all_deps = ["visage.com","config_check.com","store_check.com","store_bench.com",
             "mail_check.com","reply_check.com","smtp_check.com","http_check.com",
-            "dkim_check.com","tests/tls_selfcheck.com","tests/verify_selfcheck.com",
+            "dkim_check.com","imapd.com","imap_check.com",
+            "tests/tls_selfcheck.com","tests/verify_selfcheck.com",
             "tests/smtptest.com","tests/relay_fake.com","wasm"]
 T.append(target("all", deps=all_deps, recipe=[], out=None))
 

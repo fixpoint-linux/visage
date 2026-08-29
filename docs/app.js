@@ -46,7 +46,7 @@
     '              , cmd_timeout = 300, data_timeout = 600 }\n' +
     '   , relay = { host = "127.0.0.1", port = 2526\n' +
     '             , auth = { enabled = False, username = "", password = "" }\n' +
-    '             , retries = 3, tls = "none", tls_ca = "", max_attempts = 100 }\n' +
+    '             , retries = 3, tls = "starttls-verify", tls_ca = "", max_attempts = 100 }\n' +
     '   , storage = { path = "./var/db", spool = "./var/spool" }\n' +
     '   , reply = { prefix = "reply", separator = "+" }\n' +
     '   , catch_all = ""\n' +

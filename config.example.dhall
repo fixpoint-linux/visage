@@ -13,6 +13,7 @@ in  let Config =
       , aliases : List { alias : Text, destinations : List Text }
       , http : { address : Text, port : Natural }
       , admin : { token : Text }
+      , tls : { cert : Text, key : Text }
       , dkim : List { domain : Text, selector : Text, private_key : Text }
       }
 in  { hostname = "mx.example.com"
@@ -22,7 +23,7 @@ in  { hostname = "mx.example.com"
               , cmd_timeout = 300, data_timeout = 600 }
    , relay = { host = "127.0.0.1", port = 2526
              , auth = { enabled = False, username = "", password = "" }
-             , retries = 3, tls = "none"
+             , retries = 3, tls = "starttls-verify"
              -- tls_ca = "" uses the embedded Mozilla CA bundle; a non-empty path
              -- points at an operator-provided PEM CA bundle (only consulted
              -- when tls == "starttls-verify").
@@ -39,5 +40,9 @@ in  { hostname = "mx.example.com"
    -- enforces a 500-char ceiling); the placeholder below is fine for config-check
    -- but a real deployment must use a long random token.
    , admin = { token = "change-me" }
+   -- tls enables inbound STARTTLS (RFC 3207) on the SMTP listener.  Both
+   -- paths are required when the record is present; empty paths (below) or
+   -- an omitted tls record disable TLS entirely (plaintext default).
+   , tls = { cert = "", key = "" }
    , dkim = [] : List { domain : Text, selector : Text, private_key : Text }
    } : Config

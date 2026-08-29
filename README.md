@@ -145,7 +145,7 @@ against its schema before the daemon binds a port. See `config.example.dhall` fo
 { hostname = "mx.example.com"
 , domains = [ "example.com" ]
 , listen = { address = "0.0.0.0", port = 2525 }
-, relay = { host = "127.0.0.1", port = 2526, tls = "none", … }
+, relay = { host = "127.0.0.1", port = 2526, tls = "starttls-verify", … }
 , catch_all = ""
 , aliases = [ { alias = "jane@example.com",     destinations = [ "jane@realmail.example" ] }
             , { alias = "shopping@example.com", destinations = [ "jane@realmail.example", "bob@realmail.example" ] }

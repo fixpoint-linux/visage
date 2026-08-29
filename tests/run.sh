@@ -71,6 +71,7 @@ build_config() {
         -e "s|port = 8080|port = $HTTP_PORT|" \
         -e "s|path = \"./var/db\"|path = \"$DBDIR\"|" \
         -e "s|spool = \"./var/spool\"|spool = \"$SPOOLDIR\"|" \
+        -e 's|tls = "starttls-verify"|tls = "none"|' \
         "$ROOT/config.example.dhall" > "$CONF"
 }
 

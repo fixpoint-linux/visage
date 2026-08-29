@@ -169,6 +169,13 @@ static int cmd_daemon(const Config *cfg) {
         return 1;
     }
 
+    /* Inbound STARTTLS cert/key load is fail-closed and must precede ANY
+       listener bind (http_serve binds the admin listener before
+       smtp_in_main): a bad cert/key exits the daemon rather than silently
+       serving plaintext-only. */
+    if (smtp_in_tls_global_init(cfg->tls.cert, cfg->tls.key) != 0)
+        return 1;
+
     Store *s = store_open(cfg->storage.path);
     if (!s) {
         fprintf(stderr, "visage: cannot open store at '%s'\n", cfg->storage.path);
@@ -180,10 +187,11 @@ static int cmd_daemon(const Config *cfg) {
         return 1;
     }
 
-    printf("visage %s: smtp on %s:%u, admin http on %s:%u\n",
+    printf("visage %s: smtp on %s:%u, admin http on %s:%u, tls %s\n",
            VISAGE_VERSION,
            cfg->listen.address, cfg->listen.port,
-           cfg->http.address, cfg->http.port);
+           cfg->http.address, cfg->http.port,
+           smtp_in_tls_available() ? "on" : "off");
     fflush(stdout);
 
     return http_serve(s, cfg);

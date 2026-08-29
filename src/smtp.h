@@ -80,6 +80,50 @@ RcptDecision smtp_in_rcpt_ok(Store *s, const Config *cfg, const char *rcpt);
 int smtp_in_parse_size(const char *params, uint64_t *size, bool *present);
 
 /* ------------------------------------------------------------------ */
+/* Inbound STARTTLS (smtp_in_tls.c; mbedTLS SERVER role over the       */
+/* non-blocking conn fds).  The entry points live only in binaries     */
+/* linked with src/smtp_in_tls.c + the vendored mbedTLS objects        */
+/* (config_check.com stays mbedtls-free).                              */
+/* ------------------------------------------------------------------ */
+
+typedef struct SmtpTls SmtpTls;
+
+/* Load cert/key into the process-wide server config.  Both NULL or both ""
+   mean TLS disabled (returns 0); exactly one path, a parse failure, or a
+   cert/key mismatch prints an error and returns -1 (fail-closed: the caller
+   must exit before binding any listener). */
+int  smtp_in_tls_global_init(const char *cert, const char *key);
+
+/* Begin STARTTLS on fd: allocates the per-conn context in the PENDING state
+   (the queued plaintext 220 reply drains first).  Returns NULL on allocation
+   or setup failure (the plaintext conn is preserved). */
+SmtpTls *smtp_in_tls_start(int fd);
+
+/* Drive one handshake round.  Returns 1 established, 0 still negotiating
+   (poll POLLIN or POLLOUT per smtp_in_tls_wants_write), -1 fatal (the wire is
+   mid-TLS: the caller must drop the conn WITHOUT queueing any reply).
+   PENDING -> HANDSHAKE advance requires the conn's out buffer to be drained. */
+int  smtp_in_tls_handshake_step(SmtpTls *t);
+
+/* Decrypted read: >0 n bytes, 0 no data right now (WANT_*), -1 fatal or the
+   peer closed (caller drops the conn). */
+int  smtp_in_tls_recv(SmtpTls *t, char *buf, size_t len);
+
+/* Encrypted write: >0 n plaintext bytes accepted, 0 socket would block
+   (retry on POLLOUT), -1 fatal. */
+int  smtp_in_tls_send(SmtpTls *t, const char *buf, size_t len);
+
+/* Best-effort close_notify + free (the fd is closed by the caller, and MUST
+   still be open here so close_notify can flush). */
+void smtp_in_tls_conn_free(SmtpTls *t);
+
+bool smtp_in_tls_available(void);                  /* cert+key loaded       */
+bool smtp_in_tls_pending(const SmtpTls *t);        /* plaintext reply draining */
+bool smtp_in_tls_handshaking(const SmtpTls *t);    /* PENDING or HANDSHAKE  */
+bool smtp_in_tls_established(const SmtpTls *t);    /* TLS active: speak TLS */
+bool smtp_in_tls_wants_write(const SmtpTls *t);    /* handshake wants POLLOUT */
+
+/* ------------------------------------------------------------------ */
 /* Outbound relay STARTTLS helpers (smtp_out.c).                       */
 /* ------------------------------------------------------------------ */
 
