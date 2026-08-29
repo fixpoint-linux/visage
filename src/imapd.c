@@ -166,8 +166,13 @@ static int poll_timeout_ms(const ImapdServer *srv, time_t now) {
     size_t i;
     for (i = 0; i < srv->nconns; i++) {
         const Conn *c = srv->conns[i];
-        uint32_t tmo = (c->kind == CONN_INGEST && c->st == ST_DATA)
-                           ? srv->cfg.data_tmo : srv->cfg.cmd_tmo;
+        uint32_t tmo;
+        if (c->kind == CONN_INGEST && c->st == ST_DATA)
+            tmo = srv->cfg.data_tmo;
+        else if (c->kind == CONN_IMAP && c->idle)
+            tmo = IMAPD_IDLE_TMO;
+        else
+            tmo = srv->cfg.cmd_tmo;
         time_t elapsed, remain;
         int rms;
         if (tmo == 0) continue;
@@ -177,6 +182,16 @@ static int poll_timeout_ms(const ImapdServer *srv, time_t now) {
         rms = (int)(remain * 1000);
         if (rms > 2147483647) rms = 2147483647;
         if (ms < 0 || rms < ms) ms = rms;
+    }
+    /* A SELECTED IDLE connection wants prompt EXISTS updates: cap the wait so
+       imapd_imap_idle_refresh runs on a fixed scan cadence, not the (much
+       longer) command timeout. */
+    if (ms < 0 || IMAPD_IDLE_SCAN_MS < ms) {
+        for (i = 0; i < srv->nconns; i++)
+            if (srv->conns[i]->kind == CONN_IMAP && srv->conns[i]->idle) {
+                ms = IMAPD_IDLE_SCAN_MS;
+                break;
+            }
     }
     return ms;
 }
@@ -215,11 +230,16 @@ static void server_poll(ImapdServer *srv) {
         /* idle timeouts */
         for (i = 0; i < srv->nconns; i++) {
             Conn *c = srv->conns[i];
-            uint32_t tmo = (c->kind == CONN_INGEST && c->st == ST_DATA)
-                               ? srv->cfg.data_tmo : srv->cfg.cmd_tmo;
+            uint32_t tmo;
             const char *bye = (c->kind == CONN_INGEST)
                                   ? "421 4.4.2 Timeout - closing connection\r\n"
                                   : "* BYE timeout\r\n";
+            if (c->kind == CONN_INGEST && c->st == ST_DATA)
+                tmo = srv->cfg.data_tmo;
+            else if (c->kind == CONN_IMAP && c->idle)
+                tmo = IMAPD_IDLE_TMO;   /* RFC 2177: longer cap while idling */
+            else
+                tmo = srv->cfg.cmd_tmo;
             if (tmo != 0 && now > c->last_act &&
                 (now - c->last_act) >= (time_t)tmo) {
                 if (imapd_tls_handshaking(c)) {
@@ -338,6 +358,8 @@ static void server_poll(ImapdServer *srv) {
                 else
                     imapd_imap_readable(srv, c, now);
             }
+            if (c->kind == CONN_IMAP && c->idle && !c->closed && !c->fg)
+                imapd_imap_idle_refresh(srv, c);
             if (!c->closed && (rev & POLLOUT)) conn_flush(c);
         }
 

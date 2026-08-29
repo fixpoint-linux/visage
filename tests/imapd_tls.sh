@@ -65,6 +65,7 @@ start_daemon() {   # start_daemon ROOT LOG EXTRA_ARGS...
 ./imapd.com passwd alice waldorf --root "$ROOT_A" >/dev/null
 ./imapd.com passwd alice waldorf --root "$ROOT_B" >/dev/null
 ./imapd.com passwd alice waldorf --root "$ROOT_D" >/dev/null
+./imapd.com passwd bob waldorf --root "$ROOT_A" >/dev/null  # IDLE test user
 
 # ---- instances ----
 start_daemon "$ROOT_A" "$TMP/a.log" \
@@ -155,6 +156,60 @@ while True:
         break
 assert b"b4 OK" in sel, sel
 tls.sendall(b"b5 LOGOUT\r\n")
+PYEOF
+
+# ---- (1b) RFC 2177 IDLE: SELECT then IDLE, deliver a new message, expect an
+# unsolicited EXISTS from the idling session, then DONE completes the tag.
+# Uses its own user (bob) so it cannot perturb alice's INBOX counts. ----
+python3 - "$IMAP_A" "$ROOT_A" <<'PYEOF' && pass "imap: RFC 2177 IDLE push (EXISTS) + DONE" \
+                           || fail "imap: RFC 2177 IDLE push (EXISTS) + DONE"
+import os, socket, sys, time, uuid
+
+port, root = int(sys.argv[1]), sys.argv[2]
+s = socket.create_connection(("127.0.0.1", port), timeout=10)
+f = s.makefile("rb")
+assert f.readline().startswith(b"* OK")
+s.sendall(b"c1 LOGIN bob waldorf\r\n")
+assert f.readline().startswith(b"c1 OK")
+s.sendall(b"c2 SELECT INBOX\r\n")
+sel = b""
+while True:
+    ln = f.readline()
+    sel += ln
+    if ln.startswith(b"c2 "):
+        break
+assert b"c2 OK" in sel, sel
+
+# enter IDLE
+s.sendall(b"c3 IDLE\r\n")
+line = f.readline().decode()
+assert line.startswith("+"), line
+
+# a new message lands in the mailbox while we idle
+newdir = os.path.join(root, "bob", "Inbox", "new")
+os.makedirs(newdir, exist_ok=True)
+msg = b"From: bob@example.net\r\nSubject: idle push\r\n\r\nhello\r\n"
+open(os.path.join(newdir, uuid.uuid4().hex), "wb").write(msg)
+
+# the server should push an unsolicited EXISTS within the scan cadence
+seen = b""
+deadline = time.time() + 5
+while time.time() < deadline and b"EXISTS" not in seen:
+    seen += f.readline()
+assert b"EXISTS" in seen, seen
+
+# DONE completes the IDLE; the tagged OK may trail more unsolicited lines
+# (the poll loop can emit further EXISTS/RECENT between the first push and
+# our DONE arriving), so read until the tagged reply.
+s.sendall(b"DONE\r\n")
+done = b""
+while True:
+    ln = f.readline()
+    done += ln
+    if ln.startswith(b"c3 "):
+        break
+assert b"\r\nc3 OK IDLE completed\r\n" in done, done
+s.sendall(b"c4 LOGOUT\r\n")
 PYEOF
 
 # ---- (2) RFC 3501 11.1 gating on a non-loopback bind ----

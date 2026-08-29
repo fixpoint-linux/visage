@@ -57,6 +57,8 @@
 #define IMAPD_DEFAULT_MAX_MSG     (32u * 1024u * 1024u)
 #define IMAPD_DEFAULT_CMD_TMO     300
 #define IMAPD_DEFAULT_DATA_TMO    600
+#define IMAPD_IDLE_SCAN_MS        1000   /* RFC 2177: cadence for IDLE re-scan */
+#define IMAPD_IDLE_TMO            1800   /* RFC 2177 §4: server-side IDLE cap */
 
 #define IMAPD_PASSWD_FILE  "imapd.passwd"       /* under <root>, 0600 */
 #define IMAPD_SUBS_FILE    "imapd-subscriptions" /* under <user> */
@@ -208,6 +210,8 @@ typedef struct Conn {
     Mbox   mb;                 /* selected mailbox */
     char   mbname[IMAPD_MAX_MBOX + 1];  /* selected mailbox name */
     char   auth_tag[IMAPD_MAX_TAG + 1]; /* pending AUTHENTICATE continuation */
+    char   idle_tag[IMAPD_MAX_TAG + 1]; /* pending IDLE command tag */
+    bool   idle;              /* RFC 2177 IDLE in progress (SELECTED) */
     int    mode;               /* IC_LINE / IC_LIT */
     bool   cont_auth;          /* next line is an AUTHENTICATE b64 reply */
     size_t lit_left;           /* IC_LIT: literal bytes still expected */
@@ -402,6 +406,11 @@ void imapd_pop3_readable(ImapdServer *srv, Conn *c, time_t now);
 
 /* Generate more of an active streaming FETCH into c->out (POLLOUT drain). */
 void imapd_fetch_pump(ImapdServer *srv, Conn *c);
+
+/* RFC 2177 IDLE: re-scan the selected mailbox and emit unsolicited
+   EXISTS/RECENT updates if its message set changed.  No-op unless the
+   connection is currently IDLE with a SELECTED mailbox. */
+void imapd_imap_idle_refresh(ImapdServer *srv, Conn *c);
 
 /* Free a streaming FETCH generator (NULL-safe). */
 void imapd_fetch_free(Conn *c);

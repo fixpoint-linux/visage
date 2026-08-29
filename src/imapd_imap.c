@@ -19,8 +19,8 @@
  * with [PRIVACYREQUIRED] on a non-loopback IMAP bind until STARTTLS
  * completes (loopback binds keep the plaintext default).
  *
- * Deferred (clients get tagged NO/BAD): IDLE, ENVELOPE,
- * BODYSTRUCTURE, MIME part fetches, RENAME, quotas/ACL. */
+ * Deferred (clients get tagged NO/BAD): ENVELOPE, BODYSTRUCTURE, MIME part
+ * fetches, RENAME, quotas/ACL.  IDLE is supported (RFC 2177). */
 #include "imapd.h"
 #include "mail.h"
 
@@ -715,10 +715,10 @@ static int buf_appendf(char **buf, size_t *len, size_t *cap,
 /* Canonical CAPABILITY string (pure; unit-tested by imap_check.c). */
 const char *imapd_capability(bool tls_active, bool tls_avail,
                              bool plain_auth_ok) {
-    if (tls_active)   return "IMAP4rev1 AUTH=PLAIN";   /* RFC 2595: no STARTTLS once TLS is up */
-    if (!tls_avail)   return "IMAP4rev1 AUTH=PLAIN";   /* no cert: legacy plaintext default */
-    if (plain_auth_ok) return "IMAP4rev1 STARTTLS AUTH=PLAIN";
-    return "IMAP4rev1 STARTTLS LOGINDISABLED";         /* RFC 3501 11.1 */
+    if (tls_active)   return "IMAP4rev1 AUTH=PLAIN IDLE";   /* RFC 2595: no STARTTLS once TLS is up */
+    if (!tls_avail)   return "IMAP4rev1 AUTH=PLAIN IDLE";   /* no cert: legacy plaintext default */
+    if (plain_auth_ok) return "IMAP4rev1 STARTTLS AUTH=PLAIN IDLE";
+    return "IMAP4rev1 STARTTLS LOGINDISABLED IDLE";         /* RFC 3501 11.1 */
 }
 
 /* Loopback bind-address classifier (pure; unit-tested by imap_check.c).
@@ -2707,6 +2707,22 @@ static void dispatch(ImapdServer *srv, Conn *c) {
     const char *p = cmd;
     char *tag = NULL, *word = NULL;
     size_t tl, wl;
+
+    /* RFC 2177: while IDLE, the only valid client input is the untagged
+       continuation "DONE" (no tag).  Anything else is rejected. */
+    if (c->idle) {
+        const char *q = cmd;
+        while (*q == ' ') q++;
+        if (ascii_ieq_str(q, "DONE")) {
+            c->idle = false;
+            conn_replyf(c, "%s OK IDLE completed\r\n", c->idle_tag);
+        } else {
+            conn_replyf(c, "%s BAD command not allowed during IDLE\r\n",
+                        c->idle_tag);
+        }
+        goto out;
+    }
+
     if (imapd_next_astring(&p, &tag, &tl) != 1) {
         conn_reply(c, "* BAD missing tag\r\n");
         goto out;
@@ -2799,7 +2815,16 @@ static void dispatch(ImapdServer *srv, Conn *c) {
     } else if (ascii_ieq_str(word, "UID")) {
         do_uid(srv, c, tag, p);
     } else if (ascii_ieq_str(word, "IDLE")) {
-        conn_replyf(c, "%s NO IDLE not supported (use NOOP polling)\r\n", tag);
+        /* RFC 2177: only in SELECTED state.  Reply with a continuation, then
+           refresh_selected (via the poll loop) drives unsolicited EXISTS /
+           RECENT / EXPUNGE updates until the client sends DONE. */
+        if (c->ist != IST_SELECTED) {
+            conn_replyf(c, "%s BAD IDLE not allowed now\r\n", tag);
+        } else {
+            snprintf(c->idle_tag, sizeof c->idle_tag, "%s", tag);
+            c->idle = true;
+            conn_reply(c, "+ idling\r\n");
+        }
     } else {
         conn_replyf(c, "%s BAD unknown command\r\n", tag);
     }
@@ -2884,3 +2909,13 @@ void imapd_imap_readable(ImapdServer *srv, Conn *c, time_t now) {
         imap_process(srv, c, now);
     }
 }
+
+/* RFC 2177 IDLE: periodically re-scan the selected mailbox.  Only emits
+   unsolicited EXISTS/RECENT when the message set actually changed, so it is
+   safe to call on every poll loop tick. */
+void imapd_imap_idle_refresh(ImapdServer *srv, Conn *c) {
+    if (!c->idle || c->ist != IST_SELECTED || c->fg) return;
+    if (!c->mb_open) return;
+    refresh_selected(srv, c);
+}
+
