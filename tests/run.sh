@@ -236,10 +236,12 @@ tls_forward_scenario() {
         else
             fail "TLS: forwarded message missing Received header"
         fi
-        if grep -q '^From: sender@foo.org' "$FW" && ! grep -q 'reply+[0-9a-f]\{32\}@example.com' "$FW"; then
-            pass "TLS: forwarded From preserves the real sender"
+        if grep -q '^From: sender@foo.org' "$FW" \
+           && grep -q '^Reply-To: reply+[0-9a-f]\{32\}@example.com' "$FW" \
+           && ! grep -q '^Sender:' "$FW"; then
+            pass "TLS: forwarded From = real sender, Reply-To = reply alias, no Sender"
         else
-            fail "TLS: forwarded From does not preserve the real sender"
+            fail "TLS: forwarded From/Reply-To mismatch"
         fi
         if diff -u <(body_of "$WORK/msg1.eml") <(body_of "$FW") >"$d/body.diff" 2>&1; then
             pass "TLS: forwarded body matches msg1.eml"
@@ -387,10 +389,12 @@ verify_forward_scenario() {
         else
             fail "VERIFY: forwarded message missing Received header"
         fi
-        if grep -q '^From: sender@foo.org' "$FW" && ! grep -q 'reply+[0-9a-f]\{32\}@example.com' "$FW"; then
-            pass "VERIFY: forwarded From preserves the real sender"
+        if grep -q '^From: sender@foo.org' "$FW" \
+           && grep -q '^Reply-To: reply+[0-9a-f]\{32\}@example.com' "$FW" \
+           && ! grep -q '^Sender:' "$FW"; then
+            pass "VERIFY: forwarded From = real sender, Reply-To = reply alias, no Sender"
         else
-            fail "VERIFY: forwarded From does not preserve the real sender"
+            fail "VERIFY: forwarded From/Reply-To mismatch"
         fi
         if diff -u <(body_of "$WORK/msg1.eml") <(body_of "$FW") >"$d/body.diff" 2>&1; then
             pass "VERIFY: forwarded body matches msg1.eml"
@@ -818,24 +822,22 @@ EOM
 
     local FW1="$relay/msg-1.eml" FW2="$relay/msg-2.eml"
     if wait_for_file "$FW1"; then
-        if grep -q '^From: "Alice Smith" <alice@foo.org>' "$FW1"; then
-            pass "FROMDISP: display-name From preserved in forwarded message"
+        if grep -q '^From: "Alice Smith" <alice@foo.org>' "$FW1" \
+           && grep -q '^Reply-To: reply+[0-9a-f]\{32\}@example.com' "$FW1" \
+           && ! grep -q '^Sender:' "$FW1"; then
+            pass "FROMDISP: display-name From preserved + Reply-To reply alias"
         else
-            fail "FROMDISP: forwarded From does not preserve the display-name From (see $FW1)"
-        fi
-        if grep -q 'reply+[0-9a-f]\{32\}@example.com' "$FW1"; then
-            fail "FROMDISP: reverse alias leaked into forwarded From (see $FW1)"
-        else
-            pass "FROMDISP: no reverse alias in forwarded From"
+            fail "FROMDISP: forwarded From/Reply-To mismatch (see $FW1)"
         fi
     else
         fail "FROMDISP: relay did not record msg-1.eml"
     fi
     if wait_for_file "$FW2"; then
-        if grep -q '^From: bob@foo.org' "$FW2"; then
-            pass "FROMDISP: bare-address From preserved in forwarded message"
+        if grep -q '^From: bob@foo.org' "$FW2" \
+           && grep -q '^Reply-To: reply+[0-9a-f]\{32\}@example.com' "$FW2"; then
+            pass "FROMDISP: bare-address From preserved + Reply-To reply alias"
         else
-            fail "FROMDISP: bare-address From not preserved (see $FW2)"
+            fail "FROMDISP: bare-address From/Reply-To mismatch (see $FW2)"
         fi
     else
         fail "FROMDISP: relay did not record msg-2.eml"
@@ -984,10 +986,12 @@ if wait_for_file "$FW"; then
     else
         fail "forwarded message missing Received header"
     fi
-    if grep -q '^From: sender@foo.org' "$FW" && ! grep -q 'reply+[0-9a-f]\{32\}@example.com' "$FW"; then
-        pass "forwarded From preserves the real sender (no reverse alias)"
+    if grep -q '^From: sender@foo.org' "$FW" \
+       && grep -q '^Reply-To: reply+[0-9a-f]\{32\}@example.com' "$FW" \
+       && ! grep -q '^Sender:' "$FW"; then
+        pass "forwarded From = real sender, Reply-To = reply alias, no Sender"
     else
-        fail "forwarded From does not preserve the real sender (see $FW)"
+        fail "forwarded From/Reply-To mismatch (see $FW)"
     fi
     if diff -u <(body_of "$WORK/msg1.eml") <(body_of "$FW") >"$WORK/body.diff" 2>&1; then
         pass "forwarded body matches msg1.eml"
@@ -1005,10 +1009,42 @@ else
     fail "relay_fake did not record a forwarded message"
 fi
 
-# (g) reply round-trip was intentionally removed: forwarding now preserves the
-# original From/Reply-To headers (the mailbox shows the real sender), so no
-# reply+<token> reverse-alias is minted to reply to.  Replies go straight to
-# the original sender address carried in the From header.
+# (g) reply round-trip: reply to the Reply-To reverse-alias, which must route
+# back to the original sender with From = the alias -------------------------
+REVERSE="$(grep -o 'reply+[0-9a-f]\{32\}@example.com' "$FW" | head -n1 || true)"
+if [ -n "$REVERSE" ]; then
+    pass "extracted reverse-alias $REVERSE"
+    if "$ROOT/tests/smtptest.com" 127.0.0.1 "$SMTP_PORT" \
+            realbox@realmail.example "$REVERSE" "$WORK/msg1.eml" >"$WORK/rep.log" 2>&1; then
+        pass "smtptest reply (realbox@realmail.example -> $REVERSE)"
+    else
+        fail "smtptest reply failed (see $WORK/rep.log)"
+    fi
+    RW="$RELAY_DIR/msg-2.eml"
+    if wait_for_file "$RW"; then
+        pass "relay_fake recorded the reply-round-trip message ($RW)"
+        if grep -q '^From:.*jane@example.com' "$RW"; then
+            pass "reply message From = alias (jane@example.com)"
+        else
+            fail "reply message From is not the alias"
+        fi
+        if grep -q '^To:.*sender@foo.org' "$RW"; then
+            pass "reply message To = original sender (sender@foo.org)"
+        else
+            fail "reply message To is not the original sender"
+        fi
+        if grep -q 'MAIL FROM:<jane@example.com>' "$RELAY_DIR/dialogue-2.txt" \
+           && grep -q 'RCPT TO:<sender@foo.org>' "$RELAY_DIR/dialogue-2.txt"; then
+            pass "reply envelope MAIL FROM=alias, RCPT TO=sender"
+        else
+            fail "reply envelope mismatch (see $RELAY_DIR/dialogue-2.txt)"
+        fi
+    else
+        fail "relay_fake did not record the reply-round-trip message"
+    fi
+else
+    fail "could not extract reverse-alias from $FW"
+fi
 
 # (h) explicit health check --------------------------------------------------
 RESP="$(http_get "$HTTP_PORT" /health || true)"

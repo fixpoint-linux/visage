@@ -843,19 +843,20 @@ static void forward_sign(const Config *cfg, const char *alias,
 }
 
 /* Forward one sanitized copy of the message through `alias` to `dest`.
-   The original From/Sender/Reply-To headers are preserved so the mailbox
-   shows the real sender (no reverse-alias header rewrite); Return-Path is
-   set to the alias so bounces route to the user, and a standard Received
-   trace is added.  Returns 0 when `dest` was durably enqueued, -1 when it
-   could not be (sanitize/enqueue failure) so the caller can refuse
-   acceptance (451). */
+   The original From is preserved (the mailbox shows the real sender) and no
+   Sender header is added; a reply alias is minted and wired only into
+   Reply-To so a reply to the message routes back through `alias` to the
+   original sender (reply-from-alias).  Return-Path is set to the alias so
+   bounces route to the user, plus a standard Received trace.  Returns 0 when
+   `dest` was durably enqueued, -1 when it could not be (token/revmap/
+   sanitize/enqueue failure) so the caller can refuse acceptance (451). */
 static int forward_one(Server *srv, const char *msg, size_t msglen,
                        const char *sender, const char *alias, const char *dest,
                        uint32_t msgid, uint32_t ts, uint32_t k) {
     Store *s = srv->store;
     const Config *cfg = srv->cfg;
     MailRewrite rw;
-    char received[512];
+    char token[64], reverse[384], received[512];
     char *sanitized = NULL;
     size_t slen = 0;
     int rc;
@@ -863,7 +864,20 @@ static int forward_one(Server *srv, const char *msg, size_t msglen,
     memset(&rw, 0, sizeof rw);
 
     if (sender[0] != '\0') {
-        /* preserve the original identity headers */
+        if (reply_token_gen(token, sizeof token) != VISAGE_OK ||
+            reply_make_reverse(cfg, token, alias, reverse, sizeof reverse) != VISAGE_OK) {
+            store_log_add(s, msgid, ts, LOG_DIR_OUT, alias, dest, "error");
+            return -1;
+        }
+        /* Persist token -> (sender, alias) so a reply to reply+<token>@alias
+           resolves and routes back to the original sender. */
+        if (store_revmap_add(s, token, sender, alias) != VISAGE_OK) {
+            store_log_add(s, msgid, ts, LOG_DIR_OUT, alias, dest, "error");
+            return -1;
+        }
+        /* Keep the real From (no rewrite, no Sender header); only Reply-To
+           carries the reply alias so replies route back via the alias. */
+        rw.reply_to = reverse;
         rw.return_path = alias;
     } else {
         /* null reverse-path (bounce): route plainly. */
