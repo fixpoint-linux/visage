@@ -877,6 +877,20 @@ static void do_authenticate(ImapdServer *srv, Conn *c, const char *tag,
     free(init);
 }
 
+/* RFC 6154 SPECIAL-USE attribute for a well-known mailbox name, or NULL.
+   Case-insensitive; lets clients auto-route Sent/Trash/Archive/Junk/Drafts. */
+static const char *special_use(const char *name) {
+    if (!name) return NULL;
+    if (ascii_ieq_str(name, "INBOX"))   return "\\Inbox";
+    if (ascii_ieq_str(name, "Sent"))    return "\\Sent";
+    if (ascii_ieq_str(name, "Archive")) return "\\Archive";
+    if (ascii_ieq_str(name, "Spam") || ascii_ieq_str(name, "Junk"))
+        return "\\Junk";
+    if (ascii_ieq_str(name, "Trash"))   return "\\Trash";
+    if (ascii_ieq_str(name, "Drafts"))  return "\\Drafts";
+    return NULL;
+}
+
 /* LIST "" pattern  /  LSUB "" pattern. */
 static void do_list(ImapdServer *srv, Conn *c, const char *tag,
                     const char *rest, bool sub) {
@@ -905,13 +919,17 @@ static void do_list(ImapdServer *srv, Conn *c, const char *tag,
         return;
     }
     if (imapd_wildmat(full, "INBOX")) {
-        conn_replyf(c, "* %s (\\HasNoChildren) \".\" INBOX\r\n",
-                    sub ? "LSUB" : "LIST");
+        conn_replyf(c, "* %s (\\HasNoChildren %s) \".\" INBOX\r\n",
+                    sub ? "LSUB" : "LIST",
+                    special_use("INBOX") ? special_use("INBOX") : "");
     }
     if (!sub) {
         if (imapd_mbox_list(&srv->cfg, c->user, full, &names, &nnames) == 0) {
-            for (i = 0; i < nnames; i++)
-                conn_replyf(c, "* LIST (\\HasNoChildren) \".\" %s\r\n", names[i]);
+            for (i = 0; i < nnames; i++) {
+                const char *su = special_use(names[i]);
+                conn_replyf(c, "* LIST (\\HasNoChildren %s) \".\" %s\r\n",
+                            su ? su : "", names[i]);
+            }
         }
     } else {
         char subfile[4096 + IMAPD_MAX_USER];
@@ -1270,6 +1288,72 @@ static void do_append(ImapdServer *srv, Conn *c, const char *tag,
     }
     free(name);
     free(a1);
+}
+
+/* COPY (move=false) / MOVE (move=true): file the selected messages into
+   the named mailbox.  MOVE additionally expunges them from the selected
+   mailbox (RFC 6851), sending an EXPUNGE response per removed message. */
+static void do_file(ImapdServer *srv, Conn *c, const char *tag,
+                    const char *rest, bool uid, bool move) {
+    char *set = NULL, *name = NULL;
+    size_t sl, nl;
+    const char *p = rest;
+    const char *cmd = move ? "MOVE" : "COPY";
+    if (c->ist != IST_SELECTED) {
+        conn_replyf(c, "%s BAD %s not allowed now\r\n", tag, cmd);
+        return;
+    }
+    if (c->examine) {
+        conn_replyf(c, "%s NO Mailbox is read-only\r\n", tag);
+        return;
+    }
+    while (*p == ' ') p++;
+    if (imapd_next_astring(&p, &set, &sl) != 1 || !imapd_seqset_valid(set)) {
+        conn_replyf(c, "%s BAD %s invalid sequence set\r\n", tag, cmd);
+        free(set);
+        return;
+    }
+    while (*p == ' ') p++;
+    if (imapd_next_astring(&p, &name, &nl) != 1) {
+        conn_replyf(c, "%s BAD %s requires a mailbox name\r\n", tag, cmd);
+        free(set);
+        free(name);
+        return;
+    }
+    if (ascii_ieq_str(name, c->mbname)) {
+        conn_replyf(c, "%s NO cannot %s into the selected mailbox\r\n",
+                    tag, move ? "move" : "copy");
+        free(set);
+        free(name);
+        return;
+    }
+    imapd_fetch_free(c);
+    {
+        uint32_t star = uid ? c->mb.uidnext : (uint32_t)c->mb.nmsgs;
+        if (move) {
+            size_t i;
+            for (i = c->mb.nmsgs; i > 0; i--) {
+                Imail *m = &c->mb.msgs[i - 1];
+                uint32_t v = uid ? m->uid : (uint32_t)i;
+                if (!imapd_seqset_has(set, v, star)) continue;
+                if (imapd_mbox_file(&srv->cfg, c->user, &c->mb, m->uid,
+                                    name, true) == 0)
+                    conn_replyf(c, "* %zu EXPUNGE\r\n", i);
+            }
+        } else {
+            size_t i;
+            for (i = 0; i < c->mb.nmsgs; i++) {
+                Imail *m = &c->mb.msgs[i];
+                uint32_t v = uid ? m->uid : (uint32_t)(i + 1);
+                if (!imapd_seqset_has(set, v, star)) continue;
+                imapd_mbox_file(&srv->cfg, c->user, &c->mb, m->uid, name,
+                                false);
+            }
+        }
+    }
+    conn_replyf(c, "%s OK %s completed\r\n", tag, cmd);
+    free(set);
+    free(name);
 }
 
 static void do_close(ImapdServer *srv, Conn *c, const char *tag) {
@@ -2608,6 +2692,10 @@ static void do_uid(ImapdServer *srv, Conn *c, const char *tag,
         do_search(srv, c, tag, p, true);
     } else if (ascii_ieq_str(sub, "EXPUNGE")) {
         do_expunge(srv, c, tag, p, true);
+    } else if (ascii_ieq_str(sub, "COPY")) {
+        do_file(srv, c, tag, p, true, false);
+    } else if (ascii_ieq_str(sub, "MOVE")) {
+        do_file(srv, c, tag, p, true, true);
     } else {
         conn_replyf(c, "%s BAD unknown UID command\r\n", tag);
     }
@@ -2704,6 +2792,10 @@ static void dispatch(ImapdServer *srv, Conn *c) {
         do_fetch(srv, c, tag, p, false);
     } else if (ascii_ieq_str(word, "STORE")) {
         do_store(srv, c, tag, p, false);
+    } else if (ascii_ieq_str(word, "COPY")) {
+        do_file(srv, c, tag, p, false, false);
+    } else if (ascii_ieq_str(word, "MOVE")) {
+        do_file(srv, c, tag, p, false, true);
     } else if (ascii_ieq_str(word, "UID")) {
         do_uid(srv, c, tag, p);
     } else if (ascii_ieq_str(word, "IDLE")) {

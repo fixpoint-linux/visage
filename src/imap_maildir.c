@@ -822,6 +822,62 @@ int imapd_mbox_expunge(Mbox *mb, uint32_t uid) {
     return -1;
 }
 
+/* Move (move=true) or copy (move=false) the message with uid out of mb into
+   the mailbox named dest_name (a new mailbox is created if needed).  The
+   destination gets a fresh UID via a rescan; on MOVE the source view (mb) is
+   compacted and its uidlist entry dropped, mirroring expunge.  Returns 0. */
+int imapd_mbox_file(const ImapdConfig *cfg, const char *user, Mbox *mb,
+                    uint32_t uid, const char *dest_name, bool move) {
+    char destdir[4096], dst[4096 + 64], info[32];
+    Imail *m = imapd_mbox_find(mb, uid);
+    Mbox tmp;
+    if (!m) return -1;
+    if (imapd_mbox_dir(cfg, user, dest_name, destdir, sizeof destdir) != 0)
+        return -1;
+    if (imapd_mbox_create(destdir) != 0) return -1;
+    if (imapd_flags_encode(m->flags, m->unk, info, sizeof info) != 0)
+        return -1;
+    if (msg_path(destdir, "cur", m->base, info, dst, sizeof dst) != 0)
+        return -1;
+    if (move) {
+        if (rename(m->path, dst) != 0) return -1;
+    } else {
+        int fd, wfd;
+        char buf[16384];
+        ssize_t r;
+        fd = open(m->path, O_RDONLY);
+        if (fd < 0) return -1;
+        wfd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (wfd < 0) { close(fd); return -1; }
+        while ((r = read(fd, buf, sizeof buf)) > 0) {
+            if (write(wfd, buf, (size_t)r) != r) {
+                close(fd); close(wfd); (void)unlink(dst);
+                return -1;
+            }
+        }
+        close(fd);
+        if (close(wfd) != 0 || r < 0) { (void)unlink(dst); return -1; }
+    }
+    /* register the new file with a fresh UID in the destination */
+    memset(&tmp, 0, sizeof tmp);
+    if (imapd_mbox_peek(cfg, user, dest_name, &tmp) != 0) return -1;
+    imapd_mbox_close(&tmp);
+    if (move) {
+        /* drop the source view entry (uid found again: the view is live) */
+        uidlist_drop_uid(mb, uid);
+        for (size_t i = 0; i < mb->nmsgs; i++) {
+            if (mb->msgs[i].uid != uid) continue;
+            free(mb->msgs[i].base);
+            free(mb->msgs[i].path);
+            memmove(&mb->msgs[i], &mb->msgs[i + 1],
+                    (mb->nmsgs - i - 1) * sizeof *mb->msgs);
+            mb->nmsgs--;
+            break;
+        }
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* LIST + subscriptions                                                */
 /* ------------------------------------------------------------------ */

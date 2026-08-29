@@ -350,6 +350,11 @@ int imapd_mbox_store(Mbox *mb, uint32_t uid, uint8_t flags);
    Returns 0, or -1 when the uid is absent. */
 int imapd_mbox_expunge(Mbox *mb, uint32_t uid);
 
+/* Move or copy one message (by uid) out of mb into the mailbox dest_name.
+   See imap_maildir.c.  Returns 0 on success, -1 on failure. */
+int imapd_mbox_file(const ImapdConfig *cfg, const char *user, Mbox *mb,
+                    uint32_t uid, const char *dest_name, bool move);
+
 /* List folder names (IMAP-visible, WITHOUT the INBOX) under the user's dir
    matching the LIST pattern.  Heap-allocates *out and *nout (caller frees
    each name and the array).  Returns 0, or -1 on error. */
