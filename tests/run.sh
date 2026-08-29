@@ -756,6 +756,98 @@ dkim_forward_scenario() {
     wait "$rpid" 2>/dev/null || true
 }
 
+# Scenario: forwarded From display name is derived from the original message's
+# From: header (name or address), NOT the SMTP envelope MAIL FROM.  Two sends:
+#   (1) From: "Alice Smith" <alice@foo.org>  with envelope sender sender@foo.org
+#       -> forwarded From shows the display name "Alice Smith".
+#   (2) From: bob@foo.org                    with envelope sender sender@foo.org
+#       -> forwarded From shows the address bob@foo.org.
+# In both, the envelope sender must NOT leak into the display name (the bug
+# that surfaced Mailgun-style VERP bounce addresses as the sender).
+from_display_scenario() {
+    echo
+    echo "== scenario: forwarded From display name (From header, not envelope MAIL FROM)"
+    local d="$WORK/fromdisp" db="$WORK/fromdisp/db" spool="$WORK/fromdisp/spool"
+    local relay="$WORK/fromdisp/relay" conf="$WORK/fromdisp/config.dhall"
+    local rpid="" dpid=""
+    local SMTP=2553 RELAY=2554 HTTP=8097
+    mkdir -p "$d" "$relay" "$db" "$spool"
+    gen_config "$conf" "$SMTP" "$RELAY" none False "$HTTP" "$db" "$spool" \
+        127.0.0.1 "" example.com sel1 "$ROOT/tests/dkim-test-key.pem"
+
+    cat >"$d/msg-disp.eml" <<'EOM'
+From: "Alice Smith" <alice@foo.org>
+To: jane@example.com
+Subject: display-name forward test
+
+Body for the display-name case.
+EOM
+    cat >"$d/msg-bare.eml" <<'EOM'
+From: bob@foo.org
+To: jane@example.com
+Subject: bare-address forward test
+
+Body for the bare-address case.
+EOM
+
+    "$ROOT/tests/relay_fake.com" "$RELAY" "$relay" >"$d/relay.log" 2>&1 &
+    rpid=$!
+    sleep 0.3
+    if ! kill -0 "$rpid" 2>/dev/null; then
+        fail "FROMDISP: relay_fake failed to start (see $d/relay.log)"
+        return
+    fi
+    "$ROOT/visage.com" daemon -c "$conf" >"$d/daemon.log" 2>&1 &
+    dpid=$!
+    if wait_health "$HTTP" "$dpid" "$d/daemon.log"; then
+        pass "FROMDISP: daemon up (GET /health ok)"
+    else
+        fail "FROMDISP: daemon failed to become healthy"
+        [ -n "$rpid" ] && kill "$rpid" 2>/dev/null
+        return
+    fi
+
+    # Envelope MAIL FROM=sender@foo.org differs from both From: addresses, so a
+    # correct forward must NOT put sender@foo.org in the display name.
+    "$ROOT/tests/smtptest.com" 127.0.0.1 "$SMTP" sender@foo.org jane@example.com "$d/msg-disp.eml" >"$d/fwd1.log" 2>&1 \
+        && pass "FROMDISP: smtptest (display-name From) accepted" \
+        || fail "FROMDISP: smtptest (display-name From) failed (see $d/fwd1.log)"
+    "$ROOT/tests/smtptest.com" 127.0.0.1 "$SMTP" sender@foo.org jane@example.com "$d/msg-bare.eml" >"$d/fwd2.log" 2>&1 \
+        && pass "FROMDISP: smtptest (bare-address From) accepted" \
+        || fail "FROMDISP: smtptest (bare-address From) failed (see $d/fwd2.log)"
+
+    local FW1="$relay/msg-1.eml" FW2="$relay/msg-2.eml"
+    if wait_for_file "$FW1"; then
+        if grep -q '^From: "Alice Smith" <reply+[0-9a-f]\{32\}@example.com>' "$FW1"; then
+            pass "FROMDISP: display-name From preserved in forwarded message"
+        else
+            fail "FROMDISP: forwarded From lacks the display name (see $FW1)"
+        fi
+        if grep -q '^From: "sender@foo.org"' "$FW1" \
+           || grep -q '^From: "alice@foo.org"' "$FW1"; then
+            fail "FROMDISP: envelope/address leaked into display name (see $FW1)"
+        else
+            pass "FROMDISP: envelope sender did not leak into the display name"
+        fi
+    else
+        fail "FROMDISP: relay did not record msg-1.eml"
+    fi
+    if wait_for_file "$FW2"; then
+        if grep -q '^From: "bob@foo.org" <reply+[0-9a-f]\{32\}@example.com>' "$FW2"; then
+            pass "FROMDISP: bare-address From used as display name"
+        else
+            fail "FROMDISP: bare-address From not used as display name (see $FW2)"
+        fi
+    else
+        fail "FROMDISP: relay did not record msg-2.eml"
+    fi
+
+    [ -n "$dpid" ] && kill "$dpid" 2>/dev/null
+    [ -n "$rpid" ] && kill "$rpid" 2>/dev/null
+    wait "$dpid" 2>/dev/null || true
+    wait "$rpid" 2>/dev/null || true
+}
+
 # Scenario: M-5 bounce-loop guard.  A message submitted with the null
 # reverse-path (MAIL FROM:<>, i.e. a bounce) to jane@example.com must be
 # forwarded with the null envelope preserved end-to-end: the relay's recorded
@@ -974,6 +1066,7 @@ restart_persistence_scenario
 
 # (R9) DKIM signing scenario ------------------------------------------------
 dkim_forward_scenario
+from_display_scenario
 
 # (M-5) null reverse-path preserved on forward ---------------------------------
 null_path_scenario

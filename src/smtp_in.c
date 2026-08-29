@@ -842,6 +842,67 @@ static void forward_sign(const Config *cfg, const char *alias,
     *slen = signed_len;
 }
 
+/* Best-effort display-name source for the forwarded From:. Prefer the
+   original message's From: display name when it is clean (no RFC 2047
+   encoded word, no quote/angle char that would break the quoted form), else
+   the original From: address, else the SMTP envelope sender. Heap-allocates
+   *out (caller frees). Never fails. */
+static void forward_from_display(const char *msg, size_t msglen,
+                                 const char *envelope, char **out) {
+    char from[1024];
+    *out = NULL;
+    if (msg && mail_header_get(msg, msglen, "From", from, sizeof from) == 0) {
+        const char *lt = strchr(from, '<');
+        const char *gt = lt ? strchr(lt, '>') : NULL;
+        if (lt && gt && gt > lt) {
+            size_t nl = (size_t)(lt - from);
+            while (nl && (from[nl - 1] == ' ' || from[nl - 1] == '\t')) nl--;
+            const char *dn = from, *end = from + nl;
+            if (dn < end && dn[0] == '"' && end[-1] == '"') { dn++; end--; }
+            if (dn < end) {
+                char name[512];
+                size_t nn = (size_t)(end - dn);
+                if (nn < sizeof name) {
+                    memcpy(name, dn, nn); name[nn] = '\0';
+                    if (!strstr(name, "=?") && !strchr(name, '<') &&
+                        !strchr(name, '>') && !strchr(name, '"')) {
+                        *out = strdup(name);
+                        return;
+                    }
+                }
+            }
+            size_t al = (size_t)(gt - lt - 1);
+            if (al > 0 && al < 512) {
+                char addr[512], *l = NULL, *d = NULL;
+                memcpy(addr, lt + 1, al); addr[al] = '\0';
+                if (mail_addr_parse(addr, &l, &d) == 0) {
+                    free(l); free(d);
+                    *out = strdup(addr);
+                    return;
+                }
+            }
+        } else {
+            size_t fl = strlen(from);
+            const char *v = from, *vend = from + fl;
+            while (v < vend && (*v == ' ' || *v == '\t')) v++;
+            while (vend > v && (vend[-1] == ' ' || vend[-1] == '\t')) vend--;
+            if (v < vend) {
+                char bare[512], *l = NULL, *d = NULL;
+                size_t bl = (size_t)(vend - v);
+                if (bl < sizeof bare) {
+                    memcpy(bare, v, bl); bare[bl] = '\0';
+                    if (mail_addr_parse(bare, &l, &d) == 0) {
+                        free(l); free(d);
+                        *out = strdup(bare);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    *out = strdup(envelope ? envelope : "");
+}
+
 /* Forward one sanitized copy of the message through `alias` to `dest`.
    Mints a reverse-alias token (or a plain rewrite for a null reverse-path)
    and durably enqueues the sanitized message for outbound delivery.  Returns
@@ -862,12 +923,17 @@ static int forward_one(Server *srv, const char *msg, size_t msglen,
     memset(&rw, 0, sizeof rw);
 
     if (sender[0] != '\0') {
+        char *display = NULL;
+        forward_from_display(msg, msglen, sender, &display);
+        const char *disp = display ? display : sender;
         if (reply_token_gen(token, sizeof token) != VISAGE_OK ||
             reply_make_reverse(cfg, token, alias, reverse, sizeof reverse) != VISAGE_OK ||
-            reply_rewrite_build(sender, alias, reverse, &rw) != VISAGE_OK) {
+            reply_rewrite_build(disp, alias, reverse, &rw) != VISAGE_OK) {
+            free(display);
             store_log_add(s, msgid, ts, LOG_DIR_OUT, alias, dest, "error");
             return -1;
         }
+        free(display);
         /* Persist the reply token -> (original sender, alias) mapping so an
            inbound reply to reply+<token>@domain can be routed back. Without
            this the reverse alias is written into the headers but never
