@@ -76,6 +76,10 @@ static int ascii_strncasecmp(const char *a, const char *b, size_t n) {
     return 0;
 }
 
+static int ascii_tolower(int c) {
+    return (c >= 'A' && c <= 'Z') ? c + 32 : c;
+}
+
 static bool ascii_ieq_str(const char *a, const char *b) {
     while (*a && *b) {
         char ca = *a++, cb = *b++;
@@ -86,18 +90,51 @@ static bool ascii_ieq_str(const char *a, const char *b) {
     return *a == *b;
 }
 
-/* Case-insensitive substring search (naive; v1 bounded workloads). */
+/* Copy src into dst, dropping CR/LF so a value can't inject protocol bytes
+   into a reply line.  Always NUL-terminates within dstsz. */
+static void imapd_clean_reply_name(const char *src, char *dst, size_t dstsz) {
+    size_t n = 0;
+    if (dstsz == 0) return;
+    while (src && *src && n + 1 < dstsz) {
+        unsigned char c = (unsigned char)*src++;
+        if (c == '\r' || c == '\n') continue;
+        dst[n++] = (char)c;
+    }
+    dst[n] = '\0';
+}
+
+/* Case-insensitive substring search, linear time (KMP).  Bounded-work SEARCH
+   over potentially large message bodies; the naive nested loop is O(n*m). */
 static const char *ci_strstr(const char *hay, size_t haylen,
                              const char *needle) {
-    size_t nl;
-    size_t i;
+    size_t nl, i, q;
+    size_t *fail;
+    char hc;
     if (!hay || !needle) return NULL;
     nl = strlen(needle);
     if (nl == 0) return hay;
     if (haylen < nl) return NULL;
-    for (i = 0; i + nl <= haylen; i++) {
-        if (ascii_strncasecmp(hay + i, needle, nl) == 0) return hay + i;
+    fail = malloc(nl * sizeof *fail);
+    if (!fail) return NULL;   /* OOM: treat as no-match rather than O(n*m) */
+    /* failure function for the needle */
+    fail[0] = 0;
+    for (i = 1; i < nl; i++) {
+        q = fail[i - 1];
+        while (q > 0 && ascii_tolower(needle[i]) != ascii_tolower(needle[q]))
+            q = fail[q - 1];
+        if (ascii_tolower(needle[i]) == ascii_tolower(needle[q]))
+            q++;
+        fail[i] = q;
     }
+    q = 0;
+    for (i = 0; i < haylen; i++) {
+        hc = ascii_tolower(hay[i]);
+        while (q > 0 && hc != ascii_tolower(needle[q]))
+            q = fail[q - 1];
+        if (hc == ascii_tolower(needle[q])) q++;
+        if (q == nl) { free(fail); return hay + i - nl + 1; }
+    }
+    free(fail);
     return NULL;
 }
 
@@ -131,6 +168,47 @@ static int read_file(const char *path, char **out, size_t *outlen) {
     buf[off] = '\0';
     *out = buf;
     *outlen = off;
+    return 0;
+}
+
+/* Read only the header block (up to IMAPD_HDR_CAP or the blank line),
+   NUL-terminated.  Cheaper than reading a whole large message for a
+   header-only SEARCH/SORT. */
+static size_t msg_hdr_end(const char *msg, size_t len);   /* fwd */
+static int read_hdr(const char *path, char **out, size_t *outlen) {
+    int fd;
+    char *buf;
+    size_t got = 0, want, he;
+    struct stat st;
+    if (!path || !out || !outlen) return -1;
+    *out = NULL;
+    *outlen = 0;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    /* Allocate at most the header cap, but not more than the file size
+       (typical headers are a few KB; the full cap is only for huge ones). */
+    if (fstat(fd, &st) != 0 || st.st_size < 0) { close(fd); return -1; }
+    want = (size_t)st.st_size < IMAPD_HDR_CAP ? (size_t)st.st_size
+                                              : IMAPD_HDR_CAP;
+    buf = malloc(want + 1);
+    if (!buf) { close(fd); return -1; }
+    while (got < want) {
+        ssize_t r = read(fd, buf + got, want - got);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            free(buf);
+            close(fd);
+            return -1;
+        }
+        if (r == 0) break;
+        got += (size_t)r;
+    }
+    close(fd);
+    buf[got] = '\0';
+    he = msg_hdr_end(buf, got);
+    buf[he] = '\0';
+    *out = buf;
+    *outlen = he;
     return 0;
 }
 
@@ -252,10 +330,10 @@ int imapd_next_astring(const char **p, char **out, size_t *outlen) {
         s++;
         for (;;) {
             char ch = *s;
-            if (ch == '\0') return -1;   /* unterminated */
+            if (ch == '\0') { free(buf); return -1; }   /* unterminated */
             if (ch == '\\') {
                 s++;
-                if (*s == '\0') return -1;
+                if (*s == '\0') { free(buf); return -1; }
                 ch = *s++;
             } else if (ch == '"') {
                 s++;
@@ -349,13 +427,24 @@ void imapd_search_free(SearchKey *k) {
 }
 
 /* One bare search key from *p (caller looped for implicit AND). */
+#define IMAPD_MAX_SEARCH_DEPTH 64
+
+static int imapd_search_parse_depth(const char **p, SearchKey **out,
+                                    int depth);
+
 int imapd_search_parse(const char **p, SearchKey **out) {
+    return imapd_search_parse_depth(p, out, 0);
+}
+
+static int imapd_search_parse_depth(const char **p, SearchKey **out,
+                                    int depth) {
     const char *s = *p;
     char *tok = NULL;
     size_t tlen = 0;
     SearchKey *k;
     int r;
 
+    if (depth > IMAPD_MAX_SEARCH_DEPTH) return -1;   /* reject pathological nesting */
     *out = NULL;
     while (*s == ' ') s++;
     if (*s == '\0') { *p = s; return 0; }
@@ -368,7 +457,7 @@ int imapd_search_parse(const char **p, SearchKey **out) {
             while (*s == ' ') s++;
             if (*s == ')') { s++; break; }
             if (*s == '\0') return -1;
-            r = imapd_search_parse(&s, &sub);
+            r = imapd_search_parse_depth(&s, &sub, depth + 1);
             if (r <= 0) return -1;
             if (!grp) {
                 grp = sk_new(SK_AND);
@@ -620,10 +709,12 @@ int imapd_search_parse_program(const char **p, SearchKey **out) {
     return 1;
 }
 
+/* Do any keys need the message body (vs just headers)?  A program with only
+   header keys can be matched against a truncated header-only read, avoiding
+   the cost of loading full 2.8GB of message bodies for a FROM/SUBJECT search. */
 bool imapd_search_needs_body(const SearchKey *k) {
     if (!k) return false;
     switch (k->kind) {
-    case SK_FROM: case SK_TO: case SK_SUBJECT: case SK_HEADER:
     case SK_BODY: case SK_TEXT:
         return true;
     case SK_NOT:
@@ -632,6 +723,26 @@ bool imapd_search_needs_body(const SearchKey *k) {
         return imapd_search_needs_body(k->a) || imapd_search_needs_body(k->b);
     case SK_AND:
         return imapd_search_needs_body(k->a) || imapd_search_needs_body(k->b);
+    default:
+        return false;
+    }
+}
+
+/* True if any key reads a header (FROM/TO/SUBJECT/HEADER) and none needs the
+   full body.  Such a search can match against a header-only read. */
+static bool imapd_search_needs_hdr(const SearchKey *k) {
+    if (!k) return false;
+    switch (k->kind) {
+    case SK_FROM: case SK_TO: case SK_SUBJECT: case SK_HEADER:
+        return true;
+    case SK_BODY: case SK_TEXT:
+        return true;   /* full body: caller will use the whole message */
+    case SK_NOT:
+        return imapd_search_needs_hdr(k->a);
+    case SK_OR:
+        return imapd_search_needs_hdr(k->a) || imapd_search_needs_hdr(k->b);
+    case SK_AND:
+        return imapd_search_needs_hdr(k->a) || imapd_search_needs_hdr(k->b);
     default:
         return false;
     }
@@ -825,10 +936,10 @@ static int buf_appendf(char **buf, size_t *len, size_t *cap,
 /* Canonical CAPABILITY string (pure; unit-tested by imap_check.c). */
 const char *imapd_capability(bool tls_active, bool tls_avail,
                              bool plain_auth_ok) {
-    if (tls_active)   return "IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS CONDSTORE LITERAL+ NAMESPACE ID SORT";   /* RFC 2595: no STARTTLS once TLS is up */
-    if (!tls_avail)   return "IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS CONDSTORE LITERAL+ NAMESPACE ID SORT";   /* no cert: legacy plaintext default */
-    if (plain_auth_ok) return "IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS CONDSTORE LITERAL+ NAMESPACE ID SORT";
-    return "IMAP4rev1 STARTTLS LOGINDISABLED IDLE UIDPLUS CONDSTORE LITERAL+ NAMESPACE ID SORT";         /* RFC 3501 11.1 */
+    if (tls_active)   return "IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS CONDSTORE NAMESPACE ID SORT";   /* RFC 2595: no STARTTLS once TLS is up */
+    if (!tls_avail)   return "IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS CONDSTORE NAMESPACE ID SORT";   /* no cert: legacy plaintext default */
+    if (plain_auth_ok) return "IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS CONDSTORE NAMESPACE ID SORT";
+    return "IMAP4rev1 STARTTLS LOGINDISABLED IDLE UIDPLUS CONDSTORE NAMESPACE ID SORT";         /* RFC 3501 11.1 */
 }
 
 /* Loopback bind-address classifier (pure; unit-tested by imap_check.c).
@@ -855,7 +966,15 @@ static const char *cap_of(ImapdServer *srv, Conn *c) {
 
 static void auth_apply(ImapdServer *srv, Conn *c, const char *tag,
                        const char *user, const char *pass) {
+    time_t now = time(NULL);
+    /* Brute-force gate: refuse before even checking the credential. */
+    if (imapd_auth_blocked(srv, c->peer_ip, c->peer_ip_len, now)) {
+        conn_replyf(c, "%s NO [AUTHENTICATIONFAILED] Too many failed "
+                       "attempts; try again later\r\n", tag);
+        return;
+    }
     if (imapd_auth_check(srv, user, pass)) {
+        imapd_auth_clear(srv, c->peer_ip, c->peer_ip_len);
         free(c->user);
         c->user = strdup(user);
         if (!c->user) { conn_replyf(c, "%s NO out of memory\r\n", tag); return; }
@@ -863,6 +982,7 @@ static void auth_apply(ImapdServer *srv, Conn *c, const char *tag,
         conn_replyf(c, "%s OK [CAPABILITY %s] authentication completed\r\n",
                     tag, cap_of(srv, c));
     } else {
+        imapd_auth_fail(srv, c->peer_ip, c->peer_ip_len, now);
         conn_replyf(c, "%s NO [AUTHENTICATIONFAILED] "
                        "Authentication failed\r\n", tag);
     }
@@ -881,6 +1001,10 @@ static void auth_plain_b64(ImapdServer *srv, Conn *c, const char *tag,
                     tag);
         return;
     }
+    /* Decoded output is not NUL-terminated; terminate it so the string
+       parsing below is bounded.  mlen <= 384 (512/4*3) < 512, so this is
+       always in-bounds. */
+    msg[mlen] = '\0';
     authzid = (const char *)msg;
     {
         size_t i = strlen(authzid);
@@ -1110,7 +1234,12 @@ static void do_select(ImapdServer *srv, Conn *c, const char *tag,
             (!is_inbox && (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode))) ||
             imapd_mbox_open(&srv->cfg, c->user, name, &mb) != 0) {
             close_selected(c);
-            conn_replyf(c, "%s NO Mailbox doesn't exist: %s\r\n", tag, name);
+            /* The name may contain a lone \r (rejected by mbox_name_ok);
+               strip CR/LF so a reply can't smuggle protocol bytes. */
+            char clean[IMAPD_MAX_MBOX + 1];
+            imapd_clean_reply_name(name, clean, sizeof clean);
+            conn_replyf(c, "%s NO Mailbox doesn't exist: %s\r\n",
+                        tag, clean);
             free(name);
             return;
         }
@@ -1261,6 +1390,12 @@ static void do_subscribe(ImapdServer *srv, Conn *c, const char *tag,
                     add ? "SUBSCRIBE" : "UNSUBSCRIBE");
         return;
     }
+    if (imapd_mbox_name_ok(name) != 0) {
+        conn_replyf(c, "%s BAD %s invalid mailbox name\r\n", tag,
+                    add ? "SUBSCRIBE" : "UNSUBSCRIBE");
+        free(name);
+        return;
+    }
     if (snprintf(path, sizeof path, "%s/%s/%s", srv->cfg.root, c->user,
                  IMAPD_SUBS_FILE) >= (int)sizeof path ||
         imapd_sub_write(path, ascii_ieq_str(name, "INBOX") ? "INBOX" : name,
@@ -1293,6 +1428,8 @@ static void do_status(ImapdServer *srv, Conn *c, const char *tag,
     }
     if (imapd_mbox_peek(&srv->cfg, c->user, name, &mb) != 0) {
         conn_replyf(c, "%s NO Mailbox doesn't exist: %s\r\n", tag, name);
+        for (i = 0; i < nitems; i++) free(items[i]);
+        free(items);
         free(name);
         return;
     }
@@ -1629,6 +1766,7 @@ static void do_search(ImapdServer *srv, Conn *c, const char *tag,
     size_t outlen = 0, outcap = 0;
     size_t i;
     bool needs;
+    bool needhdr;
     int r;
     if (c->ist != IST_SELECTED) {
         conn_replyf(c, "%s BAD SEARCH not allowed now\r\n", tag);
@@ -1655,15 +1793,17 @@ static void do_search(ImapdServer *srv, Conn *c, const char *tag,
         return;
     }
     needs = imapd_search_needs_body(prog);
+    needhdr = imapd_search_needs_hdr(prog);
     (void)buf_append(&out, &outlen, &outcap, "* SEARCH", 8);
     for (i = 0; i < c->mb.nmsgs; i++) {
         Imail *m = &c->mb.msgs[i];
         char *msg = NULL;
         size_t ml = 0;
         ImailDoc doc;
-        if (needs && read_file(m->path, &msg, &ml) != 0) {
-            msg = NULL;
-            ml = 0;
+        if (needs) {
+            if (read_file(m->path, &msg, &ml) != 0) { msg = NULL; ml = 0; }
+        } else if (needhdr) {
+            if (read_hdr(m->path, &msg, &ml) != 0) { msg = NULL; ml = 0; }
         }
         doc.m = m;
         doc.seq = i + 1;
@@ -1771,13 +1911,18 @@ static void do_sort(ImapdServer *srv, Conn *c, const char *tag,
     }
     {
         bool needs = imapd_search_needs_body(prog);
+        bool needhdr = imapd_search_needs_hdr(prog);
         for (i = 0; i < c->mb.nmsgs; i++) {
             Imail *m = &c->mb.msgs[i];
             char *msg = NULL;
             size_t ml = 0;
             ImailDoc doc;
             SortEnt *ne;
-            if (needs && read_file(m->path, &msg, &ml) != 0) { msg = NULL; ml = 0; }
+            if (needs) {
+                if (read_file(m->path, &msg, &ml) != 0) { msg = NULL; ml = 0; }
+            } else if (needhdr) {
+                if (read_hdr(m->path, &msg, &ml) != 0) { msg = NULL; ml = 0; }
+            }
             doc.m = m; doc.seq = i + 1; doc.msg = msg; doc.msglen = ml;
             if (!imapd_search_match(prog, &doc, c->mb.uidnext, c->mb.nmsgs)) {
                 free(msg);
@@ -1796,12 +1941,10 @@ static void do_sort(ImapdServer *srv, Conn *c, const char *tag,
             if (by_str) {
                 char hdr[4096];
                 const char *hn = "From";
-                if (needs) {
-                    /* extract the sort header if we already have the body */
-                    if (msg) {
-                        if (mail_header_get(msg, ml, hn, hdr, sizeof hdr) == 0)
-                            ne->str = strdup(hdr);
-                    }
+                if (msg) {   /* full body or header-only read */
+                    /* extract the sort header if we have the content */
+                    if (mail_header_get(msg, ml, hn, hdr, sizeof hdr) == 0)
+                        ne->str = strdup(hdr);
                 }
             }
             free(msg);
@@ -1886,7 +2029,7 @@ struct FetchGen {
     bool     uid;
     uint64_t changedsince;   /* CONDSTORE: skip msgs with modseq <= this */
     size_t  *msgs;      /* 0-based indices into mb.msgs (owned) */
-    size_t   nmsgs, msg_i;
+    size_t   nmsgs, msgs_cap, msg_i;
     FetchItem *items;   /* owned */
     size_t   nitems;
     size_t   item_i;
@@ -2782,15 +2925,19 @@ static int fetch_build_msgs(Conn *c, FetchGen *g, const char *set) {
     uint32_t star = g->uid ? c->mb.uidnext : (uint32_t)c->mb.nmsgs;
     g->msgs = NULL;
     g->nmsgs = 0;
+    g->msgs_cap = 0;
     for (i = 0; i < c->mb.nmsgs; i++) {
         uint32_t v = g->uid ? c->mb.msgs[i].uid : (uint32_t)(i + 1);
-        size_t *nl;
         if (!imapd_seqset_has(set, v, star)) continue;
         if (g->changedsince && c->mb.msgs[i].modseq <= g->changedsince)
             continue;   /* CONDSTORE: unchanged since the given modseq */
-        nl = realloc(g->msgs, (g->nmsgs + 1) * sizeof *nl);
-        if (!nl) return -1;
-        g->msgs = nl;
+        if (g->nmsgs == g->msgs_cap) {
+            size_t nc = g->msgs_cap ? g->msgs_cap * 2 : 16;
+            size_t *nl = realloc(g->msgs, nc * sizeof *nl);
+            if (!nl) return -1;
+            g->msgs = nl;
+            g->msgs_cap = nc;
+        }
         g->msgs[g->nmsgs++] = i;
     }
     return 0;
@@ -3330,6 +3477,12 @@ void imapd_imap_readable(ImapdServer *srv, Conn *c, time_t now) {
 void imapd_imap_idle_refresh(ImapdServer *srv, Conn *c) {
     if (!c->idle || c->ist != IST_SELECTED || c->fg) return;
     if (!c->mb_open) return;
+    /* Bound the rescan to the IDLE cadence even when other activity wakes
+       the poll loop more often. */
+    if (c->last_idle_scan && (time_t)(time(NULL) - c->last_idle_scan)
+            < IMAPD_IDLE_SCAN_MS / 1000)
+        return;
+    c->last_idle_scan = time(NULL);
     refresh_selected(srv, c);
 }
 

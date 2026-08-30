@@ -110,6 +110,13 @@ typedef struct Imail {
     char    *path;              /* owned: current full path              */
 } Imail;
 
+/* A single uidlist entry (uid -> base name + CONDSTORE modseq). */
+typedef struct UidEnt {
+    char    *base;
+    uint32_t uid;
+    uint64_t modseq;   /* CONDSTORE: persisted per-message change counter */
+} UidEnt;
+
 typedef struct Mbox {
     char     dir[4096];         /* mailbox directory */
     uint32_t uidvalidity;
@@ -117,6 +124,11 @@ typedef struct Mbox {
     uint64_t highestmodseq;     /* CONDSTORE: max modseq in this mailbox */
     Imail   *msgs;              /* sorted by uid ascending */
     size_t   nmsgs, cap;
+    /* In-memory uidlist (uid -> base + modseq), loaded at scan and saved on
+       close.  Avoids rewriting the whole sidecar for every STORE. */
+    UidEnt  *uidmap;
+    size_t   nuidmap, uidmap_cap;
+    bool     uidlist_dirty;
 } Mbox;
 
 /* ------------------------------------------------------------------ */
@@ -156,6 +168,22 @@ typedef struct ImapdCred {
     char *pass;   /* owned */
 } ImapdCred;
 
+/* Brute-force protection: per-peer-IP failed-auth tracking.  A peer that
+   exceeds IMAPD_AUTH_MAX_FAILS within the window is locked out (further
+   auth attempts refused) until the lockout expires.  Cleared on success. */
+#define IMAPD_AUTH_MAX_FAILS   5
+#define IMAPD_AUTH_WINDOW_SEC  60
+#define IMAPD_AUTH_LOCKOUT_SEC 300
+#define IMAPD_AUTH_MAX_TRACKED 64   /* distinct IPs remembered */
+
+typedef struct ImapdFail {
+    unsigned char ip[16];
+    uint8_t       len;
+    uint32_t      count;
+    time_t        first_fail;
+    time_t        lock_until;
+} ImapdFail;
+
 typedef struct ImapdServer {
     ImapdConfig cfg;
     ImapdCred  *creds;
@@ -168,6 +196,8 @@ typedef struct ImapdServer {
     bool        tls_ready;       /* cert+key loaded: STARTTLS is offered  */
     bool        imap_loopback;   /* IMAP listener bound to a loopback addr */
     bool        pop3_loopback;   /* POP3 listener bound to a loopback addr */
+    ImapdFail   fails[IMAPD_AUTH_MAX_TRACKED];
+    size_t      nfails;
 } ImapdServer;
 
 typedef struct FetchGen FetchGen;   /* opaque: imapd_imap.c */
@@ -216,6 +246,7 @@ typedef struct Conn {
     char   auth_tag[IMAPD_MAX_TAG + 1]; /* pending AUTHENTICATE continuation */
     char   idle_tag[IMAPD_MAX_TAG + 1]; /* pending IDLE command tag */
     bool   idle;              /* RFC 2177 IDLE in progress (SELECTED) */
+    time_t last_idle_scan;    /* last time an IDLE mailbox rescan ran */
     int    mode;               /* IC_LINE / IC_LIT */
     bool   cont_auth;          /* next line is an AUTHENTICATE b64 reply */
     size_t lit_left;           /* IC_LIT: literal bytes still expected */
@@ -389,6 +420,15 @@ int imapd_auth_load(const ImapdConfig *cfg, ImapdServer *srv);
 /* Exact user+pass match against the loaded table. */
 bool imapd_auth_check(const ImapdServer *srv, const char *user,
                       const char *pass);
+
+/* Per-IP failed-auth tracking (brute-force lockout).  Call imapd_auth_fail
+   on a rejected attempt, imapd_auth_clear on success, and refuse to even
+   attempt when imapd_auth_blocked() is true. */
+void imapd_auth_fail(ImapdServer *srv, const unsigned char *ip, uint8_t len,
+                     time_t now);
+void imapd_auth_clear(ImapdServer *srv, const unsigned char *ip, uint8_t len);
+bool imapd_auth_blocked(ImapdServer *srv, const unsigned char *ip,
+                        uint8_t len, time_t now);
 
 /* Add/replace one "user:pass" line in $ROOT/imapd.passwd (creating the root
    dir and chmod 0600).  Used by the `imapd passwd` subcommand. */

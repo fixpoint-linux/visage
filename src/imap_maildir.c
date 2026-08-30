@@ -458,16 +458,68 @@ int imapd_mbox_deliver(const char *dir, const char *msg, size_t len,
 /* uidlist sidecar                                                     */
 /* ------------------------------------------------------------------ */
 
-typedef struct UidEnt {
-    char    *base;
-    uint32_t uid;
-    uint64_t modseq;   /* CONDSTORE: persisted per-message change counter */
-} UidEnt;
-
+/* (UidEnt is defined in imapd.h.) */
 static void uidlist_free(UidEnt *v, size_t n) {
     size_t i;
     for (i = 0; i < n; i++) free(v[i].base);
     free(v);
+}
+
+/* Open-addressed hash from base name -> index into a UidEnt array.  Used to
+   make maildir scans O(n) instead of O(n^2) on large mailboxes. */
+typedef struct BaseHash {
+    char    **key;    /* owned base strings (NULL = empty slot) */
+    uint32_t *val;    /* map array index */
+    size_t    cap;    /* power of two */
+} BaseHash;
+
+static uint32_t bh_hash(const char *s) {
+    uint32_t h = 2166136261u;
+    while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; }
+    return h;
+}
+
+static void bh_free(BaseHash *h) {
+    size_t i;
+    if (!h->key) return;
+    for (i = 0; i < h->cap; i++) free(h->key[i]);
+    free(h->key);
+    free(h->val);
+    h->key = NULL;
+    h->val = NULL;
+    h->cap = 0;
+}
+
+static int bh_init(BaseHash *h, size_t n) {
+    size_t cap = 16;
+    memset(h, 0, sizeof *h);
+    while (cap < n * 2) cap <<= 1;
+    h->key = calloc(cap, sizeof *h->key);
+    h->val = calloc(cap, sizeof *h->val);
+    if (!h->key || !h->val) { bh_free(h); return -1; }
+    h->cap = cap;
+    return 0;
+}
+
+static int bh_put(BaseHash *h, const char *base, uint32_t val) {
+    size_t i = bh_hash(base) & (h->cap - 1);
+    while (h->key[i]) {
+        if (strcmp(h->key[i], base) == 0) { h->val[i] = val; return 0; }
+        i = (i + 1) & (h->cap - 1);
+    }
+    h->key[i] = strdup(base);
+    if (!h->key[i]) return -1;   /* OOM: leave slot empty; caller must bail */
+    h->val[i] = val;
+    return 0;
+}
+
+static bool bh_get(const BaseHash *h, const char *base, uint32_t *val) {
+    size_t i = bh_hash(base) & (h->cap - 1);
+    while (h->key[i]) {
+        if (strcmp(h->key[i], base) == 0) { *val = h->val[i]; return true; }
+        i = (i + 1) & (h->cap - 1);
+    }
+    return false;
 }
 
 static int uidlist_path(const Mbox *mb, char *out, size_t outsz) {
@@ -584,6 +636,14 @@ void imapd_mbox_close(Mbox *mb) {
     free(mb->msgs);
     mb->msgs = NULL;
     mb->nmsgs = mb->cap = 0;
+    /* Flush any STORE/EXPUNGE-driven uidlist changes made this session. */
+    if (mb->uidlist_dirty && mb->uidmap)
+        (void)uidlist_save(mb, mb->uidvalidity, mb->uidnext,
+                           mb->uidmap, mb->nuidmap);
+    uidlist_free(mb->uidmap, mb->nuidmap);
+    mb->uidmap = NULL;
+    mb->nuidmap = mb->uidmap_cap = 0;
+    mb->uidlist_dirty = false;
 }
 
 /* Append one scanned file to the view (takes ownership of base/path). */
@@ -620,8 +680,9 @@ static int imail_uid_cmp(const void *pa, const void *pb) {
 
 /* Scan one of new//cur/; assigns UIDs from the uidlist map or uidnext. */
 static int scan_subdir(Mbox *mb, const char *sub, bool is_new,
-                       UidEnt **map, size_t *nmap,
-                       uint32_t *uidnext, bool *changed) {
+                       UidEnt **map, size_t *nmap, size_t *map_cap,
+                       uint32_t *uidnext, bool *changed,
+                       const BaseHash *bh) {
     char sub_dir[4096 + 8];
     DIR *d;
     struct dirent *e;
@@ -636,7 +697,7 @@ static int scan_subdir(Mbox *mb, const char *sub, bool is_new,
         uint32_t uid = 0;
         uint64_t modseq = 1;
         uint8_t flags = 0;
-        size_t i, bl;
+        size_t bl;
         char *base, *fpath;
         if (e->d_name[0] == '.') continue;
         colon = strchr(e->d_name, ':');
@@ -653,31 +714,38 @@ static int scan_subdir(Mbox *mb, const char *sub, bool is_new,
         if (snprintf(path, sizeof path, "%s/%s", sub_dir, e->d_name)
                 >= (int)sizeof path) continue;
         if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
-        for (i = 0; i < *nmap; i++) {
-            if (strlen((*map)[i].base) == bl &&
-                memcmp((*map)[i].base, e->d_name, bl) == 0) {
-                uid = (*map)[i].uid;
-                modseq = (*map)[i].modseq;
-                break;
+        {
+            /* Look the base up in the uidlist (O(1) via hash). */
+            char tmp[4096 + 64];
+            uint32_t idx;
+            if (bl < sizeof tmp) {
+                memcpy(tmp, e->d_name, bl);
+                tmp[bl] = '\0';
+                if (bh && bh_get(bh, tmp, &idx)) {
+                    uid = (*map)[idx].uid;
+                    modseq = (*map)[idx].modseq;
+                }
             }
         }
         if (uid == 0) {
-            UidEnt *nv;
             uid = (*uidnext)++;
             modseq = (*uidnext);   /* new message: modseq >= any prior */
             *changed = true;
             /* record the assignment so the next save persists it */
-            nv = realloc(*map, (*nmap + 1) * sizeof **map);
-            if (nv) {
+            if (*nmap == *map_cap) {
+                size_t nc = *map_cap ? *map_cap * 2 : 16;
+                UidEnt *nv = realloc(*map, nc * sizeof **map);
+                if (!nv) continue;
                 *map = nv;
-                (*map)[*nmap].base = malloc(bl + 1);
-                if ((*map)[*nmap].base) {
-                    memcpy((*map)[*nmap].base, e->d_name, bl);
-                    (*map)[*nmap].base[bl] = '\0';
-                    (*map)[*nmap].uid = uid;
-                    (*map)[*nmap].modseq = modseq;
-                    (*nmap)++;
-                }
+                *map_cap = nc;
+            }
+            (*map)[*nmap].base = malloc(bl + 1);
+            if ((*map)[*nmap].base) {
+                memcpy((*map)[*nmap].base, e->d_name, bl);
+                (*map)[*nmap].base[bl] = '\0';
+                (*map)[*nmap].uid = uid;
+                (*map)[*nmap].modseq = modseq;
+                (*nmap)++;
             }
         }
         base = malloc(bl + 1);
@@ -698,10 +766,11 @@ static int scan_subdir(Mbox *mb, const char *sub, bool is_new,
 static int mbox_scan(Mbox *mb, const ImapdConfig *cfg, const char *user,
                      const char *name, bool move_new) {
     UidEnt *map = NULL;
-    size_t nmap = 0, i, j;
+    size_t nmap = 0, map_cap = 0, i;
     uint32_t uidvalidity = (uint32_t)time(NULL);
     uint32_t uidnext = 1;
     bool changed = false;
+    bool map_owned = false;
     int rc = -1;
 
     memset(mb, 0, sizeof *mb);
@@ -711,34 +780,58 @@ static int mbox_scan(Mbox *mb, const ImapdConfig *cfg, const char *user,
 
     map = uidlist_load(mb, &uidvalidity, &uidnext, &nmap);
     if (uidnext == 0) uidnext = 1;
+    map_owned = (map != NULL);
+    map_cap = nmap;
 
-    if (scan_subdir(mb, "new", true, &map, &nmap, &uidnext, &changed) != 0)
-        goto out;
-    if (scan_subdir(mb, "cur", false, &map, &nmap, &uidnext, &changed) != 0)
-        goto out;
+    /* Index the uidlist by base so the two scan_subdir passes are O(n). */
+    {
+        BaseHash bht;
+        if (bh_init(&bht, nmap) != 0) goto out;
+        for (i = 0; i < nmap; i++)
+            if (bh_put(&bht, map[i].base, (uint32_t)i) != 0) {
+                bh_free(&bht);
+                goto out;
+            }
+        if (scan_subdir(mb, "new", true, &map, &nmap, &map_cap, &uidnext,
+                        &changed, &bht) != 0) {
+            bh_free(&bht);
+            goto out;
+        }
+        if (scan_subdir(mb, "cur", false, &map, &nmap, &map_cap, &uidnext,
+                        &changed, &bht) != 0) {
+            bh_free(&bht);
+            goto out;
+        }
+        bh_free(&bht);
+    }
 
     if (mb->nmsgs > 1)
         qsort(mb->msgs, mb->nmsgs, sizeof *mb->msgs, imail_uid_cmp);
 
-    /* Prune uidlist entries whose file vanished. */
-    for (i = 0; i < nmap; ) {
-        bool found = false;
-        for (j = 0; j < mb->nmsgs; j++) {
-            if (mb->msgs[j].uid == map[i].uid &&
-                strlen(mb->msgs[j].base) == strlen(map[i].base) &&
-                memcmp(mb->msgs[j].base, map[i].base,
-                       strlen(map[i].base)) == 0) {
-                found = true;
-                break;
+    /* Prune uidlist entries whose file vanished (O(n) via a base hash). */
+    {
+        BaseHash seen;
+        if (bh_init(&seen, mb->nmsgs) == 0) {
+            int ok = 0;
+            for (i = 0; i < mb->nmsgs; i++)
+                if (bh_put(&seen, mb->msgs[i].base, mb->msgs[i].uid) != 0) {
+                    ok = -1;
+                    break;
+                }
+            if (ok != 0) { bh_free(&seen); goto out; }
+            for (i = 0; i < nmap; ) {
+                uint32_t sv;
+                if (bh_get(&seen, map[i].base, &sv) &&
+                    sv == map[i].uid) {
+                    i++;
+                } else {
+                    free(map[i].base);
+                    map[i] = map[nmap - 1];
+                    nmap--;
+                    changed = true;
+                }
             }
-        }
-        if (!found) {
-            free(map[i].base);
-            map[i] = map[nmap - 1];
-            nmap--;
-            changed = true;
-        } else {
-            i++;
+            bh_free(&seen);
         }
     }
 
@@ -761,12 +854,26 @@ static int mbox_scan(Mbox *mb, const ImapdConfig *cfg, const char *user,
 
     mb->uidvalidity = uidvalidity;
     mb->uidnext = uidnext;
-    if (changed && uidlist_save(mb, uidvalidity, uidnext, map, nmap) != 0)
-        goto out;
+    /* Keep the uidlist in memory for this session (saved on close) so that
+       STORE can bump one modseq without rewriting the whole sidecar.  If the
+       scan changed it, persist immediately so a crash mid-session loses
+       nothing. */
+    if (map) {
+        mb->uidmap = map;
+        mb->nuidmap = nmap;
+        mb->uidmap_cap = map_cap;
+        map_owned = false;   /* ownership transferred to the Mbox */
+        if (changed) {
+            if (uidlist_save(mb, uidvalidity, uidnext, map, nmap) != 0)
+                goto out;
+        }
+    }
     rc = 0;
 out:
-    uidlist_free(map, nmap);
-    if (rc != 0) imapd_mbox_close(mb);
+    if (rc != 0) {
+        if (map_owned) uidlist_free(map, nmap);
+        imapd_mbox_close(mb);
+    }
     return rc;
 }
 
@@ -817,6 +924,7 @@ Imail *imapd_mbox_find(Mbox *mb, uint32_t uid) {
 
 int imapd_mbox_store(Mbox *mb, uint32_t uid, uint8_t flags) {
     char dst[4096 + 64], info[32];
+    size_t i;
     Imail *m = imapd_mbox_find(mb, uid);
     if (!m) return -1;
     if (imapd_flags_encode(flags, m->unk, info, sizeof info) != 0) return -1;
@@ -832,58 +940,43 @@ int imapd_mbox_store(Mbox *mb, uint32_t uid, uint8_t flags) {
        delivery and is persisted); guarantee strictly-greater-than. */
     if (++mb->highestmodseq == 0) mb->highestmodseq = 1;
     m->modseq = mb->highestmodseq;
-    {
-        char path[4200];
-        UidEnt *map = NULL;
-        size_t nmap = 0, i;
-        uint32_t uv = mb->uidvalidity, un = mb->uidnext;
-        if (uidlist_path(mb, path, sizeof path) == 0) {
-            map = uidlist_load(mb, &uv, &un, &nmap);
-            for (i = 0; i < nmap; i++)
-                if (map[i].uid == uid) { map[i].modseq = m->modseq; break; }
-            if (i == nmap && map) {
-                UidEnt *nv = realloc(map, (nmap + 1) * sizeof *nv);
-                if (nv) {
-                    map = nv;
-                    map[nmap].base = strdup(m->base);
-                    if (map[nmap].base) {
-                        map[nmap].uid = uid;
-                        map[nmap].modseq = m->modseq;
-                        nmap++;
-                    }
-                }
-            }
-            (void)uidlist_save(mb, mb->uidvalidity, mb->uidnext, map, nmap);
-            uidlist_free(map, nmap);
+    /* Update the in-memory uidlist entry (persisted on close). */
+    for (i = 0; i < mb->nuidmap; i++) {
+        if (mb->uidmap[i].uid == uid) {
+            mb->uidmap[i].modseq = m->modseq;
+            mb->uidlist_dirty = true;
+            return 0;
         }
     }
+    /* uid absent from the map (shouldn't happen): append it. */
+    if (mb->nuidmap == mb->uidmap_cap) {
+        size_t nc = mb->uidmap_cap ? mb->uidmap_cap * 2 : 16;
+        UidEnt *nv = realloc(mb->uidmap, nc * sizeof *nv);
+        if (!nv) return -1;
+        mb->uidmap = nv;
+        mb->uidmap_cap = nc;
+    }
+    mb->uidmap[mb->nuidmap].base = strdup(m->base);
+    if (!mb->uidmap[mb->nuidmap].base) return -1;
+    mb->uidmap[mb->nuidmap].uid = uid;
+    mb->uidmap[mb->nuidmap].modseq = m->modseq;
+    mb->nuidmap++;
+    mb->uidlist_dirty = true;
     return 0;
 }
 
 /* Remove one uid from the uidlist file (best-effort prune; the next open
    would prune anyway). */
-static void uidlist_drop_uid(Mbox *mb, uint32_t uid) {
-    char path[4200];
-    char *buf = NULL;
-    size_t buflen = 0;
-    UidEnt *map = NULL;
-    size_t nmap = 0, i;
-    uint32_t uv = mb->uidvalidity, un = mb->uidnext;
-    if (uidlist_path(mb, path, sizeof path) != 0) return;
-    if (read_file(path, &buf, &buflen) != 0) return;
-    free(buf);
-    map = uidlist_load(mb, &uv, &un, &nmap);
-    for (i = 0; i < nmap; ) {
-        if (map[i].uid == uid) {
-            free(map[i].base);
-            map[i] = map[nmap - 1];
-            nmap--;
-        } else {
-            i++;
-        }
+static void uidmap_remove(Mbox *mb, uint32_t uid) {
+    size_t i;
+    for (i = 0; i < mb->nuidmap; i++) {
+        if (mb->uidmap[i].uid != uid) continue;
+        free(mb->uidmap[i].base);
+        mb->uidmap[i] = mb->uidmap[mb->nuidmap - 1];
+        mb->nuidmap--;
+        mb->uidlist_dirty = true;
+        return;
     }
-    (void)uidlist_save(mb, uv, un, map, nmap);
-    uidlist_free(map, nmap);
 }
 
 int imapd_mbox_expunge(Mbox *mb, uint32_t uid) {
@@ -896,7 +989,7 @@ int imapd_mbox_expunge(Mbox *mb, uint32_t uid) {
         memmove(&mb->msgs[i], &mb->msgs[i + 1],
                 (mb->nmsgs - i - 1) * sizeof *mb->msgs);
         mb->nmsgs--;
-        uidlist_drop_uid(mb, uid);
+        uidmap_remove(mb, uid);
         return 0;
     }
     return -1;
@@ -944,7 +1037,7 @@ int imapd_mbox_file(const ImapdConfig *cfg, const char *user, Mbox *mb,
     imapd_mbox_close(&tmp);
     if (move) {
         /* drop the source view entry (uid found again: the view is live) */
-        uidlist_drop_uid(mb, uid);
+        uidmap_remove(mb, uid);
         for (size_t i = 0; i < mb->nmsgs; i++) {
             if (mb->msgs[i].uid != uid) continue;
             free(mb->msgs[i].base);
@@ -1143,6 +1236,77 @@ bool imapd_auth_check(const ImapdServer *srv, const char *user,
         if (strcmp(srv->creds[i].user, user) == 0 &&
             strcmp(srv->creds[i].pass, pass) == 0)
             return true;
+    return false;
+}
+
+/* ---- brute-force protection (per-IP failed-auth lockout) ---- */
+
+static ImapdFail *auth_fail_find(ImapdServer *srv, const unsigned char *ip,
+                                 uint8_t len) {
+    size_t i;
+    for (i = 0; i < srv->nfails; i++)
+        if (srv->fails[i].len == len &&
+            memcmp(srv->fails[i].ip, ip, len) == 0)
+            return &srv->fails[i];
+    return NULL;
+}
+
+/* Record a failed auth for this peer.  When the threshold is crossed within
+   the window, the IP is locked out. */
+void imapd_auth_fail(ImapdServer *srv, const unsigned char *ip, uint8_t len,
+                     time_t now) {
+    ImapdFail *f;
+    if (!srv || !ip || !len) return;
+    f = auth_fail_find(srv, ip, len);
+    if (!f) {
+        if (srv->nfails >= IMAPD_AUTH_MAX_TRACKED) {
+            /* Table full: evict the oldest expired entry (or, if none,
+               the longest-idle one) so a new attacker isn't silently
+               un-tracked while old state lingers. */
+            size_t j, ev = 0;
+            for (j = 1; j < srv->nfails; j++)
+                if (srv->fails[j].first_fail < srv->fails[ev].first_fail)
+                    ev = j;
+            f = &srv->fails[ev];
+            memset(f, 0, sizeof *f);
+        } else {
+            f = &srv->fails[srv->nfails++];
+        }
+        memcpy(f->ip, ip, len);
+        f->len = len;
+        f->count = 0;
+        f->first_fail = 0;
+        f->lock_until = 0;
+    }
+    if (now - f->first_fail > IMAPD_AUTH_WINDOW_SEC) {
+        f->first_fail = now;   /* reset the window */
+        f->count = 0;
+    }
+    f->count++;
+    if (f->count >= IMAPD_AUTH_MAX_FAILS)
+        f->lock_until = now + IMAPD_AUTH_LOCKOUT_SEC;
+}
+
+/* Clear any lockout/tally for this peer after a successful auth. */
+void imapd_auth_clear(ImapdServer *srv, const unsigned char *ip, uint8_t len) {
+    ImapdFail *f;
+    if (!srv || !ip || !len) return;
+    f = auth_fail_find(srv, ip, len);
+    if (!f) return;
+    f->count = 0;
+    f->first_fail = 0;
+    f->lock_until = 0;
+}
+
+/* True if this peer is currently locked out of auth. */
+bool imapd_auth_blocked(ImapdServer *srv, const unsigned char *ip,
+                        uint8_t len, time_t now) {
+    ImapdFail *f;
+    if (!srv || !ip || !len) return false;
+    f = auth_fail_find(srv, ip, len);
+    if (!f) return false;
+    if (f->lock_until && now < f->lock_until) return true;
+    if (f->lock_until) f->lock_until = 0;   /* lockout expired */
     return false;
 }
 

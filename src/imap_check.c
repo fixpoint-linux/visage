@@ -550,6 +550,35 @@ static void auth_test(const char *root) {
     }
 }
 
+static void bf_test(void) {
+    ImapdServer srv;
+    unsigned char ip[4] = { 10, 0, 0, 1 };
+    time_t t = 1000;
+    memset(&srv, 0, sizeof srv);
+    /* 5 failures lock out */
+    imapd_auth_fail(&srv, ip, 4, t++);
+    imapd_auth_fail(&srv, ip, 4, t++);
+    imapd_auth_fail(&srv, ip, 4, t++);
+    imapd_auth_fail(&srv, ip, 4, t++);
+    EXPECT(!imapd_auth_blocked(&srv, ip, 4, t), "not blocked before threshold");
+    imapd_auth_fail(&srv, ip, 4, t++);
+    EXPECT(imapd_auth_blocked(&srv, ip, 4, t), "blocked after 5 failures");
+    /* lock_until was set at the 5th fail (t=1004) => expires at 1304 */
+    EXPECT(imapd_auth_blocked(&srv, ip, 4, 1303), "blocked inside lockout window");
+    EXPECT(!imapd_auth_blocked(&srv, ip, 4, 1305), "unblocked after lockout expires");
+    /* success clears the tally */
+    imapd_auth_fail(&srv, ip, 4, t + 100);
+    imapd_auth_fail(&srv, ip, 4, t + 101);
+    imapd_auth_clear(&srv, ip, 4);
+    EXPECT(!imapd_auth_blocked(&srv, ip, 4, t + 200), "clear resets tally");
+    /* distinct IPs are tracked independently */
+    {
+        unsigned char ip2[4] = { 10, 0, 0, 2 };
+        EXPECT(!imapd_auth_blocked(&srv, ip2, 4, t + 200),
+               "unrelated IP unaffected");
+    }
+}
+
 /* ---- LIST wildcards ---- */
 
 static void wildmat_test(void) {
@@ -566,16 +595,16 @@ static void wildmat_test(void) {
 
 static void tls_test(void) {
     EXPECT(strcmp(imapd_capability(true, true, true),
-                  "IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS CONDSTORE LITERAL+ NAMESPACE ID SORT") == 0,
+                  "IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS CONDSTORE NAMESPACE ID SORT") == 0,
            "capability: TLS established drops STARTTLS");
     EXPECT(strcmp(imapd_capability(false, true, true),
-                  "IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS CONDSTORE LITERAL+ NAMESPACE ID SORT") == 0,
+                  "IMAP4rev1 STARTTLS AUTH=PLAIN IDLE UIDPLUS CONDSTORE NAMESPACE ID SORT") == 0,
            "capability: TLS available on loopback bind");
     EXPECT(strcmp(imapd_capability(false, true, false),
-                  "IMAP4rev1 STARTTLS LOGINDISABLED IDLE UIDPLUS CONDSTORE LITERAL+ NAMESPACE ID SORT") == 0,
+                  "IMAP4rev1 STARTTLS LOGINDISABLED IDLE UIDPLUS CONDSTORE NAMESPACE ID SORT") == 0,
            "capability: TLS available off-loopback => LOGINDISABLED");
     EXPECT(strcmp(imapd_capability(false, false, false),
-                  "IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS CONDSTORE LITERAL+ NAMESPACE ID SORT") == 0,
+                  "IMAP4rev1 AUTH=PLAIN IDLE UIDPLUS CONDSTORE NAMESPACE ID SORT") == 0,
            "capability: no cert = legacy plaintext default");
 
     EXPECT(imapd_addr_loopback("127.0.0.1"), "loopback 127.0.0.1");
@@ -701,6 +730,7 @@ int main(void) {
     tokenizer_test();
     search_test();
     b64_test();
+    bf_test();
     wildmat_test();
     tls_test();
     bodystructure_test();

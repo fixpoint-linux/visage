@@ -243,13 +243,15 @@ static int start_retr(Conn *c, size_t idx, long top) {
     size_t send_end = fsize;
     if (fd < 0) return -1;
     if (top >= 0) {
-        char buf[IMAPD_HDR_CAP];
+        char *buf = malloc(IMAPD_HDR_CAP);
         size_t got = 0, want = fsize < IMAPD_HDR_CAP ? fsize : IMAPD_HDR_CAP;
         size_t hdr_end;
+        if (!buf) { close(fd); return -1; }
         while (got < want) {
             ssize_t r = read(fd, buf + got, want - got);
             if (r < 0) {
                 if (errno == EINTR) continue;
+                free(buf);
                 close(fd);
                 return -1;
             }
@@ -257,6 +259,7 @@ static int start_retr(Conn *c, size_t idx, long top) {
             got += (size_t)r;
         }
         hdr_end = hdr_end_of(buf, got);
+        free(buf);
         send_end = top_cut(fd, hdr_end, fsize, (unsigned long)top);
     }
     g = calloc(1, sizeof *g);
@@ -424,7 +427,14 @@ static void cmd_pass(ImapdServer *srv, Conn *c, const char *arg) {
         c->pend_user = NULL;
         return;
     }
+    if (imapd_auth_blocked(srv, c->peer_ip, c->peer_ip_len, time(NULL))) {
+        pop3_err(c, "Too many failed attempts; try again later");
+        free(c->pend_user);
+        c->pend_user = NULL;
+        return;
+    }
     if (!imapd_auth_check(srv, c->pend_user, arg)) {
+        imapd_auth_fail(srv, c->peer_ip, c->peer_ip_len, time(NULL));
         /* RFC 1939: a failed PASS drops the pending USER; the client must
            re-issue USER before PASS again */
         pop3_err(c, "Invalid credentials");
@@ -432,6 +442,7 @@ static void cmd_pass(ImapdServer *srv, Conn *c, const char *arg) {
         c->pend_user = NULL;
         return;
     }
+    imapd_auth_clear(srv, c->peer_ip, c->peer_ip_len);
     free(c->user);
     c->user = strdup(c->pend_user);
     if (!c->user) { pop3_err(c, "Out of memory"); return; }
