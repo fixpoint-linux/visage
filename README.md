@@ -3,11 +3,10 @@
 A **compact email alias & forwarding server** written in C11 — give out disposable
 `alias@domain` addresses that forward to your real inbox, and reply through them too. The whole
 service — daemon *and* alias store — fits in a single small, portable [APE](https://github.com/jart/cosmopolitan)
-binary, configured in [typechecked Dhall](https://dhall-lang.org/). The same C core also builds to
-**WebAssembly** and runs fully client-side in your browser.
+binary, configured in [typechecked Dhall](https://dhall-lang.org/).
 
 > ▶ **Try it live — https://jmars.github.io/visage/** (edit a Dhall config and resolve aliases in the
-> browser, powered by the real C pipeline compiled to wasm)
+> browser)
 
 ## What it is
 
@@ -76,8 +75,6 @@ CRITICAL). Where it stands:
 - **Availability** — inbound SMTP is rate-bounded (512 conns global / 16 per-IP, `421` on excess);
   queue-driven relay sends are batched (8/tick) so a slow relay can't stall the event loop; null
   reverse-path mail is preserved end-to-end (`MAIL FROM:<>`) so DSN bounce loops can't ping-pong.
-- **Browser demo** — remote `http://` Dhall imports are **compiled out** of the wasm build, so a
-  pasted config can't make your browser probe URLs.
 
 ## Stack
 
@@ -90,34 +87,27 @@ CRITICAL). Where it stands:
 | STARTTLS / STARTTLS-verify (`vendor/mbedtls`) | relay to your mailbox provider, optionally cert-verified |
 | DKIM (`src/dkim.c`) | sign outbound mail from C |
 | durable outbound retry queue | spooled to disk, bounded retries, no lost mail |
-| emscripten | the same C core → `docs/visage.wasm` (client-side demo) |
 
 ## Build
 
-Requires `cosmocc`. `dhall-c`, `datalog-dafsa`, `dhake`, `design` and `mfe-framework` are
-vendored as git submodules; mbedTLS is vendored under `vendor/`. Every build target is driven
+Requires a host C compiler (`cc`), `zig` (to build the `libdatalog.so`/`libdhall.so` engines in
+the sibling `datalog-dafsa`/`dhall-c` checkouts), and the vendored submodules. `dhall-c`,
+`datalog-dafsa`, `dhake`, `design` and `mfe-framework` are vendored as git submodules; mbedTLS is
+vendored under `vendor/`. Every build target is driven
 by **dhake** (no Make), with **hash-verified builds** — each output pins its expected sha256
 (`hash`) and every input source pins its sha256 (`depsHash`), so a tampered or drifted artifact
-fails the build.
+fails the build. All binaries are plain glibc ELFs linked with `cc` (no APE/cosmocc).
 
 ```sh
 git submodule update --init --recursive   # first checkout: fetch all vendored submodules
-./vendor/dhake/dhake.com                  # default target `all`: visage.com + all *_check tools + tests + wasm
+# build libdatalog.so + libdhall.so once in the sibling checkouts (see their READMEs)
+./vendor/dhake/dhake.com                  # default target `all`: visage.com + all *_check tools + tests
 ./vendor/dhake/dhake.com visage.com       # build one binary
 ./vendor/dhake/dhake.com e2e              # host integration tests (tests/run.sh)
 ./vendor/dhake/dhake.com bench            # store benchmark + docs/bench-*.svg
 ./vendor/dhake/dhake.com dist/index.html  # the Elm MFE docs site
 ./vendor/dhake/dhake.com --verify         # CI pre-flight: check pinned hashes + up-to-dateness
 ./vendor/dhake/dhake.com --list           # list all targets
-```
-
-To use sibling `dhall-c`/`datalog-dafsa` checkouts instead of the submodules, point
-`scripts/build-wasm.sh` at them with `DHALL_C` (the C build reads them from `vendor/`).
-
-For the browser build (needs `emscripten clang lld llvm nodejs`):
-
-```sh
-./vendor/dhake/dhake.com wasm             # → docs/visage.js + docs/visage.wasm, then runs the wasm smoke test
 ```
 
 When a pinned hash goes stale (source or toolchain changed), rebuild with

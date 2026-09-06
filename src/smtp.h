@@ -98,6 +98,9 @@ int  smtp_in_tls_global_init(const char *cert, const char *key);
    (the queued plaintext 220 reply drains first).  Returns NULL on allocation
    or setup failure (the plaintext conn is preserved). */
 SmtpTls *smtp_in_tls_start(int fd);
+/* Feed plaintext bytes read before TLS started into the handshake
+   (implicit-TLS + PROXY: the TLS ClientHello arrives with the PROXY line). */
+int smtp_in_tls_prefeed(SmtpTls *t, const char *buf, size_t len);
 
 /* Drive one handshake round.  Returns 1 established, 0 still negotiating
    (poll POLLIN or POLLOUT per smtp_in_tls_wants_write), -1 fatal (the wire is
@@ -142,5 +145,22 @@ bool smtp_reply_has_cap(const char *reply, size_t len, const char *cap);
    SMTP_TEMPFAIL, 5xx (incl 535/534) -> SMTP_PERMFAIL, anything else ->
    SMTP_ERROR.  Pure — no I/O. */
 int smtp_auth_class(int code);
+
+/* Choose the outbound relay for one durable-queue delivery.  `is_reply` is
+   true for a reverse-alias reply (delivered through the dedicated external
+   reply_relay), false for a normal alias forward (delivered through the local
+   relay).  Returns a pointer into cfg (never NULL for a loaded Config).  Pure
+   — the reply/normal distinction itself is carried by an in-memory
+   side-channel in smtp_in.c; this just maps that flag to the relay. */
+const ConfigRelay *smtp_relay_for(const Config *cfg, bool is_reply);
+
+/* Deliver a single envelope to an EXPLICIT host:port (outbox direct MX
+   delivery), reusing the same connect/TLS/dialogue machinery as smtp_out_send
+   but keyed off `host`/`port` instead of Config.relay.host/port.  `c->relay`
+   still supplies the TLS mode / timeouts / retries; pass relay.retries == 0 to
+   let the caller drive its own per-MX retry loop. */
+int smtp_out_send_host(const Config *c, const char *host, uint32_t port,
+                       const char *from, const char *to, const char *body,
+                       size_t bodylen, char *status_out, size_t status_sz);
 
 #endif /* VISAGE_SMTP_H */

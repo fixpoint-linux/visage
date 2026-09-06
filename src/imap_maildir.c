@@ -48,10 +48,14 @@ out:
 }
 
 static int write_file(const char *path, const char *data, size_t len) {
-    FILE *f = fopen(path, "wb");
+    /* 0600: mail bodies must not be world-readable on the host. */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     size_t w;
     int rc;
-    if (!f) return -1;
+    FILE *f;
+    if (fd < 0) return -1;
+    f = fdopen(fd, "wb");
+    if (!f) { close(fd); return -1; }
     w = fwrite(data, 1, len, f);
     rc = fclose(f);
     if (w != len || rc != 0) return -1;
@@ -89,6 +93,28 @@ static int read_file(const char *path, char **out, size_t *outlen) {
     *out = buf;
     *outlen = off;
     return 0;
+}
+
+/* Extract the Message-ID header value from a message buffer (malloc'd, or
+   NULL if absent).  Feeds the fast SEARCH Message-ID index so searches don't
+   have to read every message file. */
+static char *imapd_msgid_of_buf(const char *msg, size_t len) {
+    char buf[1024];
+    if (!msg || len == 0) return NULL;
+    if (mail_header_get(msg, len, "Message-ID", buf, sizeof buf) != 0 ||
+        buf[0] == '\0')
+        return NULL;
+    return strdup(buf);
+}
+
+static char *imapd_msgid_of_file(const char *path) {
+    char *msg = NULL, *mid = NULL;
+    size_t ml = 0;
+    if (read_file(path, &msg, &ml) == 0) {
+        mid = imapd_msgid_of_buf(msg, ml);
+        free(msg);
+    }
+    return mid;
 }
 
 /* Recursively remove a directory tree (bounded: directories only, and the
@@ -461,7 +487,7 @@ int imapd_mbox_deliver(const char *dir, const char *msg, size_t len,
 /* (UidEnt is defined in imapd.h.) */
 static void uidlist_free(UidEnt *v, size_t n) {
     size_t i;
-    for (i = 0; i < n; i++) free(v[i].base);
+    for (i = 0; i < n; i++) { free(v[i].base); free(v[i].mid); }
     free(v);
 }
 
@@ -557,43 +583,51 @@ static UidEnt *uidlist_load(const Mbox *mb, uint32_t *uidvalidity,
         unsigned long long uid = 0;
         size_t bl;
         char *base;
+        char *mid = NULL;
         uint64_t modseq = 1;
+        char *rest;
         if (sscanf(p, "%llu", &uid) != 1) break;
         nl = strchr(p, '\n');
         if (!nl) nl = p + strlen(p);
         p += strspn(p, "0123456789");
         if (*p != ' ') break;   /* malformed line: keep what we have */
         p++;
+        /* base: up to the next space or end of line */
         bl = (size_t)(nl - p);
+        rest = memchr(p, ' ', bl);
+        if (rest) bl = (size_t)(rest - p);
         if (bl == 0) break;
-        /* Optional trailing " <modseq>" (CONDSTORE).  Older uidlists lack it;
-           treat those messages as modseq 1. */
-        {
-            char *sp = memchr(p, ' ', bl);
-            if (sp) {
-                unsigned long long ms = 0;
-                if (sscanf(sp, " %llu", &ms) == 1) {
-                    modseq = ms;
-                    bl = (size_t)(sp - p);
-                }
-            }
-        }
-        if (bl == 0 || memchr(p, ' ', bl)) break;   /* no base, or junk */
         base = malloc(bl + 1);
         if (!base) break;
         memcpy(base, p, bl);
         base[bl] = '\0';
+        /* Optional " <modseq>" (CONDSTORE; older uidlists lack it) and then
+           an optional " <message-id>".  Message-IDs never contain spaces. */
+        if (rest) {
+            char *q = rest + 1;
+            unsigned long long ms = 0;
+            if (sscanf(q, "%llu", &ms) == 1) {
+                modseq = ms;
+                q += strspn(q, "0123456789");
+                if (*q == ' ' && q + 1 < nl) {
+                    size_t mlen = (size_t)(nl - (q + 1));
+                    mid = malloc(mlen + 1);
+                    if (mid) { memcpy(mid, q + 1, mlen); mid[mlen] = '\0'; }
+                }
+            }
+        }
         if (n == cap) {
             size_t nc = cap ? cap * 2 : 16;
             UidEnt *nv = realloc(v, nc * sizeof *nv);
-            if (!nv) { free(base); break; }
+            if (!nv) { free(base); free(mid); break; }
             v = nv;
             cap = nc;
         }
         v[n].base = base;
+        v[n].mid = mid;
         v[n].uid = (uid == 0 || uid > UINT32_MAX) ? 0 : (uint32_t)uid;
         v[n].modseq = modseq;
-        if (v[n].uid == 0) { free(base); break; }
+        if (v[n].uid == 0) { free(base); free(mid); break; }
         n++;
         if (!*nl) break;
         p = nl + 1;
@@ -612,9 +646,17 @@ static int uidlist_save(const Mbox *mb, uint32_t uidvalidity,
     f = fopen(path, "wb");
     if (!f) return -1;
     if (fprintf(f, "%u %u\n", uidvalidity, uidnext) < 0) goto fail;
-    for (i = 0; i < n; i++)
-        if (fprintf(f, "%u %s %llu\n", v[i].uid, v[i].base,
-                    (unsigned long long)v[i].modseq) < 0) goto fail;
+    for (i = 0; i < n; i++) {
+        if (v[i].mid && v[i].mid[0]) {
+            if (fprintf(f, "%u %s %llu %s\n", v[i].uid, v[i].base,
+                        (unsigned long long)v[i].modseq, v[i].mid) < 0)
+                goto fail;
+        } else {
+            if (fprintf(f, "%u %s %llu\n", v[i].uid, v[i].base,
+                        (unsigned long long)v[i].modseq) < 0)
+                goto fail;
+        }
+    }
     if (fclose(f) != 0) return -1;
     return 0;
 fail:
@@ -632,6 +674,7 @@ void imapd_mbox_close(Mbox *mb) {
     for (i = 0; i < mb->nmsgs; i++) {
         free(mb->msgs[i].base);
         free(mb->msgs[i].path);
+        free(mb->msgs[i].mid);
     }
     free(mb->msgs);
     mb->msgs = NULL;
@@ -646,10 +689,11 @@ void imapd_mbox_close(Mbox *mb) {
     mb->uidlist_dirty = false;
 }
 
-/* Append one scanned file to the view (takes ownership of base/path). */
+/* Append one scanned file to the view (takes ownership of base/path; dups
+   mid). */
 static int scan_add(Mbox *mb, uint32_t uid, uint8_t flags, const char *unk,
                     bool recent, const struct stat *st, uint64_t modseq,
-                    char *base, char *path) {
+                    char *base, char *path, const char *mid) {
     Imail *m;
     if (mb->nmsgs == mb->cap) {
         size_t nc = mb->cap ? mb->cap * 2 : 16;
@@ -669,6 +713,7 @@ static int scan_add(Mbox *mb, uint32_t uid, uint8_t flags, const char *unk,
     m->size = (size_t)st->st_size;
     m->base = base;
     m->path = path;
+    m->mid = (mid && mid[0]) ? strdup(mid) : NULL;
     return 0;
 }
 
@@ -699,6 +744,7 @@ static int scan_subdir(Mbox *mb, const char *sub, bool is_new,
         uint8_t flags = 0;
         size_t bl;
         char *base, *fpath;
+        const char *mid = NULL;
         if (e->d_name[0] == '.') continue;
         colon = strchr(e->d_name, ':');
         if (colon) {
@@ -724,6 +770,7 @@ static int scan_subdir(Mbox *mb, const char *sub, bool is_new,
                 if (bh && bh_get(bh, tmp, &idx)) {
                     uid = (*map)[idx].uid;
                     modseq = (*map)[idx].modseq;
+                    mid = (*map)[idx].mid;
                 }
             }
         }
@@ -745,6 +792,10 @@ static int scan_subdir(Mbox *mb, const char *sub, bool is_new,
                 (*map)[*nmap].base[bl] = '\0';
                 (*map)[*nmap].uid = uid;
                 (*map)[*nmap].modseq = modseq;
+                /* extract the Message-ID now so it persists in the uidlist
+                   and future searches never have to read the file */
+                (*map)[*nmap].mid = imapd_msgid_of_file(path);
+                mid = (*map)[*nmap].mid;
                 (*nmap)++;
             }
         }
@@ -754,7 +805,8 @@ static int scan_subdir(Mbox *mb, const char *sub, bool is_new,
         memcpy(base, e->d_name, bl);
         base[bl] = '\0';
         strcpy(fpath, path);
-        if (scan_add(mb, uid, flags, info, is_new, &st, modseq, base, fpath) != 0) {
+        if (scan_add(mb, uid, flags, info, is_new, &st, modseq, base, fpath,
+                     mid) != 0) {
             free(base);
             free(fpath);
         }
@@ -826,6 +878,7 @@ static int mbox_scan(Mbox *mb, const ImapdConfig *cfg, const char *user,
                     i++;
                 } else {
                     free(map[i].base);
+                    free(map[i].mid);
                     map[i] = map[nmap - 1];
                     nmap--;
                     changed = true;
@@ -958,6 +1011,7 @@ int imapd_mbox_store(Mbox *mb, uint32_t uid, uint8_t flags) {
     }
     mb->uidmap[mb->nuidmap].base = strdup(m->base);
     if (!mb->uidmap[mb->nuidmap].base) return -1;
+    mb->uidmap[mb->nuidmap].mid = m->mid ? strdup(m->mid) : NULL;
     mb->uidmap[mb->nuidmap].uid = uid;
     mb->uidmap[mb->nuidmap].modseq = m->modseq;
     mb->nuidmap++;
@@ -972,6 +1026,7 @@ static void uidmap_remove(Mbox *mb, uint32_t uid) {
     for (i = 0; i < mb->nuidmap; i++) {
         if (mb->uidmap[i].uid != uid) continue;
         free(mb->uidmap[i].base);
+        free(mb->uidmap[i].mid);
         mb->uidmap[i] = mb->uidmap[mb->nuidmap - 1];
         mb->nuidmap--;
         mb->uidlist_dirty = true;
@@ -986,6 +1041,7 @@ int imapd_mbox_expunge(Mbox *mb, uint32_t uid) {
         (void)unlink(mb->msgs[i].path);
         free(mb->msgs[i].base);
         free(mb->msgs[i].path);
+        free(mb->msgs[i].mid);
         memmove(&mb->msgs[i], &mb->msgs[i + 1],
                 (mb->nmsgs - i - 1) * sizeof *mb->msgs);
         mb->nmsgs--;
@@ -995,15 +1051,77 @@ int imapd_mbox_expunge(Mbox *mb, uint32_t uid) {
     return -1;
 }
 
+/* Register the message file just placed into dest_name's cur/ by assigning it
+   a fresh UID from the destination's uidlist sidecar.  This is O(1) in the
+   destination size: it only loads/appends/saves the uidlist file, never a full
+   rescan.  That matters because MOVE/COPY run once per message — rescanning a
+   large destination (e.g. a 30k-message Archive) per message blocked the poll
+   loop for seconds, so a queued client move timed out, its EXPUNGE removed the
+   Inbox copy, and the archive copy was never registered: lost mail. */
+static int mbox_register(const ImapdConfig *cfg, const char *user,
+                         const char *dest_name, const char *base,
+                         const char *mid,
+                         uint32_t *uv_out, uint32_t *uid_out) {
+    Mbox d;
+    uint32_t uidvalidity, uidnext, uid;
+    uint64_t modseq;
+    size_t n, i;
+    UidEnt *v;
+    memset(&d, 0, sizeof d);
+    if (imapd_mbox_dir(cfg, user, dest_name, d.dir, sizeof d.dir) != 0)
+        return -1;
+    if (imapd_mbox_create(d.dir) != 0) return -1;
+    uidvalidity = (uint32_t)time(NULL);
+    uidnext = 1;
+    v = uidlist_load(&d, &uidvalidity, &uidnext, &n);
+    if (uidnext == 0) uidnext = 1;
+    /* idempotent: re-moving an already-archived base must not duplicate */
+    for (i = 0; i < n; i++) {
+        if (strcmp(v[i].base, base) == 0) {
+            if (uv_out) *uv_out = uidvalidity;
+            if (uid_out) *uid_out = v[i].uid;
+            uidlist_free(v, n);
+            return 0;
+        }
+    }
+    uid = uidnext++;
+    if (uid == 0) uid = 1;            /* UINT32_MAX rollover guard */
+    modseq = uidnext;                  /* mirror scan_subdir: > any prior */
+    {
+        UidEnt *nv = realloc(v, (n + 1) * sizeof *v);
+        if (!nv) { uidlist_free(v, n); return -1; }
+        v = nv;
+    }
+    v[n].base = strdup(base);
+    if (!v[n].base) { uidlist_free(v, n); return -1; }
+    v[n].mid = (mid && mid[0]) ? strdup(mid) : NULL;
+    v[n].uid = uid;
+    v[n].modseq = modseq;
+    n++;
+    if (uidlist_save(&d, uidvalidity, uidnext, v, n) != 0) {
+        free(v[n - 1].base);
+        free(v[n - 1].mid);
+        uidlist_free(v, n - 1);
+        return -1;
+    }
+    if (uv_out) *uv_out = uidvalidity;
+    if (uid_out) *uid_out = uid;
+    uidlist_free(v, n);
+    return 0;
+}
+
 /* Move (move=true) or copy (move=false) the message with uid out of mb into
    the mailbox named dest_name (a new mailbox is created if needed).  The
-   destination gets a fresh UID via a rescan; on MOVE the source view (mb) is
-   compacted and its uidlist entry dropped, mirroring expunge.  Returns 0. */
+   destination gets a fresh UID via an O(1) uidlist append (no rescan); on MOVE
+   the source view (mb) is compacted and its uidlist entry dropped, mirroring
+   expunge.  When non-NULL, *uv_out and *uid_out receive the destination's
+   UIDVALIDITY and the UID the message was registered under (for UIDPLUS
+   COPYUID).  Returns 0. */
 int imapd_mbox_file(const ImapdConfig *cfg, const char *user, Mbox *mb,
-                    uint32_t uid, const char *dest_name, bool move) {
+                    uint32_t uid, const char *dest_name, bool move,
+                    uint32_t *uv_out, uint32_t *uid_out) {
     char destdir[4096], dst[4096 + 64], info[32];
     Imail *m = imapd_mbox_find(mb, uid);
-    Mbox tmp;
     if (!m) return -1;
     if (imapd_mbox_dir(cfg, user, dest_name, destdir, sizeof destdir) != 0)
         return -1;
@@ -1031,10 +1149,11 @@ int imapd_mbox_file(const ImapdConfig *cfg, const char *user, Mbox *mb,
         close(fd);
         if (close(wfd) != 0 || r < 0) { (void)unlink(dst); return -1; }
     }
-    /* register the new file with a fresh UID in the destination */
-    memset(&tmp, 0, sizeof tmp);
-    if (imapd_mbox_peek(cfg, user, dest_name, &tmp) != 0) return -1;
-    imapd_mbox_close(&tmp);
+    /* register the new file with a fresh UID in the destination (O(1),
+       no full-destination rescan) */
+    if (mbox_register(cfg, user, dest_name, m->base, m->mid,
+                      uv_out, uid_out) != 0)
+        return -1;
     if (move) {
         /* drop the source view entry (uid found again: the view is live) */
         uidmap_remove(mb, uid);
@@ -1042,6 +1161,7 @@ int imapd_mbox_file(const ImapdConfig *cfg, const char *user, Mbox *mb,
             if (mb->msgs[i].uid != uid) continue;
             free(mb->msgs[i].base);
             free(mb->msgs[i].path);
+            free(mb->msgs[i].mid);
             memmove(&mb->msgs[i], &mb->msgs[i + 1],
                     (mb->nmsgs - i - 1) * sizeof *mb->msgs);
             mb->nmsgs--;
@@ -1228,15 +1348,41 @@ int imapd_auth_load(const ImapdConfig *cfg, ImapdServer *srv) {
     return 0;
 }
 
+/* Constant-time byte comparison over the LONGER of the two lengths.  Lengths
+ * are folded in too, so the only observable difference is a single uniform
+ * loop over max(alen, blen) bytes.  (Port of outbox_auth.c's ct_equal.) */
+static bool ct_equal(const unsigned char *a, size_t alen,
+                     const unsigned char *b, size_t blen) {
+    volatile unsigned char diff = 0;
+    size_t n = alen > blen ? alen : blen;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        unsigned char ca = (i < alen) ? a[i] : 0;
+        unsigned char cb = (i < blen) ? b[i] : 0;
+        diff = (unsigned char)(diff | (ca ^ cb));
+    }
+    return diff == 0;
+}
+
 bool imapd_auth_check(const ImapdServer *srv, const char *user,
                       const char *pass) {
+    /* Dummy candidate so an unknown user still runs a full constant-time
+       compare (hides user existence; mirrors outbox_auth_check). */
+    static const char dummy_pass[] = "visage-dummy-imapd-password";
+    const char *cand = dummy_pass;
+    size_t clen = sizeof dummy_pass - 1;
     size_t i;
+
     if (!srv || !user || !pass) return false;
-    for (i = 0; i < srv->ncreds; i++)
-        if (strcmp(srv->creds[i].user, user) == 0 &&
-            strcmp(srv->creds[i].pass, pass) == 0)
-            return true;
-    return false;
+    for (i = 0; i < srv->ncreds; i++) {
+        if (strcmp(srv->creds[i].user, user) == 0) {
+            cand = srv->creds[i].pass;
+            clen = strlen(srv->creds[i].pass);
+            break;
+        }
+    }
+    return ct_equal((const unsigned char *)pass, strlen(pass),
+                    (const unsigned char *)cand, clen);
 }
 
 /* ---- brute-force protection (per-IP failed-auth lockout) ---- */

@@ -86,6 +86,86 @@ static char **dup_strlist(Term **elems, int n) {
     return a;
 }
 
+/* Walk a relay record literal ({ host, port, auth, retries, tls, tls_ca,
+   max_attempts }) into *out.  tls_ca and max_attempts are optional (older
+   configs omit them): they default to "" (embedded CA bundle) and 100
+   respectively, mirroring the original inline `relay` walk.  Returns false and
+   sets cfg_error on any failure.  Shared by `relay` and the optional
+   `reply_relay` (same schema). */
+static bool relay_get(Term *rel, ConfigRelay *out) {
+    uint64_t v = 0, p = 0;
+    if (!text_dup(rec_get(rel, "host"), &out->host)) return false;
+    if (!nat_u64(rec_get(rel, "port"), &p)) return false;
+    out->port = (uint32_t)p;
+    if (!nat_u64(rec_get(rel, "retries"), &v)) return false;
+    out->retries = (uint32_t)v;
+    if (!text_dup(rec_get(rel, "tls"), &out->tls)) return false;
+    {
+        Term *maxa = rec_get(rel, "max_attempts");
+        if (maxa) {
+            if (!nat_u64(maxa, &v)) return false;
+            out->max_attempts = (uint32_t)v;
+        } else {
+            out->max_attempts = 100;
+        }
+    }
+    {
+        Term *ca = rec_get(rel, "tls_ca");
+        if (ca) {
+            if (!text_dup(ca, &out->tls_ca)) return false;
+        } else {
+            out->tls_ca = strdup("");
+            if (!out->tls_ca) { cfg_error("out of memory"); return false; }
+        }
+    }
+    Term *auth = rec_get(rel, "auth");
+    if (!auth) { cfg_error("config missing 'auth'"); return false; }
+    if (!bool_get(rec_get(auth, "enabled"), &out->auth.enabled)) return false;
+    if (!text_dup(rec_get(auth, "username"), &out->auth.username)) return false;
+    if (!text_dup(rec_get(auth, "password"), &out->auth.password)) return false;
+    /* Fail-closed: relay AUTH credentials must never travel over a channel
+     * that cannot be certificate-verified.  "implicit" TLS is always
+     * VERIFY_NONE in this codebase (no pinned-CA implicit mode exists) and
+     * "none" is plaintext, so auth + either mode is rejected at load.
+     * "starttls" + auth is likewise refused per-delivery in smtp_out.c
+     * (opportunistic TLS is also VERIFY_NONE) with a status message, keeping
+     * that negative path observable in the e2e; "starttls-verify" is the
+     * only mode allowed to carry AUTH. */
+    if (out->auth.enabled && out->tls &&
+        (strcmp(out->tls, "none") == 0 || strcmp(out->tls, "implicit") == 0)) {
+        cfg_error("relay.auth requires tls = \"starttls-verify\" "
+                  "(credentials must not travel over an unverified channel)");
+        return false;
+    }
+    return true;
+}
+
+/* Deep-copy one ConfigRelay (all heap-owned strings) into another.  Used to
+   default reply_relay to a copy of relay when the config omits it.  Returns
+   false (with cfg_error set) on allocation failure. */
+static bool relay_dup(const ConfigRelay *src, ConfigRelay *dst) {
+    dst->host = strdup(src->host ? src->host : "");
+    dst->tls = strdup(src->tls ? src->tls : "");
+    dst->tls_ca = strdup(src->tls_ca ? src->tls_ca : "");
+    dst->auth.username = strdup(src->auth.username ? src->auth.username : "");
+    dst->auth.password = strdup(src->auth.password ? src->auth.password : "");
+    if (!dst->host || !dst->tls || !dst->tls_ca ||
+        !dst->auth.username || !dst->auth.password) {
+        free(dst->host);
+        free(dst->tls);
+        free(dst->tls_ca);
+        free(dst->auth.username);
+        free(dst->auth.password);
+        cfg_error("out of memory");
+        return false;
+    }
+    dst->port = src->port;
+    dst->auth.enabled = src->auth.enabled;
+    dst->retries = src->retries;
+    dst->max_attempts = src->max_attempts;
+    return true;
+}
+
 static bool walk_config(Config *cfg, Term *nf) {
     if (!nf || nf->tag != TmRecordLit) { cfg_error("config must be a record"); return false; }
 
@@ -109,6 +189,33 @@ static bool walk_config(Config *cfg, Term *nf) {
     if (!nat_u64(rec_get(listen, "port"), &p)) return false;
     cfg->listen.port = (uint32_t)p;
 
+    /* listen.proxy_from is optional (older configs omit it): the trusted
+     * PROXY-protocol v1 peer addresses (IP literals).  Absent or empty means
+     * NO peer is trusted, so a directly reachable listener cannot be used to
+     * forge the client IP (SPF/Authentication-Results, per-IP conn cap). */
+    {
+        Term *pf = rec_get(listen, "proxy_from");
+        if (pf) {
+            int npf = list_len(pf);
+            if (npf < 0) return false;
+            Term **pelems = list_collect(pf, npf);
+            if (!pelems) return false;
+            cfg->listen.proxy_from = dup_strlist(pelems, npf);
+            free(pelems);
+            if (!cfg->listen.proxy_from) return false;
+            cfg->listen.nproxy_from = (size_t)npf;
+        }
+    }
+
+    /* optional implicit-TLS (SMTPS) listener: lenient like relay.tls_ca —
+       absent means disabled (port 0), present record { address, port }. */
+    Term *tl = rec_get(nf, "tls_listen");
+    if (tl) {
+        if (!text_dup(rec_get(tl, "address"), &cfg->tls_listen.address)) return false;
+        if (!nat_u64(rec_get(tl, "port"), &p)) return false;
+        cfg->tls_listen.port = (uint32_t)p;
+    }
+
     Term *lim = rec_get(nf, "limits");
     if (!lim) { cfg_error("config missing 'limits'"); return false; }
     uint64_t v = 0;
@@ -125,41 +232,22 @@ static bool walk_config(Config *cfg, Term *nf) {
 
     Term *rel = rec_get(nf, "relay");
     if (!rel) { cfg_error("config missing 'relay'"); return false; }
-    if (!text_dup(rec_get(rel, "host"), &cfg->relay.host)) return false;
-    if (!nat_u64(rec_get(rel, "port"), &p)) return false;
-    cfg->relay.port = (uint32_t)p;
-    if (!nat_u64(rec_get(rel, "retries"), &v)) return false;
-    cfg->relay.retries = (uint32_t)v;
-    if (!text_dup(rec_get(rel, "tls"), &cfg->relay.tls)) return false;
+    if (!relay_get(rel, &cfg->relay)) return false;
+
     {
-        /* relay.max_attempts is the durable-queue re-drive cap.  Tolerate an
-         * absent field (older configs) by defaulting to 100; a present 0 also
-         * falls back to 100 at the usage site. */
-        Term *maxa = rec_get(rel, "max_attempts");
-        if (maxa) {
-            if (!nat_u64(maxa, &v)) return false;
-            cfg->relay.max_attempts = (uint32_t)v;
+        /* reply_relay is optional (older configs omit it): the outbound relay
+         * used ONLY for reverse-alias reply deliveries (normal forwards keep
+         * using `relay`).  Absent -> deep-copy `relay` so reply delivery keeps
+         * the previous behaviour (same relay as forwards); present -> it must
+         * be a full relay record, typically an authenticated STARTTLS
+         * submission server that can deliver to external recipients. */
+        Term *rr = rec_get(nf, "reply_relay");
+        if (rr) {
+            if (!relay_get(rr, &cfg->reply_relay)) return false;
         } else {
-            cfg->relay.max_attempts = 100;
+            if (!relay_dup(&cfg->relay, &cfg->reply_relay)) return false;
         }
     }
-    {
-        /* relay.tls_ca is optional (older configs omit it): path to a PEM CA
-         * bundle used for peer verification when tls == "starttls-verify";
-         * empty means the embedded Mozilla bundle.  Default "" when absent. */
-        Term *ca = rec_get(rel, "tls_ca");
-        if (ca) {
-            if (!text_dup(ca, &cfg->relay.tls_ca)) return false;
-        } else {
-            cfg->relay.tls_ca = strdup("");
-            if (!cfg->relay.tls_ca) { cfg_error("out of memory"); return false; }
-        }
-    }
-    Term *auth = rec_get(rel, "auth");
-    if (!auth) { cfg_error("config missing 'relay.auth'"); return false; }
-    if (!bool_get(rec_get(auth, "enabled"), &cfg->relay.auth.enabled)) return false;
-    if (!text_dup(rec_get(auth, "username"), &cfg->relay.auth.username)) return false;
-    if (!text_dup(rec_get(auth, "password"), &cfg->relay.auth.password)) return false;
 
     Term *stor = rec_get(nf, "storage");
     if (!stor) { cfg_error("config missing 'storage'"); return false; }
@@ -360,11 +448,20 @@ void config_free(Config *cfg) {
     for (size_t i = 0; i < cfg->ndomains; i++) free(cfg->domains[i]);
     free(cfg->domains);
     free(cfg->listen.address);
+    for (size_t i = 0; i < cfg->listen.nproxy_from; i++)
+        free(cfg->listen.proxy_from[i]);
+    free(cfg->listen.proxy_from);
+    free(cfg->tls_listen.address);
     free(cfg->relay.host);
     free(cfg->relay.tls);
     free(cfg->relay.tls_ca);
     free(cfg->relay.auth.username);
     free(cfg->relay.auth.password);
+    free(cfg->reply_relay.host);
+    free(cfg->reply_relay.tls);
+    free(cfg->reply_relay.tls_ca);
+    free(cfg->reply_relay.auth.username);
+    free(cfg->reply_relay.auth.password);
     free(cfg->storage.path);
     free(cfg->storage.spool);
     free(cfg->reply.prefix);

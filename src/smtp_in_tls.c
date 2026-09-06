@@ -50,6 +50,14 @@ struct SmtpTls {
     mbedtls_ssl_context ssl;
     int                 state;       /* TLS_* */
     bool                want_write;  /* last handshake round wants POLLOUT */
+    int                 fd;          /* underlying socket (BIO ctx) */
+    /* Leftover plaintext bytes already read from the socket before TLS was
+       established (implicit-TLS + PROXY: nginx sends the PROXY line and the
+       TLS ClientHello in one TCP segment, so the ClientHello bytes sit in the
+       command buffer when TLS starts).  bio_recv drains these before touching
+       the socket. */
+    char   *prebuf;
+    size_t  prelen, preoff, precap;
 };
 
 /* Process-wide state: one DRBG + one read-only server config, set up once
@@ -127,10 +135,26 @@ int smtp_in_tls_global_init(const char *cert, const char *key) {
 /* ------------------------------------------------------------------ */
 
 static int bio_recv(void *ctx, unsigned char *buf, size_t len) {
-    int fd = (int)(intptr_t)ctx;
+    SmtpTls *t = ctx;
     if (len == 0) return 0;
+    /* Drain any pre-established leftover bytes first (implicit-TLS + PROXY:
+       the TLS ClientHello arrived in the same segment as the PROXY line). */
+    if (t->preoff < t->prelen) {
+        size_t take = t->prelen - t->preoff;
+        if (take > len) take = len;
+        memcpy(buf, t->prebuf + t->preoff, take);
+        t->preoff += take;
+        buf += take;
+        len -= take;
+        if (t->preoff == t->prelen) {
+            free(t->prebuf);
+            t->prebuf = NULL;
+            t->prelen = t->preoff = t->precap = 0;
+        }
+        if (len == 0) return (int)take;
+    }
     for (;;) {
-        ssize_t r = recv(fd, buf, len, 0);
+        ssize_t r = recv(t->fd, buf, len, 0);
         if (r < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -142,8 +166,8 @@ static int bio_recv(void *ctx, unsigned char *buf, size_t len) {
 }
 
 static int bio_send(void *ctx, const unsigned char *buf, size_t len) {
-    int fd = (int)(intptr_t)ctx;
-    ssize_t r = send(fd, buf, len, MSG_NOSIGNAL);
+    SmtpTls *t = ctx;
+    ssize_t r = send(t->fd, buf, len, MSG_NOSIGNAL);
     if (r < 0) {
         if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
             return MBEDTLS_ERR_SSL_WANT_WRITE;
@@ -162,15 +186,36 @@ SmtpTls *smtp_in_tls_start(int fd) {
     if (!g_ready || fd < 0) return NULL;
     t = calloc(1, sizeof *t);
     if (!t) return NULL;
+    t->fd = fd;
     mbedtls_ssl_init(&t->ssl);
     if (mbedtls_ssl_setup(&t->ssl, &g_conf) != 0) {
         free(t);
         return NULL;
     }
-    mbedtls_ssl_set_bio(&t->ssl, (void *)(intptr_t)fd, bio_send, bio_recv, NULL);
+    mbedtls_ssl_set_bio(&t->ssl, t, bio_send, bio_recv, NULL);
     t->state = TLS_PENDING;
     t->want_write = false;
     return t;
+}
+
+/* Feed plaintext bytes read from the socket BEFORE TLS was established into
+   the handshake (implicit-TLS + PROXY: nginx sends the PROXY line and the TLS
+   ClientHello in one TCP segment).  Called after the PROXY line is consumed
+   and TLS has started, with the leftover c->in bytes.  Returns 0, or -1 on
+   allocation failure. */
+int smtp_in_tls_prefeed(SmtpTls *t, const char *buf, size_t len) {
+    if (!t || len == 0) return 0;
+    if (t->prelen + len > t->precap) {
+        size_t nc = t->precap ? t->precap * 2 : 256;
+        while (nc < t->prelen + len) nc *= 2;
+        char *np = realloc(t->prebuf, nc);
+        if (!np) return -1;
+        t->prebuf = np;
+        t->precap = nc;
+    }
+    memcpy(t->prebuf + t->prelen, buf, len);
+    t->prelen += len;
+    return 0;
 }
 
 int smtp_in_tls_handshake_step(SmtpTls *t) {
@@ -221,6 +266,7 @@ void smtp_in_tls_conn_free(SmtpTls *t) {
     if (t->state == TLS_ESTABLISHED)
         (void)mbedtls_ssl_close_notify(&t->ssl);   /* best effort */
     mbedtls_ssl_free(&t->ssl);
+    free(t->prebuf);
     free(t);
 }
 

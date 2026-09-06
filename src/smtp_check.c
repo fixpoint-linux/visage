@@ -8,6 +8,11 @@
 #include "mail.h"
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <signal.h>
 
 static int nchecks = 0;
 static int nfails = 0;
@@ -190,6 +195,7 @@ static void tls_valid_test(void) {
     EXPECT(smtp_tls_valid("starttls") == 0, "tls_valid accepts starttls");
     EXPECT(smtp_tls_valid("starttls-verify") == 0,
            "tls_valid accepts starttls-verify");
+    EXPECT(smtp_tls_valid("implicit") == 0, "tls_valid accepts implicit");
     EXPECT(smtp_tls_valid("tls") == -1, "tls_valid rejects tls");
     EXPECT(smtp_tls_valid("") == -1, "tls_valid rejects empty");
     EXPECT(smtp_tls_valid(NULL) == -1, "tls_valid rejects NULL");
@@ -246,6 +252,245 @@ static void auth_class_test(void) {
     EXPECT(smtp_auth_class(301) == SMTP_ERROR, "auth_class 301 -> ERROR");
     EXPECT(smtp_auth_class(100) == SMTP_ERROR, "auth_class 100 -> ERROR");
     EXPECT(smtp_auth_class(600) == SMTP_ERROR, "auth_class 600 -> ERROR");
+}
+
+/* ---- loopback routing proof (offline, no internet) ---- */
+
+struct stub_result {
+    char mail[256];
+    char rcpt[256];
+};
+
+/* Read one CRLF (or bare-LF) terminated line into buf (NUL-terminated,
+   terminator stripped).  Returns the line length (excl. terminator) or -1. */
+static int stub_read_line(int fd, char *buf, size_t bufsz) {
+    size_t n = 0;
+    for (;;) {
+        if (n + 1 >= bufsz) return -1;
+        char c;
+        ssize_t r = read(fd, &c, 1);
+        if (r <= 0) return -1;
+        buf[n++] = c;
+        if (n >= 2 && buf[n - 2] == '\r' && buf[n - 1] == '\n') {
+            buf[n - 2] = '\0';
+            return (int)(n - 2);
+        }
+        if (buf[n - 1] == '\n') {
+            buf[n - 1] = '\0';
+            return (int)(n - 1);
+        }
+    }
+}
+
+static int stub_write_all(int fd, const char *s) {
+    size_t len = strlen(s), off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, s + off, len - off);
+        if (w <= 0) return -1;
+        off += (size_t)w;
+    }
+    return 0;
+}
+
+/* Minimal SMTP server for ONE transaction (plaintext, no AUTH/STARTTLS): the
+   point is to record WHICH listener smtp_out_send connected to, not to
+   exercise TLS/AUTH (covered elsewhere).  Persists the MAIL FROM / RCPT TO it
+   receives to outpath BEFORE the final reply so the parent can read it even if
+   the child is killed right after smtp_out_send returns. */
+static void stub_serve(int listen_fd, const char *outpath) {
+    struct stub_result res;
+    memset(&res, 0, sizeof res);
+    int cfd = accept(listen_fd, NULL, NULL);
+    if (cfd < 0) _exit(2);
+
+    char line[512];
+    if (stub_write_all(cfd, "220 stub ESMTP ready\r\n") != 0) _exit(3);
+    if (stub_read_line(cfd, line, sizeof line) < 0) _exit(3);      /* EHLO */
+    if (stub_write_all(cfd, "250-stub\r\n250 8BITMIME\r\n") != 0) _exit(3);
+
+    if (stub_read_line(cfd, line, sizeof line) < 0) _exit(3);      /* MAIL FROM */
+    strncpy(res.mail, line, sizeof res.mail - 1);
+    res.mail[sizeof res.mail - 1] = '\0';
+    if (stub_write_all(cfd, "250 OK\r\n") != 0) _exit(3);
+
+    if (stub_read_line(cfd, line, sizeof line) < 0) _exit(3);      /* RCPT TO */
+    strncpy(res.rcpt, line, sizeof res.rcpt - 1);
+    res.rcpt[sizeof res.rcpt - 1] = '\0';
+
+    /* Persist the envelope now (before DATA/final reply) so the parent never
+       races the child's exit. */
+    int f = open(outpath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (f >= 0) {
+        (void)write(f, &res, sizeof res);
+        close(f);
+    }
+
+    if (stub_write_all(cfd, "250 OK\r\n") != 0) _exit(3);
+    if (stub_read_line(cfd, line, sizeof line) < 0) _exit(3);      /* DATA */
+    if (stub_write_all(cfd, "354 go\r\n") != 0) _exit(3);
+    for (;;) {                                                    /* body + "." */
+        if (stub_read_line(cfd, line, sizeof line) < 0) _exit(3);
+        if (strcmp(line, ".") == 0) break;
+    }
+    if (stub_write_all(cfd, "250 OK\r\n") != 0) _exit(3);
+    (void)stub_read_line(cfd, line, sizeof line);                  /* QUIT */
+    (void)stub_write_all(cfd, "221 bye\r\n");
+    _exit(0);
+}
+
+/* Bind a loopback ephemeral listener, fork a child to serve one transaction,
+   and return the bound port + child pid. */
+static int stub_spawn(uint16_t *port_out, pid_t *pid_out, const char *outpath) {
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (lfd < 0) return -1;
+    int one = 1;
+    (void)setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = 0;
+    if (bind(lfd, (struct sockaddr *)&sa, sizeof sa) != 0 ||
+        listen(lfd, 4) != 0) {
+        close(lfd);
+        return -1;
+    }
+    socklen_t slen = sizeof sa;
+    if (getsockname(lfd, (struct sockaddr *)&sa, &slen) != 0) {
+        close(lfd);
+        return -1;
+    }
+    uint16_t port = ntohs(sa.sin_port);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(lfd);
+        return -1;
+    }
+    if (pid == 0) {
+        stub_serve(lfd, outpath);
+        _exit(1);
+    }
+    close(lfd);
+    *port_out = port;
+    *pid_out = pid;
+    return 0;
+}
+
+/* Prove end-to-end that smtp_out_send connects to the relay SELECTED by
+   smtp_relay_for: a normal forward goes to the local relay listener, a
+   reverse reply goes to the reply_relay listener, and neither crosses over. */
+static void relay_routing_test(void) {
+    char pathA[64], pathB[64];
+    snprintf(pathA, sizeof pathA, "/tmp/visage_rr_local_%d", (int)getpid());
+    snprintf(pathB, sizeof pathB, "/tmp/visage_rr_reply_%d", (int)getpid());
+    unlink(pathA);
+    unlink(pathB);
+
+    uint16_t port_local = 0, port_reply = 0;
+    pid_t pid_local = -1, pid_reply = -1;
+    if (stub_spawn(&port_local, &pid_local, pathA) != 0 ||
+        stub_spawn(&port_reply, &pid_reply, pathB) != 0) {
+        check_fail("relay routing (stub_spawn)", "failed to spawn loopback stubs");
+        return;
+    }
+
+    Config cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.hostname = "test.local";
+    cfg.limits.cmd_timeout = 5;
+    cfg.limits.data_timeout = 5;
+    cfg.relay.host = "127.0.0.1";
+    cfg.relay.port = port_local;
+    cfg.relay.tls = "none";
+    cfg.relay.auth.enabled = false;
+    cfg.relay.retries = 0;
+    cfg.reply_relay.host = "127.0.0.1";
+    cfg.reply_relay.port = port_reply;
+    cfg.reply_relay.tls = "none";
+    cfg.reply_relay.auth.enabled = false;
+    cfg.reply_relay.retries = 0;
+
+    const char body[] = "Subject: routing-test\r\n\r\nhello\r\n";
+    char status[256];
+    int sres;
+
+    /* normal forward -> local relay */
+    {
+        Config one = cfg;
+        one.relay = *smtp_relay_for(&cfg, false);
+        one.relay.retries = 0;
+        sres = smtp_out_send(NULL, &one, "from@test.local",
+                             "normal-dest@test.local", body, sizeof body - 1,
+                             status, sizeof status);
+        EXPECT(sres == SMTP_OK,
+               "relay routing: normal forward delivered (local relay)");
+    }
+
+    /* reverse reply -> reply relay */
+    {
+        Config one = cfg;
+        one.relay = *smtp_relay_for(&cfg, true);
+        one.relay.retries = 0;
+        sres = smtp_out_send(NULL, &one, "alias@test.local",
+                             "external@example.com", body, sizeof body - 1,
+                             status, sizeof status);
+        EXPECT(sres == SMTP_OK,
+               "relay routing: reverse reply delivered (reply relay)");
+    }
+
+    /* Reap (kill first: a child still blocked in accept() — i.e. the send
+       failed at connect — must not wedge the test). */
+    (void)kill(pid_local, SIGTERM);
+    (void)kill(pid_reply, SIGTERM);
+    (void)waitpid(pid_local, NULL, 0);
+    (void)waitpid(pid_reply, NULL, 0);
+
+    struct stub_result rA, rB;
+    memset(&rA, 0, sizeof rA);
+    memset(&rB, 0, sizeof rB);
+    {
+        int f = open(pathA, O_RDONLY);
+        if (f >= 0) { (void)read(f, &rA, sizeof rA); close(f); }
+        f = open(pathB, O_RDONLY);
+        if (f >= 0) { (void)read(f, &rB, sizeof rB); close(f); }
+    }
+    unlink(pathA);
+    unlink(pathB);
+
+    EXPECT(strstr(rA.rcpt, "normal-dest@test.local") != NULL,
+           "relay routing: local relay received the normal forward");
+    EXPECT(strstr(rB.rcpt, "external@example.com") != NULL,
+           "relay routing: reply relay received the reverse reply");
+    EXPECT(strstr(rA.rcpt, "external@example.com") == NULL,
+           "relay routing: local relay did NOT receive the reply");
+    EXPECT(strstr(rB.rcpt, "normal-dest@test.local") == NULL,
+           "relay routing: reply relay did NOT receive the normal forward");
+}
+
+/* smtp_relay_for picks reply_relay for reverse-alias replies and relay for
+   normal forwards.  This is the pure decision behind queue_deliver_one's
+   one-shot Config: the SELECTED relay's host/port/auth/tls are copied into
+   one_shot.relay before smtp_out_send, so this single ternary is the whole
+   reply-vs-forward routing switch. */
+static void relay_select_test(void) {
+    Config cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.relay.host = "local-relay";
+    cfg.relay.port = 2526;
+    cfg.reply_relay.host = "external-relay";
+    cfg.reply_relay.port = 587;
+
+    EXPECT(smtp_relay_for(&cfg, false) == &cfg.relay,
+           "relay_for normal forward -> local relay");
+    EXPECT(smtp_relay_for(&cfg, true) == &cfg.reply_relay,
+           "relay_for reverse reply -> reply relay");
+    EXPECT(strcmp(smtp_relay_for(&cfg, true)->host, "external-relay") == 0 &&
+               smtp_relay_for(&cfg, true)->port == 587,
+           "relay_for reply relay carries host:port");
+    EXPECT(strcmp(smtp_relay_for(&cfg, false)->host, "local-relay") == 0 &&
+               smtp_relay_for(&cfg, false)->port == 2526,
+           "relay_for local relay carries host:port");
 }
 
 static void alias_read_only_test(void) {
@@ -349,6 +594,12 @@ int main(void) {
 
     /* config-declared aliases are read-only (admin lock) */
     alias_read_only_test();
+
+    /* reverse-alias reply vs normal forward relay selection */
+    relay_select_test();
+
+    /* end-to-end loopback routing (reply -> reply relay, forward -> local) */
+    relay_routing_test();
 
     printf("\n%d checks, %d failed\n", nchecks, nfails);
     return nfails ? 1 : 0;

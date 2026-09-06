@@ -78,6 +78,77 @@ static void check_retention(const char *example) {
     }
 }
 
+/* Assert the optional reply_relay parses when present (explicit value in the
+   example config) and DEFAULTS to a deep copy of `relay` when absent (older
+   configs omit it).  Reuses the same temp-file trick as check_retention: the
+   absent-field case needs a config that is NOT type-annotated with the new
+   schema. */
+static void check_reply_relay(const char *example) {
+    Config cfg;
+    char err[512];
+
+    if (config_load(example, &cfg, err, sizeof err) != 0) {
+        check(0, "reply_relay: explicit config loads");
+        return;
+    }
+    check(strcmp(cfg.reply_relay.host, "outbox.node-one") == 0,
+          "reply_relay explicit host == outbox.node-one");
+    check(cfg.reply_relay.port == 587, "reply_relay explicit port == 587");
+    check(cfg.reply_relay.auth.enabled == true,
+          "reply_relay explicit auth.enabled == true");
+    check(strcmp(cfg.reply_relay.tls, "starttls-verify") == 0,
+          "reply_relay explicit tls == starttls-verify");
+    check(strcmp(cfg.relay.host, "127.0.0.1") == 0,
+          "relay still parses to the local relay");
+    config_free(&cfg);
+
+    {
+        static const char *const def_cfg =
+            "{ hostname = \"h\"\n"
+            ", domains = [ \"example.com\" ]\n"
+            ", listen = { address = \"0.0.0.0\", port = 1 }\n"
+            ", limits = { message = 100, line = 1000, rcpts = 10\n"
+            "           , cmd_timeout = 30, data_timeout = 60 }\n"
+            ", relay = { host = \"local-relay\", port = 2\n"
+            "          , auth = { enabled = False, username = \"\", password = \"\" }\n"
+            "          , retries = 1, tls = \"none\" }\n"
+            ", storage = { path = \"/tmp/x\", spool = \"/tmp/y\" }\n"
+            ", reply = { prefix = \"reply\", separator = \"+\" }\n"
+            ", catch_all = \"\"\n"
+            ", aliases = [] : List { alias : Text, destinations : List Text }\n"
+            ", http = { address = \"127.0.0.1\", port = 3 }\n"
+            ", admin = { token = \"default-config-check-token\" }\n"
+            "}\n";
+        char tmp[64];
+        int fd;
+        FILE *f;
+        int loaded;
+        snprintf(tmp, sizeof tmp, "/tmp/visage_cfg_rr_XXXXXX");
+        fd = mkstemp(tmp);
+        if (fd < 0) {
+            check(0, "reply_relay: default mkstemp");
+        } else {
+            f = fdopen(fd, "w");
+            if (!f) { close(fd); unlink(tmp); check(0, "reply_relay: default fdopen"); }
+            else {
+                fputs(def_cfg, f);
+                fclose(f);
+                loaded = (config_load(tmp, &cfg, err, sizeof err) == 0);
+                check(loaded, "reply_relay: absent-field config loads");
+                if (loaded) {
+                    check(strcmp(cfg.reply_relay.host, "local-relay") == 0 &&
+                              cfg.reply_relay.port == 2 &&
+                              cfg.reply_relay.auth.enabled == false &&
+                              strcmp(cfg.reply_relay.tls, "none") == 0,
+                          "reply_relay defaults to a copy of relay when absent");
+                    config_free(&cfg);
+                }
+                unlink(tmp);
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     const char *path = (argc > 1) ? argv[1] : "config.example.dhall";
     Config cfg;
@@ -101,6 +172,10 @@ int main(int argc, char **argv) {
            cfg.relay.host, cfg.relay.port, cfg.relay.retries, cfg.relay.tls,
            cfg.relay.max_attempts, cfg.relay.tls_ca,
            cfg.relay.auth.enabled ? "yes" : "no", cfg.relay.auth.username);
+    printf("reply_relay:       %s:%u retries=%u tls=%s max_attempts=%u tls_ca=%s auth(enabled=%s user=%s)\n",
+           cfg.reply_relay.host, cfg.reply_relay.port, cfg.reply_relay.retries,
+           cfg.reply_relay.tls, cfg.reply_relay.max_attempts, cfg.reply_relay.tls_ca,
+           cfg.reply_relay.auth.enabled ? "yes" : "no", cfg.reply_relay.auth.username);
     printf("storage:           path=%s spool=%s retention_days=%u\n",
            cfg.storage.path, cfg.storage.spool, cfg.storage.retention_days);
     printf("reply:             prefix=%s separator=%s\n", cfg.reply.prefix, cfg.reply.separator);
@@ -123,6 +198,9 @@ int main(int argc, char **argv) {
 
     /* retention_days explicit + default asserts. */
     check_retention(path);
+
+    /* reply_relay explicit + default (copy of relay) asserts. */
+    check_reply_relay(path);
 
     if (failures) {
         fprintf(stderr, "config_check: %d FAILURE(S)\n", failures);

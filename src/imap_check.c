@@ -394,6 +394,17 @@ static void search_test(void) {
                "search rejects missing arg");
         imapd_search_free(k);
 
+        /* regression: a 3-key implicit-AND program must keep ALL keys in the
+           chain (a previous version overwrote tail->b and dropped the middle
+           key).  m[0] is seen+from-bob+subject-hello; m[1] is unseen so it
+           must not match even though it is also from bob. */
+        p = "SEEN FROM bob SUBJECT hello";
+        EXPECT(imapd_search_parse_program(&p, &k) == 1,
+               "search parse 3-key AND");
+        EXPECT(MATCH(0, k) && !MATCH(1, k) && !MATCH(3, k),
+               "search 3-key AND keeps all keys");
+        imapd_search_free(k);
+
 #undef MATCH
     }
     for (i = 0; i < 4; i++) {
@@ -513,6 +524,131 @@ static void flags_store_test(const char *root) {
     imapd_mbox_close(&mb);
     EXPECT(imapd_mbox_open(&cfg, "dave", "INBOX", &mb) == 0, "expunge: reopen");
     EXPECT(mb.nmsgs == 0 && mb.uidnext == 2, "expunge persisted");
+    imapd_mbox_close(&mb);
+}
+
+/* ---- (9) move/copy (imapd_mbox_file) ---- */
+
+static void move_copy_test(const char *root) {
+    ImapdConfig cfg;
+    Mbox in, arc;
+    char dir[4096];
+    char msg[] = "Subject: move\r\n\r\nbody\r\n";
+    uint32_t u1, u2, u3;
+    int i, seen;
+
+    memset(&cfg, 0, sizeof cfg);
+    cfg.root = root;
+
+    EXPECT(imapd_mbox_dir(&cfg, "erin", "INBOX", dir, sizeof dir) == 0,
+           "move: inbox dir");
+    EXPECT(imapd_mbox_deliver(dir, msg, strlen(msg), 0, NULL) == 0,
+           "move: deliver 1");
+    EXPECT(imapd_mbox_deliver(dir, msg, strlen(msg), 0, NULL) == 0,
+           "move: deliver 2");
+    EXPECT(imapd_mbox_deliver(dir, msg, strlen(msg), IMAIL_SEEN, NULL) == 0,
+           "move: deliver 3 (\\Seen)");
+
+    memset(&in, 0, sizeof in);
+    EXPECT(imapd_mbox_open(&cfg, "erin", "INBOX", &in) == 0, "move: open inbox");
+    EXPECT(in.nmsgs == 3, "move: 3 in inbox");
+    u1 = in.msgs[0].uid;
+    u2 = in.msgs[1].uid;
+    u3 = in.msgs[2].uid;
+
+    /* COPY msg1 to a brand-new Archive: source keeps it, dest gets uid 1 */
+    EXPECT(imapd_mbox_file(&cfg, "erin", &in, u1, "Archive", false, NULL, NULL) == 0,
+           "copy: file ok");
+    EXPECT(in.nmsgs == 3, "copy: source unchanged");
+    memset(&arc, 0, sizeof arc);
+    EXPECT(imapd_mbox_open(&cfg, "erin", "Archive", &arc) == 0,
+           "copy: open archive");
+    EXPECT(arc.nmsgs == 1, "copy: one in archive");
+    EXPECT(arc.msgs[0].uid == 1, "copy: fresh uid 1 in new mailbox");
+    imapd_mbox_close(&arc);
+
+    /* Re-copying the same message must not duplicate the destination entry */
+    EXPECT(imapd_mbox_file(&cfg, "erin", &in, u1, "Archive", false, NULL, NULL) == 0,
+           "copy: re-copy ok");
+    memset(&arc, 0, sizeof arc);
+    imapd_mbox_open(&cfg, "erin", "Archive", &arc);
+    EXPECT(arc.nmsgs == 1, "copy: re-copy not duplicated");
+    imapd_mbox_close(&arc);
+
+    /* MOVE msg2: gone from source, appears in dest with next fresh uid */
+    EXPECT(imapd_mbox_file(&cfg, "erin", &in, u2, "Archive", true, NULL, NULL) == 0,
+           "move: file ok");
+    EXPECT(in.nmsgs == 2, "move: source shrunk");
+    EXPECT(imapd_mbox_find(&in, u2) == NULL, "move: gone from source view");
+    memset(&arc, 0, sizeof arc);
+    imapd_mbox_open(&cfg, "erin", "Archive", &arc);
+    EXPECT(arc.nmsgs == 2, "move: two in archive");
+    EXPECT(arc.msgs[0].uid != arc.msgs[1].uid &&
+               arc.msgs[0].uid == 1 && arc.msgs[1].uid == 2,
+           "move: distinct fresh uids, no collision");
+    imapd_mbox_close(&arc);
+
+    /* MOVE the \\Seen message: flag must survive into the destination */
+    EXPECT(imapd_mbox_file(&cfg, "erin", &in, u3, "Archive", true, NULL, NULL) == 0,
+           "move: seen msg ok");
+    imapd_mbox_close(&in);
+    memset(&arc, 0, sizeof arc);
+    imapd_mbox_open(&cfg, "erin", "Archive", &arc);
+    EXPECT(arc.nmsgs == 3, "move: all three in archive");
+    seen = 0;
+    for (i = 0; i < (int)arc.nmsgs; i++)
+        if (arc.msgs[i].flags & IMAIL_SEEN) seen++;
+    EXPECT(seen == 1, "move: \\Seen flag preserved");
+    imapd_mbox_close(&arc);
+
+    /* persistence: only msg1 (copied) remains in Inbox */
+    memset(&in, 0, sizeof in);
+    imapd_mbox_open(&cfg, "erin", "INBOX", &in);
+    EXPECT(in.nmsgs == 1, "move: inbox persists (only copied msg left)");
+    imapd_mbox_close(&in);
+}
+
+/* ---- (10) Message-ID index (fast SEARCH HEADER Message-ID) ---- */
+
+static void mid_index_test(const char *root) {
+    ImapdConfig cfg;
+    Mbox mb;
+    char dir[4096];
+    char msg[] = "Subject: m\r\nMessage-ID: <abc@test.com>\r\nFrom: a\r\n\r\nbody\r\n";
+    char noid[] = "Subject: n\r\nFrom: a\r\n\r\nbody\r\n";
+
+    memset(&cfg, 0, sizeof cfg);
+    cfg.root = root;
+    imapd_mbox_dir(&cfg, "frank", "INBOX", dir, sizeof dir);
+
+    EXPECT(imapd_mbox_deliver(dir, noid, strlen(noid), 0, NULL) == 0,
+           "mid: deliver no-id");
+    EXPECT(imapd_mbox_deliver(dir, msg, strlen(msg), 0, NULL) == 0,
+           "mid: deliver with-id");
+
+    memset(&mb, 0, sizeof mb);
+    imapd_mbox_open(&cfg, "frank", "INBOX", &mb);
+    EXPECT(mb.nmsgs == 2, "mid: two messages");
+    {
+        int withmid = 0, withoutmid = 0, i;
+        for (i = 0; i < (int)mb.nmsgs; i++) {
+            if (mb.msgs[i].mid && strcmp(mb.msgs[i].mid, "<abc@test.com>") == 0)
+                withmid++;
+            else if (!mb.msgs[i].mid || !mb.msgs[i].mid[0])
+                withoutmid++;
+        }
+        EXPECT(withmid == 1 && withoutmid == 1,
+               "mid: extracted only for the message that has one");
+    }
+    imapd_mbox_close(&mb);
+
+    /* the mid must persist in the uidlist across reopen */
+    memset(&mb, 0, sizeof mb);
+    imapd_mbox_open(&cfg, "frank", "INBOX", &mb);
+    EXPECT(mb.nmsgs == 2 &&
+               ((mb.msgs[0].mid && strcmp(mb.msgs[0].mid, "<abc@test.com>") == 0) ||
+                (mb.msgs[1].mid && strcmp(mb.msgs[1].mid, "<abc@test.com>") == 0)),
+           "mid: persisted across reopen");
     imapd_mbox_close(&mb);
 }
 
@@ -747,6 +883,8 @@ int main(void) {
         uidlist_test(root);
         deliver_test(root);
         flags_store_test(root);
+        move_copy_test(root);
+        mid_index_test(root);
         auth_test(root);
 
         /* folder listing over the scratch root (carol has only INBOX; give

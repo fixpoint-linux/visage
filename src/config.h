@@ -8,11 +8,26 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* listen { address, port } */
+/* listen { address, port, proxy_from } */
 typedef struct {
     char   *address;
     uint32_t port;
+    /* Trusted PROXY-protocol v1 peers (IP literals, IPv4 or IPv6).  A PROXY
+     * header is honored only when the actual TCP peer address is in this
+     * list; from any other peer the line is ignored (the claimed client IP
+     * is attacker-controlled: it feeds SPF/Authentication-Results and the
+     * per-IP connection cap).  Empty or absent = no peer is trusted. */
+    char  **proxy_from;
+    size_t  nproxy_from;
 } ConfigListen;
+
+/* Optional implicit-TLS (SMTPS) listener: `tls_listen { address, port }`.
+ * Port 0 (or absent) disables it.  Used by the fly edge to talk to visage over
+ * TLS (nginx stream `proxy_ssl`), since nginx cannot drive SMTP STARTTLS. */
+typedef struct {
+    char   *address;
+    uint32_t port;      /* 0 = disabled */
+} ConfigTlsListen;
 
 /* limits { message, line, rcpts, cmd_timeout, data_timeout } (all Natural) */
 typedef struct {
@@ -102,8 +117,17 @@ typedef struct Config {
     char       **domains;
     size_t       ndomains;
     ConfigListen listen;
+    ConfigTlsListen tls_listen;  /* optional implicit-TLS (SMTPS) listener */
     ConfigLimits limits;
     ConfigRelay  relay;
+    /* Optional outbound relay for reverse-alias REPLIES only.  Normal alias
+       forwards keep using `relay` (the local imapd ingest).  When the config
+       omits `reply_relay`, the loader deep-copies `relay` into it so reply
+       delivery keeps the previous behaviour (same relay as forwards).  When
+       present it must be a full relay record (host/port/auth/retries/tls/
+       tls_ca/max_attempts) — typically an authenticated STARTTLS submission
+       server (e.g. node-one's outbox on :587) that can deliver externally. */
+    ConfigRelay  reply_relay;
     ConfigStorage storage;
     ConfigReply  reply;
     char        *catch_all;      /* "" = disabled */

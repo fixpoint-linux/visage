@@ -392,13 +392,11 @@ landingView =
         , Fixpoint.Section.view
             { id = "quickstart"
             , title = "Quickstart"
-            , hint = "// make · make wasm"
+            , hint = "// make"
             , children =
                 [ Fixpoint.Code.block
                     [ text "git submodule update --init --recursive   # fetch vendor/dhall-c + vendor/datalog-dafsa\n"
-                    , text "make                                      # builds visage.com (APE) + *_check tools\n"
-                    , text "make wasm                                 # → docs/visage.js + docs/visage.wasm\n"
-                    , text "node tests/wasm-smoke.js                  # headless smoke test of the wasm module"
+                    , text "make                                      # builds visage.com (APE) + *_check tools"
                     ]
                 , p [] [ docLink "/cli" "The full CLI reference & usage →" ]
                 ]
@@ -678,7 +676,7 @@ cliView =
         , Fixpoint.Section.view
             { id = "build"
             , title = "Build"
-            , hint = "// cosmocc · make · make wasm"
+            , hint = "// cosmocc · make"
             , children =
                 [ p [] [ text "Requires ", Fixpoint.Code.inline "cosmocc", text ". ", Fixpoint.Code.inline "dhall-c", text " and ", Fixpoint.Code.inline "datalog-dafsa", text " are vendored as git submodules; mbedTLS is vendored under ", Fixpoint.Code.inline "vendor/", text "." ]
                 , Fixpoint.Code.block
@@ -692,16 +690,7 @@ cliView =
                     , Fixpoint.Code.inline "datalog-dafsa"
                     , text " checkouts instead of the submodules, build with "
                     , Fixpoint.Code.inline "make DHALL_C=../dhall-c DATALOG=../datalog-dafsa"
-                    , text " (likewise "
-                    , Fixpoint.Code.inline "scripts/build-wasm.sh"
-                    , text " honors "
-                    , Fixpoint.Code.inline "DHALL_C"
-                    , text ")."
-                    ]
-                , p [] [ text "For the browser build (needs ", Fixpoint.Code.inline "emscripten clang lld llvm nodejs", text "):" ]
-                , Fixpoint.Code.block
-                    [ text "make wasm                # → docs/visage.js + docs/visage.wasm\n"
-                    , text "node tests/wasm-smoke.js # headless smoke test of the wasm module"
+                    , text "."
                     ]
                 ]
             }
@@ -720,7 +709,7 @@ playgroundView =
                 [ Fixpoint.Hero.hash
                 , text " visage "
                 , Fixpoint.Hero.dollar
-                , text " make wasm"
+                , text " make"
                 , Fixpoint.Hero.blink
                 ]
             , title = [ text "Playground" ]
@@ -747,20 +736,6 @@ playgroundView =
                     , text ", compiled to wasm) parses the config, typechecks it, and resolves the address — accept/reject, via alias or catch-all."
                     ]
                 , node "visage-playground" [] []
-                ]
-            }
-        , Fixpoint.Section.view
-            { id = "rebuild"
-            , title = "Rebuild"
-            , hint = "// make wasm"
-            , children =
-                [ p []
-                    [ text "The WebAssembly bundle is rebuilt from the C source with "
-                    , Fixpoint.Code.inline "make wasm"
-                    , text "; see "
-                    , a [ href "https://github.com/fixpoint-linux/visage" ] [ text "the repo" ]
-                    , text " for details."
-                    ]
                 ]
             }
         ]

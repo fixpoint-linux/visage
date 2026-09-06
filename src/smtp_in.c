@@ -18,9 +18,11 @@
 #include "mail.h"
 #include "reply.h"
 #include "dkim.h"
+#include "auth_results.h"
 
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <poll.h>
 #include <fcntl.h>
@@ -50,8 +52,8 @@
    the per-IP cap prevents one host from exhausting the pool (mitigating
    slowloris-style resource hogging).  Both are enforced at accept time, BEFORE
    the 220 greeting, by replying 421 and closing. */
-#define SMTP_IN_MAX_CONNS         512
-#define SMTP_IN_MAX_CONNS_PER_IP  16
+#define SMTP_IN_MAX_CONNS         1024
+#define SMTP_IN_MAX_CONNS_PER_IP  128
 
 /* log relation "dir" column codes (raw u32). */
 #define LOG_DIR_IN  1u
@@ -182,15 +184,33 @@ typedef struct Conn {
     char  *out;                /* reply output buffer (owned) */
     size_t out_len, out_off, out_cap;
     time_t last_act;           /* last activity (idle-timeout clock) */
-    unsigned char peer_ip[16];  /* peer address bytes (4 IPv4 / 16 IPv6) */
+    unsigned char peer_ip[16];  /* peer address bytes (4 IPv4 / 16 IPv6);
+                                    from a TRUSTED PROXY header when one was
+                                    honored, else the real TCP peer */
     uint8_t       peer_ip_len;  /* 0 = not set */
+    unsigned char real_ip[16];  /* the ACTUAL TCP peer address — never
+                                    overwritten by a PROXY header; per-IP
+                                    connection limits key on this */
+    uint8_t       real_ip_len;  /* 0 = not set */
+    bool          proxy_seen;   /* a PROXY-protocol header was consumed */
+    bool          greeted;      /* the 220 greeting has been sent */
+    bool          tls_proxy_wait; /* implicit-TLS: consume a plaintext PROXY
+                                     header before starting the handshake */
     SmtpTls *tls;              /* inbound STARTTLS ctx (NULL = plaintext) */
 } Conn;
+
+/* One entry in the reply/normal relay side-channel: identifies a durable
+   queue row (msgid, k) that is a reverse-alias reply. */
+typedef struct {
+    uint32_t msgid;
+    uint32_t k;
+} ReplyMark;
 
 typedef struct Server {
     const Config *cfg;
     Store        *store;
     int           listen_fd;
+    int           listen_tls_fd;  /* optional implicit-TLS (SMTPS) listener */
     Conn        **conns;
     size_t        nconns, conn_cap;
     /* effective limits (0 replaced with defaults) */
@@ -198,6 +218,14 @@ typedef struct Server {
     uint64_t raw_cap;          /* bounded DATA accumulation ceiling */
     time_t   next_revmap_sweep; /* next time to expire stale revmap rows */
     time_t   next_spool_sweep;  /* next time to GC old spool bodies */
+    /* In-memory side-channel marking which durable-queue rows are
+       reverse-alias replies (delivered via reply_relay) vs normal forwards
+       (delivered via relay).  The datalog queue schema stores only
+       (msgid, k, from, to), so the reply/normal distinction is kept here
+       rather than adding a store column (which would force a schema change).
+       See the trade-off comment at queue_enqueue. */
+    ReplyMark *reply_rows;
+    size_t     nreply_rows, reply_rows_cap;
 } Server;
 
 /* ------------------------------------------------------------------ */
@@ -282,13 +310,17 @@ out:
     return rc;
 }
 
-/* Write len bytes to a file (bounded; NUL bytes are fine). Returns 0 on
+/* Write len bytes to a file (bounded; NUL bytes are fine).  The file is
+   created 0600 (mail bodies must not be world-readable). Returns 0 on
    success. */
 static int write_file(const char *path, const char *data, size_t len) {
-    FILE *f = fopen(path, "wb");
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    FILE *f;
     size_t w;
     int rc;
-    if (!f) return -1;
+    if (fd < 0) return -1;
+    f = fdopen(fd, "wb");
+    if (!f) { close(fd); return -1; }
     w = fwrite(data, 1, len, f);
     rc = fclose(f);
     if (w != len || rc != 0) return -1;
@@ -297,10 +329,11 @@ static int write_file(const char *path, const char *data, size_t len) {
 
 /* Write len bytes to a file and fsync it before returning.  Used for the
    durable outbound spool so a queue row can never reference a body whose
-   bytes have not reached stable storage (spool-commit-before-send).  Returns
-   0 on success. */
+   bytes have not reached stable storage (spool-commit-before-send).  Created
+   0600 — spooled mail bodies must not be world-readable.  Returns 0 on
+   success. */
 static int write_file_fsync(const char *path, const char *data, size_t len) {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     size_t off = 0;
     if (fd < 0) return -1;
     while (off < len) {
@@ -579,6 +612,56 @@ RcptDecision smtp_in_rcpt_ok(Store *s, const Config *cfg, const char *rcpt) {
 /* Durable outbound delivery queue (S-A2)                             */
 /* ------------------------------------------------------------------ */
 
+/* One entry in the reply/normal relay side-channel: identifies a durable
+   queue row (msgid, k) that is a reverse-alias reply.  The typedef itself
+   lives just above `struct Server`, which embeds a pointer to these.
+   Operations follow. */
+
+/* Reserve capacity for one more ReplyMark (allocates only when full).  Called
+   BEFORE the durable enqueue so recording the mark can never fail (OOM) after
+   the queue row is committed — a committed reply row whose mark was lost would
+   otherwise be delivered through the WRONG relay on redrive.  Returns 0, or -1
+   on allocation failure. */
+static int reply_mark_reserve(Server *srv) {
+    if (srv->nreply_rows < srv->reply_rows_cap) return 0;
+    size_t nc = srv->reply_rows_cap ? srv->reply_rows_cap * 2 : 8;
+    ReplyMark *na = realloc(srv->reply_rows, nc * sizeof *na);
+    if (!na) return -1;
+    srv->reply_rows = na;
+    srv->reply_rows_cap = nc;
+    return 0;
+}
+
+/* Record (msgid, k) as a reply row.  Precondition: reply_mark_reserve()
+   already succeeded for this slot (no allocation here). */
+static void reply_mark_push(Server *srv, uint32_t msgid, uint32_t k) {
+    srv->reply_rows[srv->nreply_rows].msgid = msgid;
+    srv->reply_rows[srv->nreply_rows].k = k;
+    srv->nreply_rows++;
+}
+
+/* Is (msgid, k) marked as a reply row?  Linear scan: the number of in-flight
+   (not-yet-terminal) reply rows is tiny. */
+static bool reply_mark_lookup(const Server *srv, uint32_t msgid, uint32_t k) {
+    for (size_t i = 0; i < srv->nreply_rows; i++)
+        if (srv->reply_rows[i].msgid == msgid && srv->reply_rows[i].k == k)
+            return true;
+    return false;
+}
+
+/* Drop the mark once a reply row reaches a terminal state (delivered or
+   permfail) so the side-channel does not grow without bound.  No-op when the
+   row was not marked (e.g. a normal forward). */
+static void reply_mark_remove(Server *srv, uint32_t msgid, uint32_t k) {
+    for (size_t i = 0; i < srv->nreply_rows; i++) {
+        if (srv->reply_rows[i].msgid == msgid && srv->reply_rows[i].k == k) {
+            srv->reply_rows[i] = srv->reply_rows[srv->nreply_rows - 1];
+            srv->nreply_rows--;
+            return;
+        }
+    }
+}
+
 /* Bump attempts and either requeue (next_ts = now + backoff) or, once
    max_attempts is exceeded, mark permfail.  The sanitized body stays spooled
    on terminal permfail for audit/replay; the spool GC removes it once
@@ -620,8 +703,14 @@ static void queue_deliver_one(Server *srv, uint32_t msgid, uint32_t k,
     size_t bodylen = 0;
     char status[128];
     uint32_t now = (uint32_t)time(NULL);
+    /* Reverse-alias replies go out through the dedicated external reply_relay;
+       normal alias forwards use the local relay.  The reply/normal distinction
+       lives in the in-memory side-channel (Server.reply_rows) because the
+       durable queue row does not record it. */
+    bool is_reply = reply_mark_lookup(srv, msgid, k);
+    const ConfigRelay *out_relay = smtp_relay_for(cfg, is_reply);
     uint32_t max_attempts =
-        cfg->relay.max_attempts ? cfg->relay.max_attempts : 100u;
+        out_relay->max_attempts ? out_relay->max_attempts : 100u;
     int sres;
 
     /* Flip to delivering (narrows the double-send crash window; startup
@@ -646,6 +735,7 @@ static void queue_deliver_one(Server *srv, uint32_t msgid, uint32_t k,
             fprintf(stderr, "visage: queue: set_status(permfail) failed "
                     "msgid=%u k=%u (spool path too long)\n", msgid, k);
         (void)store_log_add(s, msgid, now, LOG_DIR_OUT, from, to, "permfail");
+        if (is_reply) reply_mark_remove(srv, msgid, k);
         return;
     }
 
@@ -661,11 +751,13 @@ static void queue_deliver_one(Server *srv, uint32_t msgid, uint32_t k,
        relay.retries > 0, also SLEEPS between in-attempt retries - and it
        runs on the single-threaded poll loop that also serves SMTP accept
        and the admin HTTP API.  Use a shallow one-shot Config (pointer
-       fields are shared; only the scalar retries is zeroed) so each
-       redrive tick does at most ONE relay attempt per due item; the
+       fields are shared) whose `relay` is the SELECTED relay (reply_relay
+       for replies, relay for forwards); only the scalar retries is zeroed so
+       each redrive tick does at most ONE relay attempt per due item; the
        durable queue's across-attempt re-drive supplies the retry cadence. */
     {
         Config one_shot = *cfg;
+        one_shot.relay = *out_relay;   /* host/port/auth/tls of chosen relay */
         one_shot.relay.retries = 0;
         sres = smtp_out_send(s, &one_shot, from, to, body, bodylen, status,
                              sizeof status);
@@ -681,6 +773,7 @@ static void queue_deliver_one(Server *srv, uint32_t msgid, uint32_t k,
         /* The sanitized body is RETAINED on delivered so an operator can
            audit/replay it; the spool GC removes it once retention_days elapse. */
         (void)store_log_add(s, msgid, now, LOG_DIR_OUT, from, to, "delivered");
+        if (is_reply) reply_mark_remove(srv, msgid, k);
         break;
     case SMTP_PERMFAIL:
         if (store_queue_set_status(s, msgid, k, "permfail", attempts, 0)
@@ -689,6 +782,7 @@ static void queue_deliver_one(Server *srv, uint32_t msgid, uint32_t k,
                     "msgid=%u k=%u\n", msgid, k);
         /* Body retained for audit/replay (see delivered above). */
         (void)store_log_add(s, msgid, now, LOG_DIR_OUT, from, to, "permfail");
+        if (is_reply) reply_mark_remove(srv, msgid, k);
         break;
     default:   /* SMTP_TEMPFAIL and SMTP_ERROR: retry across attempts */
         queue_requeue(srv, msgid, k, from, to, attempts, now, max_attempts,
@@ -775,17 +869,33 @@ static void queue_redrive(Server *srv) {
    shared re-drive path (low-latency first attempt).  `sanitized` is the
    ALREADY-sanitized outbound body produced by the caller (From/Reply-To
    headers already carry the reverse token; the revmap fact is already
-   persisted) — do NOT re-sanitize or re-mint a token here.  Returns 0 when the
-   delivery is durably accepted (spool fsync + queue row), -1 on any hard
-   failure (mkdir/spool write/fsync/store_queue_add) so the caller can refuse
-   acceptance (451). */
+   persisted) — do NOT re-sanitize or re-mint a token here.  `reply` selects
+   the relay: true -> reverse-alias reply (reply_relay), false -> normal
+   forward (relay).  Returns 0 when the delivery is durably accepted (spool
+   fsync + queue row), -1 on any hard failure (mkdir/spool write/fsync/
+   store_queue_add) so the caller can refuse acceptance (451).
+
+   Durability trade-off: the durable queue row stores only (msgid, k, from,
+   to) — it does NOT record which relay to use (adding a column would force a
+   datalog/store schema change).  The reply/normal distinction is kept in the
+   in-memory side-channel Server.reply_rows, so a reply that TEMPFAILs and is
+   re-driven within this process lifetime keeps using reply_relay.  The only
+   loss is across a full daemon restart: a reply row left "queued" by a crash
+   is re-driven as a normal forward through `relay`.  Replies are low-volume,
+   and the crash window is the gap between a TEMPFAIL and its next re-drive,
+   so this is accepted rather than changing the store schema. */
 static int queue_enqueue(Server *srv, uint32_t msgid, uint32_t k,
                          const char *from, const char *to,
-                         const char *sanitized, size_t slen) {
+                         const char *sanitized, size_t slen, bool reply) {
     Store *s = srv->store;
     const Config *cfg = srv->cfg;
     char spoolpath[4096];
     uint32_t now = (uint32_t)time(NULL);
+
+    /* Reserve the reply-mark slot BEFORE any durable commit so the mark can
+       never fail (OOM) after the queue row is committed (a committed reply row
+       that lost its mark would be delivered through the WRONG relay). */
+    if (reply && reply_mark_reserve(srv) != 0) return -1;
 
     /* 1. Durably spool the sanitized body BEFORE the queue row, so a queue row
        can never reference a body that has not reached stable storage. */
@@ -804,7 +914,11 @@ static int queue_enqueue(Server *srv, uint32_t msgid, uint32_t k,
     }
     store_log_add(s, msgid, now, LOG_DIR_OUT, from, to, "queued");
 
-    /* 3. Low-latency first attempt via the shared re-drive path. */
+    /* 3. Mark the row as a reply (no allocation: reserve() ran above) so the
+       shared re-drive path delivers it through reply_relay. */
+    if (reply) reply_mark_push(srv, msgid, k);
+
+    /* 4. Low-latency first attempt via the shared re-drive path. */
     queue_redrive(srv);
     return 0;
 }
@@ -905,7 +1019,7 @@ static int forward_one(Server *srv, const char *msg, size_t msglen,
        destination bounces the bounce forever.  Only the envelope changes; the
        header rewrite (rw.from=alias etc.) is unchanged. */
     const char *env_from = (sender[0] != '\0') ? alias : "";
-    rc = queue_enqueue(srv, msgid, k, env_from, dest, sanitized, slen);
+    rc = queue_enqueue(srv, msgid, k, env_from, dest, sanitized, slen, false);
     mail_free(sanitized);
     return (rc == 0) ? 0 : -1;
 }
@@ -991,7 +1105,7 @@ static int forward_reply(Server *srv, const char *msg, size_t msglen,
 
     forward_sign(cfg, alias_addr, &sanitized, &slen);
 
-    rc = queue_enqueue(srv, msgid, k, alias_addr, dest, sanitized, slen);
+    rc = queue_enqueue(srv, msgid, k, alias_addr, dest, sanitized, slen, true);
     mail_free(sanitized);
     return (rc == 0) ? 0 : -1;
 }
@@ -1009,6 +1123,7 @@ static void deliver_message(Server *srv, Conn *c, time_t now) {
     uint32_t k = 0;   /* per-msgid destination ordinal (0-based, stable) */
     size_t i;
     int failed = 0;   /* any destination not durably enqueued -> 451 */
+    char *auth_hdr = NULL;
 
     if (mail_unstuff_dots(msg, &msglen) != 0) {
         conn_reply(c, "451 4.3.0 Temporary processing error\r\n");
@@ -1027,6 +1142,28 @@ static void deliver_message(Server *srv, Conn *c, time_t now) {
         conn_reply(c, "552 5.3.4 Message exceeds fixed limit\r\n");
         c->closed = true;
         return;
+    }
+
+    /* Evaluate SPF/DKIM/DMARC on the RAW inbound message (before
+       mail_sanitize_for_forward strips the original DKIM-Signature) and prepend
+       the RFC 8601 Authentication-Results header so the mailbox shows real
+       auth status.  Uses the real client IP when a PROXY header was seen,
+       otherwise the immediate peer (the edge). */
+    auth_hdr = auth_results_build(cfg->hostname, msg, msglen,
+                                  c->from ? c->from : "",
+                                  c->peer_ip, c->peer_ip_len);
+    if (auth_hdr) {
+        size_t hl = strlen(auth_hdr);
+        char *nm = malloc(hl + msglen + 1);
+        if (nm) {
+            memcpy(nm, auth_hdr, hl);
+            memcpy(nm + hl, msg, msglen);
+            nm[hl + msglen] = '\0';
+            msg = nm;
+            msglen = hl + msglen;
+            c->data = msg;   /* forwarding uses c->data */
+            c->data_len = msglen;
+        }
     }
 
     msgid = store_next_msgid(s);
@@ -1082,7 +1219,13 @@ static void deliver_message(Server *srv, Conn *c, time_t now) {
        msgid, so (msgid,k) does not de-dup across a 451 resend). */
     conn_reply(c, failed ? "451 4.3.0 Temporary queue failure\r\n"
                          : "250 2.0.0 OK: queued\r\n");
+
+    free(auth_hdr);
 }
+
+static void handle_command(Server *srv, Conn *c, char *line);   /* fwd */
+static int proxy_parse(const Config *cfg, Conn *c, const char *line); /* fwd */
+static void tls_advance(Server *srv, Conn *c, time_t now);      /* fwd */
 
 /* ------------------------------------------------------------------ */
 /* DATA input                                                         */
@@ -1323,6 +1466,49 @@ static void handle_command(Server *srv, Conn *c, char *line) {
     char *sp;
     size_t vlen;
     char *rest;
+
+    /* A PROXY-protocol v1 header (sent by the fly edge / nginx upstream) is the
+       first line on the connection; consume it before any SMTP command. */
+    if (!c->proxy_seen) {
+        if (proxy_parse(srv->cfg, c, line) == 1) {
+            c->proxy_seen = true;
+            /* Implicit-TLS listener: the PROXY line arrives in plaintext before
+               the TLS handshake; nginx sends the TLS ClientHello in the SAME
+               segment, so leftover c->in bytes are TLS bytes to prefeed.  The
+               220 greeting is deferred until the handshake completes. */
+            if (c->tls_proxy_wait) {
+                c->tls_proxy_wait = false;
+                if (!smtp_in_tls_available() ||
+                    !(c->tls = smtp_in_tls_start(c->fd))) {
+                    c->closed = true;
+                    c->out_len = c->out_off = 0;
+                } else if (smtp_in_tls_prefeed(c->tls, c->in, c->in_len) != 0) {
+                    c->closed = true;
+                    c->out_len = c->out_off = 0;
+                } else {
+                    c->in_len = 0;   /* handed to the TLS BIO */
+                    tls_advance(srv, c, time(NULL));   /* handshake from prebuf */
+                }
+            }
+            return;
+        }
+        c->proxy_seen = true;   /* first non-PROXY line: normal session */
+        if (c->tls_proxy_wait) {
+            /* no PROXY header on an implicit-TLS connection: start TLS with the
+               buffered first line as TLS bytes (should not happen normally). */
+            c->tls_proxy_wait = false;
+            if (!smtp_in_tls_available() ||
+                !(c->tls = smtp_in_tls_start(c->fd)) ||
+                smtp_in_tls_prefeed(c->tls, c->in, c->in_len) != 0) {
+                c->closed = true;
+                c->out_len = c->out_off = 0;
+                return;
+            }
+            c->in_len = 0;
+            tls_advance(srv, c, time(NULL));
+            return;
+        }
+    }
 
     while (*p == ' ') p++;
     sp = strchr(p, ' ');
@@ -1629,10 +1815,25 @@ static void tls_advance(Server *srv, Conn *c, time_t now) {
         return;
     }
     if (r > 0) {
-        /* TLS is up: restart the session clean (RFC 3207 4: the client must
-           EHLO again), then drain immediately (the final handshake flight
-           and the first app bytes often land in one TCP segment, so POLLIN
-           may never fire for them). */
+        /* TLS is up.  For an implicit-TLS (SMTPS) listener this is the first
+           contact: send the 220 greeting now (over TLS).  For STARTTLS this is
+           a session restart (RFC 3207 4: the client must EHLO again), then
+           drain immediately (handshake + first app bytes often share a TCP
+           segment, so POLLIN may never fire for them). */
+        if (!c->greeted) {
+            c->greeted = true;
+            c->state = ST_INIT;
+            char g[512];
+            int gn = snprintf(g, sizeof g, "220 %s ESMTP visage\r\n",
+                              (srv->cfg->hostname && srv->cfg->hostname[0])
+                                  ? srv->cfg->hostname : "localhost");
+            if (gn < 0 || (size_t)gn >= sizeof g)
+                conn_reply(c, "220 localhost ESMTP visage\r\n");
+            else
+                conn_reply(c, g);
+            conn_readable(srv, c, now);
+            return;
+        }
         conn_reset(c, ST_INIT);
         conn_readable(srv, c, now);
     }
@@ -1688,6 +1889,67 @@ static int poll_timeout_ms(const Server *srv, time_t now) {
     return ms;
 }
 
+/* True iff the connection's ACTUAL TCP peer address (real_ip, captured at
+   accept time and never overwritten) matches an entry of the configured
+   listen.proxy_from allowlist (IP literals, IPv4 or IPv6). */
+static bool proxy_peer_trusted(const Config *cfg, const Conn *c) {
+    size_t i;
+    if (!cfg || c->real_ip_len == 0) return false;
+    for (i = 0; i < cfg->listen.nproxy_from; i++) {
+        const char *e = cfg->listen.proxy_from[i];
+        struct in_addr a4;
+        struct in6_addr a6;
+        if (inet_pton(AF_INET, e, &a4) == 1) {
+            if (c->real_ip_len == 4 && memcmp(c->real_ip, &a4, 4) == 0)
+                return true;
+        } else if (inet_pton(AF_INET6, e, &a6) == 1) {
+            if (c->real_ip_len == 16 && memcmp(c->real_ip, &a6, 16) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+/* Parse a PROXY protocol v1 header line ("PROXY TCP4 <src> <dst> <sp> <dp>\r\n"
+   or "PROXY UNKNOWN\r\n") and, on success, replace c->peer_ip with the real
+   client address.  The fly edge (with handlers=["proxy_proto"]) and nginx
+   stream (`proxy_protocol on`) relay the original client IP this way; visage
+   otherwise only sees the edge's address, which breaks SPF.  Returns 1 if the
+   line was a PROXY header (consumed), 0 if it was a normal SMTP command.
+
+   The claimed address is honored ONLY when the actual TCP peer is in the
+   configured trusted-proxy allowlist (listen.proxy_from): from any other
+   peer the line is attacker-controlled (forged spf=pass input + per-IP cap
+   evasion), so it returns 0 and falls through to be rejected as an SMTP
+   command ("500 Command not recognized"), leaving peer_ip = the real peer. */
+static int proxy_parse(const Config *cfg, Conn *c, const char *line) {
+    if (strncmp(line, "PROXY ", 6) != 0) return 0;
+    if (!proxy_peer_trusted(cfg, c)) return 0;
+    if (strncmp(line, "PROXY TCP4 ", 11) == 0) {
+        char src[64] = {0};
+        const char *p = line + 11;
+        size_t k = 0;
+        while (*p && *p != ' ' && k < sizeof src - 1) src[k++] = *p++;
+        struct in_addr a;
+        if (inet_pton(AF_INET, src, &a) == 1) {
+            memcpy(c->peer_ip, &a, 4);
+            c->peer_ip_len = 4;
+        }
+    } else if (strncmp(line, "PROXY TCP6 ", 11) == 0) {
+        char src[64] = {0};
+        const char *p = line + 11;
+        size_t k = 0;
+        while (*p && *p != ' ' && k < sizeof src - 1) src[k++] = *p++;
+        struct in6_addr a;
+        if (inet_pton(AF_INET6, src, &a) == 1) {
+            memcpy(c->peer_ip, &a, 16);
+            c->peer_ip_len = 16;
+        }
+    }
+    /* PROXY UNKNOWN / others: leave peer_ip as-is */
+    return 1;
+}
+
 /* Extract the peer address bytes (AF_INET -> 4 from sin_addr, AF_INET6 -> 16
    from sin6_addr) into peer_ip/peer_ip_len; returns 0 on success, -1 on an
    unknown family (len stays 0). */
@@ -1711,24 +1973,27 @@ static int peer_ip_of(struct sockaddr_storage *sa, socklen_t salen,
 
 /* Count how many live connections share the peer's address (O(n), n<=512).
    Deriving it by scanning srv->conns avoids a separate table and eliminates
-   decrement/leak bugs — the count is always exactly the live conn list. */
+   decrement/leak bugs — the count is always exactly the live conn list.
+   Keyed on real_ip (the ACTUAL TCP peer): a PROXY header — even an honored
+   one from a trusted edge — must not hand a connection a fresh per-IP
+   budget, so all forwarded conns count against the edge's own address. */
 static size_t count_peer_conns(const Server *srv, const unsigned char *ip,
                                uint8_t iplen) {
     size_t n = 0, i;
     if (iplen == 0) return 0;
     for (i = 0; i < srv->nconns; i++) {
         const Conn *c = srv->conns[i];
-        if (c->peer_ip_len == iplen && memcmp(c->peer_ip, ip, iplen) == 0)
+        if (c->real_ip_len == iplen && memcmp(c->real_ip, ip, iplen) == 0)
             n++;
     }
     return n;
 }
 
-static void server_accept(Server *srv, time_t now) {
+static void server_accept(Server *srv, int lfd, bool implicit_tls, time_t now) {
     for (;;) {
         struct sockaddr_storage sa;
         socklen_t salen = sizeof sa;
-        int fd = accept(srv->listen_fd, (struct sockaddr *)&sa, &salen);
+        int fd = accept(lfd, (struct sockaddr *)&sa, &salen);
         Conn *c;
         char g[512];
         int gn;
@@ -1765,6 +2030,16 @@ static void server_accept(Server *srv, time_t now) {
         c->state = ST_INIT;
         c->last_act = now;
         (void)peer_ip_of(&sa, salen, c->peer_ip, &c->peer_ip_len);
+        (void)peer_ip_of(&sa, salen, c->real_ip, &c->real_ip_len);
+
+        /* Implicit-TLS (SMTPS) listener: the edge's nginx sends a plaintext
+           PROXY header first, then starts TLS.  Consume the PROXY line in
+           plaintext (tls_proxy_wait), then create the TLS context and drive
+           the handshake; the 220 greeting goes out once TLS is up. */
+        if (implicit_tls) {
+            c->tls_proxy_wait = true;
+            c->state = ST_INIT;
+        }
 
         if (srv->nconns == srv->conn_cap) {
             size_t nc = srv->conn_cap ? srv->conn_cap * 2 : 16;
@@ -1775,6 +2050,10 @@ static void server_accept(Server *srv, time_t now) {
         }
         srv->conns[srv->nconns++] = c;
 
+        /* Implicit-TLS conns wait for a plaintext PROXY line first (see
+           tls_proxy_wait handling in conn_readable); no greeting yet. */
+        if (implicit_tls) continue;
+
         gn = snprintf(g, sizeof g, "220 %s ESMTP visage\r\n",
                       (srv->cfg->hostname && srv->cfg->hostname[0])
                           ? srv->cfg->hostname : "localhost");
@@ -1782,6 +2061,7 @@ static void server_accept(Server *srv, time_t now) {
             conn_reply(c, "220 localhost ESMTP visage\r\n");
         else
             conn_reply(c, g);
+        c->greeted = true;
     }
 }
 
@@ -1836,7 +2116,7 @@ static void server_poll(Server *srv) {
 
         /* build pollfd array: [0] SMTP listen, [1..] extra listeners,
            then SMTP conns, then a fixed block of HTTP conn slots. */
-        nfds = 1 + s_nextra + srv->nconns + SMTP_IN_MAX_HTTP;
+        nfds = 2 + s_nextra + srv->nconns + SMTP_IN_MAX_HTTP;
         if (nfds > pfds_cap) {
             free(pfds);
             pfds = malloc(nfds * sizeof *pfds);
@@ -1846,32 +2126,36 @@ static void server_poll(Server *srv) {
         pfds[0].fd = srv->listen_fd;
         pfds[0].events = POLLIN;
         pfds[0].revents = 0;
+        /* [1] optional implicit-TLS listener (or -1 = disabled) */
+        pfds[1].fd = srv->listen_tls_fd;
+        pfds[1].events = (srv->listen_tls_fd >= 0) ? POLLIN : 0;
+        pfds[1].revents = 0;
         for (i = 0; i < s_nextra; i++) {
-            pfds[i + 1].fd = s_extra[i].fd;
-            pfds[i + 1].events = POLLIN;
-            pfds[i + 1].revents = 0;
+            pfds[i + 2].fd = s_extra[i].fd;
+            pfds[i + 2].events = POLLIN;
+            pfds[i + 2].revents = 0;
         }
         for (i = 0; i < srv->nconns; i++) {
             Conn *c = srv->conns[i];
-            pfds[1 + s_nextra + i].fd = c->fd;
+            pfds[2 + s_nextra + i].fd = c->fd;
             if (!c->closed && smtp_in_tls_handshaking(c->tls)) {
                 /* STARTTLS: PENDING drains the plaintext 220 reply (POLLOUT);
                    the handshake polls whichever way mbedtls asked for last */
-                pfds[1 + s_nextra + i].events = smtp_in_tls_pending(c->tls)
+                pfds[2 + s_nextra + i].events = smtp_in_tls_pending(c->tls)
                     ? POLLOUT
                     : (smtp_in_tls_wants_write(c->tls) ? POLLOUT : POLLIN);
             } else if (c->closed) {
-                pfds[1 + s_nextra + i].events = (c->out_off < c->out_len) ? POLLOUT : 0;
+                pfds[2 + s_nextra + i].events = (c->out_off < c->out_len) ? POLLOUT : 0;
             } else {
                 /* stop reading new commands while the reply backlog is high:
                    backpressure instead of unbounded c->out growth. */
-                pfds[1 + s_nextra + i].events =
+                pfds[2 + s_nextra + i].events =
                     (c->out_len < SMTP_IN_MAX_OUT / 2) ? POLLIN : 0;
-                if (c->out_off < c->out_len) pfds[1 + s_nextra + i].events |= POLLOUT;
+                if (c->out_off < c->out_len) pfds[2 + s_nextra + i].events |= POLLOUT;
             }
-            pfds[1 + s_nextra + i].revents = 0;
+            pfds[2 + s_nextra + i].revents = 0;
         }
-        http_base = 1 + s_nextra + srv->nconns;
+        http_base = 2 + s_nextra + srv->nconns;
         for (i = 0; i < SMTP_IN_MAX_HTTP; i++) {
             const HttpSlot *h = &s_http[i];
             pfds[http_base + i].fd = h->used ? h->fd : -1;   /* poll skips -1 */
@@ -1891,16 +2175,18 @@ static void server_poll(Server *srv) {
         n_before = srv->nconns;
 
         if (pfds[0].revents & POLLIN)
-            server_accept(srv, now);
+            server_accept(srv, srv->listen_fd, false, now);
+        if (pfds[1].revents & POLLIN)
+            server_accept(srv, srv->listen_tls_fd, true, now);
 
         /* dispatch extra-fd listeners (may add SMTP connections) */
         for (i = 0; i < s_nextra; i++)
-            if (pfds[i + 1].revents & (POLLIN | POLLHUP | POLLERR))
+            if (pfds[i + 2].revents & (POLLIN | POLLHUP | POLLERR))
                 s_extra[i].cb(s_extra[i].fd, s_extra[i].user);
 
         for (i = 0; i < n_before; i++) {
             Conn *c = srv->conns[i];
-            short rev = pfds[1 + s_nextra + i].revents;
+            short rev = pfds[2 + s_nextra + i].revents;
             if (c->closed) {
                 if (rev & POLLOUT) conn_flush(c);
                 continue;
@@ -1961,7 +2247,7 @@ static void server_poll(Server *srv) {
 /* Listener + entry point                                             */
 /* ------------------------------------------------------------------ */
 
-static int make_listener(const Config *cfg) {
+static int make_listener(const char *addr, uint32_t port) {
     struct addrinfo hints;
     struct addrinfo *res = NULL;
     struct addrinfo *ai;
@@ -1973,8 +2259,8 @@ static int make_listener(const Config *cfg) {
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
 
-    snprintf(portstr, sizeof portstr, "%u", cfg->listen.port);
-    if (getaddrinfo(cfg->listen.address, portstr, &hints, &res) != 0)
+    snprintf(portstr, sizeof portstr, "%u", port);
+    if (getaddrinfo(addr, portstr, &hints, &res) != 0)
         return -1;
 
     for (ai = res; ai; ai = ai->ai_next) {
@@ -2013,8 +2299,15 @@ int smtp_in_main(const Config *c, const Store *s) {
     Server srv;
     if (!c || !s) return VISAGE_EPARAM;
     server_init(&srv, c, (Store *)s);
-    srv.listen_fd = make_listener(c);
+    srv.listen_fd = make_listener(c->listen.address, c->listen.port);
     if (srv.listen_fd < 0) return VISAGE_ERR;
+    srv.listen_tls_fd = -1;
+    if (c->tls_listen.port != 0) {
+        const char *tl_addr = c->tls_listen.address
+            ? c->tls_listen.address : c->listen.address;
+        srv.listen_tls_fd = make_listener(tl_addr, c->tls_listen.port);
+        if (srv.listen_tls_fd < 0) return VISAGE_ERR;
+    }
 
     /* Startup recovery: reset any delivery left "delivering" by a crash, then
        drain everything due before serving (at-least-once). */
@@ -2029,5 +2322,7 @@ int smtp_in_main(const Config *c, const Store *s) {
 
     server_poll(&srv);
     close(srv.listen_fd);
+    if (srv.listen_tls_fd >= 0) close(srv.listen_tls_fd);
+    free(srv.reply_rows);
     return VISAGE_OK;
 }

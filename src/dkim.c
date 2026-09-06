@@ -371,12 +371,17 @@ typedef struct {
     char **hnames; size_t nh;
     uint32_t t;
     unsigned char *sig; size_t siglen;
+    /* The DKIM-Signature header as it appears on the wire (name + folded
+       value, first header per parse_dkim).  Verification must canonicalize
+       THIS (with the b= value emptied), not a rebuilt tag-ordered value,
+       because relaxed canonicalization preserves the signer's field order. */
+    char  *raw; size_t rawlen;
 } Parsed;
 
 static void parsed_free(Parsed *p) {
     free(p->d); free(p->s); free(p->bh);
     for (size_t i = 0; i < p->nh; i++) free(p->hnames[i]);
-    free(p->hnames); free(p->sig);
+    free(p->hnames); free(p->sig); free(p->raw);
     memset(p, 0, sizeof *p);
 }
 
@@ -405,6 +410,13 @@ static int parse_dkim(const char *msg, size_t len, Parsed *p) {
     size_t vlen = end - vstart;
     while (vlen && (msg[vstart + vlen - 1] == '\r' || msg[vstart + vlen - 1] == '\n')) vlen--;
     const char *val = msg + vstart;
+
+    /* Keep the raw header (name + full folded value up to `end`). */
+    p->raw = malloc(end + 1);
+    if (!p->raw) return -1;
+    memcpy(p->raw, msg, end);
+    p->raw[end] = '\0';
+    p->rawlen = end;
 
     p->d  = tag_get(val, vlen, "d=");
     p->s  = tag_get(val, vlen, "s=");
@@ -435,11 +447,61 @@ static int parse_dkim(const char *msg, size_t len, Parsed *p) {
     free(hh);
     size_t bl = strlen(bb);
     while (bl && is_wsp(bb[bl - 1])) bl--;
+    /* The b= value may be folded across lines (CRLF + WSP) per RFC 6376; strip
+       all FWS before base64-decoding (mbedtls rejects embedded whitespace). */
+    {
+        char *clean = malloc(bl + 1);
+        if (!clean) { free(bb); return -1; }
+        size_t c = 0;
+        for (size_t k = 0; k < bl; k++) {
+            unsigned char ch = (unsigned char)bb[k];
+            if (ch == '\r' || ch == '\n' || is_wsp(ch)) continue;
+            clean[c++] = ch;
+        }
+        clean[c] = '\0';
+        free(bb);
+        bb = clean;
+        bl = c;
+    }
     unsigned char *raw = malloc(512); size_t rawlen = 0;
     if (b64d(bb, bl, raw, 512, &rawlen) != 0) { free(bb); return -1; }
     free(bb);
     p->sig = raw; p->siglen = rawlen;
     return 0;
+}
+
+/* Canonicalize the actual DKIM-Signature header for the signing input (RFC
+ * 6376 3.7): take the signer's on-wire header, empty the b= tag value, then
+ * relaxed-canonicalize.  The colon offset is after the fixed "DKIM-Signature"
+ * name (the header is always the message's first header, per parse_dkim). */
+static int canon_raw_dkim_hdr(const Parsed *p, Buf *out) {
+    char *hdr = malloc(p->rawlen + 1);
+    if (!hdr) return -1;
+    memcpy(hdr, p->raw, p->rawlen);
+    hdr[p->rawlen] = '\0';
+
+    char *colon = strchr(hdr, ':');
+    if (!colon) { free(hdr); return -1; }
+    char *v = colon + 1;
+    while (*v == ' ' || *v == '\t' || *v == '\r' || *v == '\n') v++;
+    for (char *q = v; *q; q++) {
+        if (*q == ';') {
+            char *t = q + 1;
+            /* skip FWS (including folded CRLF) before the tag name */
+            while (*t == ' ' || *t == '\t' || *t == '\r' || *t == '\n') t++;
+            if (t[0] == 'b' && t[1] == '=') {
+                char *end = t + 2;
+                while (*end && *end != ';') end++;
+                while (end > t + 2 && (end[-1] == ' ' || end[-1] == '\t')) end--;
+                memmove(t + 2, end, strlen(end) + 1);   /* drop the value */
+            }
+        }
+    }
+
+    size_t clen = DKIM_HDR_NAME_LEN;   /* colon offset: "DKIM-Signature" */
+    int rc = relaxed_header(hdr, strlen(hdr), clen, out);
+    free(hdr);
+    return rc;
 }
 
 static int dkim_verify_core(const char *msg, size_t len, mbedtls_pk_context *pk,
@@ -455,27 +517,67 @@ static int dkim_verify_core(const char *msg, size_t len, mbedtls_pk_context *pk,
 
     Buf in; buf_init(&in);
     size_t blank = find_blank(msg, len);
-    for (size_t i = 0; i < p.nh; i++) {
-        size_t pos = 0; bool found = false;
-        size_t hs = 0, hc = 0, he = 0;
+
+    /* Collect every header field (lowercased name + offsets), in order. */
+    typedef struct { size_t off, namelen, colon, end; } Hdrent;
+    size_t nhead = 0;
+    {
+        size_t pos = 0;
         while (pos < blank) {
             size_t nl = 0, colon = 0, end = 0;
             if (scan_header(msg, blank, pos, &nl, &colon, &end) != 0) { pos = end; continue; }
-            if (strlen(p.hnames[i]) == nl && strncasecmp(msg + pos, p.hnames[i], nl) == 0) {
-                hs = pos; hc = colon; he = end; found = true; break;
-            }
+            nhead++;
             pos = end;
         }
-        if (!found) { buf_free(&in); buf_free(&htv); parsed_free(&p); return -1; }
+    }
+    Hdrent *hd = malloc(nhead ? nhead * sizeof *hd : 1);
+    if (!hd) { buf_free(&in); buf_free(&htv); parsed_free(&p); return -1; }
+    {
+        size_t pos = 0, k = 0;
+        while (pos < blank && k < nhead) {
+            size_t nl = 0, colon = 0, end = 0;
+            if (scan_header(msg, blank, pos, &nl, &colon, &end) != 0) { pos = end; continue; }
+            hd[k].off = pos; hd[k].namelen = nl; hd[k].colon = colon; hd[k].end = end;
+            k++;
+            pos = end;
+        }
+    }
+
+    /* RFC 6376 3.7: repeated h= entries bind to field occurrences from the END
+       of the header block (first h= entry -> last occurrence, next -> the one
+       before it).  Mirrors dkimpy's select_headers: an h= entry with no
+       remaining occurrence is silently dropped. */
+    for (size_t i = 0; i < p.nh; i++) {
+        size_t name_len = strlen(p.hnames[i]);
+        size_t hi = nhead;
+        bool found = false;
+        while (hi > 0) {
+            hi--;
+            if (hd[hi].namelen == name_len &&
+                strncasecmp(msg + hd[hi].off, p.hnames[i], name_len) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) continue;   /* no occurrence left: skip this h= entry */
         Buf ch; buf_init(&ch);
-        relaxed_header(msg + hs, he - hs, hc - hs, &ch);
+        relaxed_header(msg + hd[hi].off, hd[hi].end - hd[hi].off,
+                       hd[hi].colon - hd[hi].off, &ch);
         buf_put(&in, ch.p, ch.len);
         buf_put(&in, "\r\n", 2);
         buf_free(&ch);
+        hd[hi].namelen = (size_t)-1;   /* consumed */
     }
+    free(hd);
     {
         Buf cd; buf_init(&cd);
-        canon_dkim_hdr(p.d, p.s, p.t, p.bh, htv.p, "", &cd);
+        /* RFC 6376 3.7: the DKIM-Signature header in the signing input is the
+           signer's actual header, relaxed-canonicalized, with only the b= tag
+           value emptied.  Rebuilding a fixed tag order (canon_dkim_hdr) is
+           wrong for signers whose field order/tags differ. */
+        if (canon_raw_dkim_hdr(&p, &cd) != 0) {
+            buf_free(&in); buf_free(&htv); parsed_free(&p); return -1;
+        }
         buf_put(&in, cd.p, cd.len);
         buf_free(&cd);
     }
@@ -601,6 +703,22 @@ int dkim_verify(const char *msg, size_t len, const char *key_path) {
     int r = dkim_load_pk(key_path, &pk);
     if (r != 0) return -1;
     return dkim_verify_core(msg, len, pk, NULL);
+}
+
+int dkim_verify_key(const char *msg, size_t len, const char *pem) {
+    if (!msg || !pem) return -1;
+    int r = dkim_global_init();
+    if (r != 0) return r;
+    mbedtls_pk_context pk;
+    mbedtls_pk_init(&pk);
+    r = mbedtls_pk_parse_public_key(&pk, (const unsigned char *)pem,
+                                    strlen(pem) + 1);
+    if (r == 0 && mbedtls_pk_get_type(&pk) != MBEDTLS_PK_RSA)
+        r = -2;   /* only RSA signatures are supported */
+    if (r == 0)
+        r = dkim_verify_core(msg, len, &pk, NULL);
+    mbedtls_pk_free(&pk);
+    return r;
 }
 
 int dkim_relaxed_header(const char *hdr, size_t len, size_t colon,

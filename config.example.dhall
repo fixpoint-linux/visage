@@ -2,11 +2,21 @@ let Auth = { enabled : Bool, username : Text, password : Text }
 in  let Config =
       { hostname : Text
       , domains : List Text
-      , listen : { address : Text, port : Natural }
+      , listen : { address : Text, port : Natural, proxy_from : List Text }
+      , tls_listen : { address : Text, port : Natural }
       , limits : { message : Natural, line : Natural, rcpts : Natural
                  , cmd_timeout : Natural, data_timeout : Natural }
       , relay : { host : Text, port : Natural, auth : Auth, retries : Natural
                 , tls : Text, tls_ca : Text, max_attempts : Natural }
+      -- Optional outbound relay for reverse-alias REPLIES only.  Normal alias
+      -- forwards keep using `relay` (the local imapd ingest); replies from the
+      -- local mailbox back to the original external sender go out through
+      -- `reply_relay` — typically an authenticated STARTTLS submission server
+      -- (e.g. node-one's outbox on :587) that can deliver to external
+      -- recipients.  Omit the field (older configs) to default to a copy of
+      -- `relay` (previous behaviour).  Same schema as `relay`.
+      , reply_relay : { host : Text, port : Natural, auth : Auth, retries : Natural
+                      , tls : Text, tls_ca : Text, max_attempts : Natural }
       , storage : { path : Text, spool : Text, retention_days : Natural }
       , reply : { prefix : Text, separator : Text }
       , catch_all : Text
@@ -18,7 +28,16 @@ in  let Config =
       }
 in  { hostname = "mx.example.com"
    , domains = [ "example.com" ]
-   , listen = { address = "0.0.0.0", port = 2525 }
+   , listen = { address = "0.0.0.0", port = 2525, proxy_from = [] : List Text }
+   -- proxy_from lists the TRUSTED PROXY-protocol v1 peers (IP literals, e.g.
+   -- the fly edge / nginx stream proxy in front of this listener).  A PROXY
+   -- header is honored only when the actual TCP peer is in this list; from
+   -- any other peer it is ignored, so an empty list means a directly
+   -- reachable listener cannot forge the client IP (SPF / conn caps).
+   -- Put the edge's address here when running behind a PROXY-protocol proxy.
+   -- Optional implicit-TLS (SMTPS) listener; the fly edge uses it to deliver
+   -- over TLS (nginx stream `proxy_ssl`).  port 0 = disabled.
+   , tls_listen = { address = "0.0.0.0", port = 0 }
    , limits = { message = 26214400, line = 1000, rcpts = 100
               , cmd_timeout = 300, data_timeout = 600 }
    , relay = { host = "127.0.0.1", port = 2526
@@ -28,6 +47,16 @@ in  { hostname = "mx.example.com"
              -- points at an operator-provided PEM CA bundle (only consulted
              -- when tls == "starttls-verify").
              , tls_ca = "", max_attempts = 100 }
+   -- reply_relay carries reverse-alias replies to an EXTERNAL submission
+   -- server (AUTH + STARTTLS on :587).  Replace host/username/password with
+   -- node-one's outbox credentials.  AUTH is only ever sent over a
+   -- certificate-VERIFIED TLS leg, so auth.enabled=True requires
+   -- tls = "starttls-verify" (implicit/starttls are privacy-only: an active
+   -- MITM terminates them and would capture the password).
+   , reply_relay = { host = "outbox.node-one", port = 587
+                   , auth = { enabled = True, username = "visage", password = "change-me" }
+                   , retries = 3, tls = "starttls-verify"
+                   , tls_ca = "", max_attempts = 100 }
    , storage = { path = "./var/db", spool = "./var/spool", retention_days = 30 }
    , reply = { prefix = "reply", separator = "+" }
    , catch_all = ""

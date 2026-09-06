@@ -27,6 +27,10 @@
  *     and NEVER retry a bad cert; any other TLS error (timeout/EOF/transport)
  *     is TEMPFAIL and the durable queue re-drives.  No AUTH-over-plaintext is
  *     possible in this mode (mandatory TLS subsumes the auth rule).
+ *   - relay.tls == "implicit" (SMTPS, RFC 8314): TLS begins immediately on
+ *     connect — no STARTTLS command — with VERIFY_NONE (same privacy-only
+ *     posture as opportunistic STARTTLS).  Used for a fixed internal relay
+ *     (e.g. visage's implicit-TLS MX ingest).
  * relay.tls == "none" is the unchanged plaintext path (byte-identical).
  *
  * Reply-code mapping: 2xx/3xx = ok, 4xx = tempfail, 5xx = permfail. Connect
@@ -160,12 +164,14 @@ static int timeout_ms(uint32_t seconds) {
     return (int)ms;
 }
 
-/* Validate relay.tls ∈ {"none", "starttls", "starttls-verify"}.  Pure; unit-tested. */
+/* Validate relay.tls ∈ {"none", "starttls", "starttls-verify", "implicit"}.
+   Pure; unit-tested. */
 int smtp_tls_valid(const char *tls) {
     if (!tls) return -1;
     if (strcmp(tls, "none") == 0) return 0;
     if (strcmp(tls, "starttls") == 0) return 0;
     if (strcmp(tls, "starttls-verify") == 0) return 0;
+    if (strcmp(tls, "implicit") == 0) return 0;
     return -1;
 }
 
@@ -657,12 +663,13 @@ static int build_addr_cmd(char *buf, size_t bufsz, const char *verb,
 /* Connect                                                            */
 /* ------------------------------------------------------------------ */
 
-/* Blocking TCP connect to relay.host:port with a bounded timeout. Tries each
+/* Blocking TCP connect to host:port with a bounded timeout. Tries each
    address returned by getaddrinfo in turn. Returns the connected fd, or -1
    (with a message in status_out). */
-static int smtp_connect(const Config *c, char *status_out, size_t status_sz) {
+static int smtp_connect(const char *host, uint32_t port,
+                        char *status_out, size_t status_sz) {
     char portstr[16];
-    snprintf(portstr, sizeof portstr, "%u", c->relay.port);
+    snprintf(portstr, sizeof portstr, "%u", port);
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof hints);
@@ -670,7 +677,7 @@ static int smtp_connect(const Config *c, char *status_out, size_t status_sz) {
     hints.ai_socktype = SOCK_STREAM;
 
     struct addrinfo *res = NULL;
-    int gai = getaddrinfo(c->relay.host, portstr, &hints, &res);
+    int gai = getaddrinfo(host, portstr, &hints, &res);
     if (gai != 0) {
         set_status(status_out, status_sz, gai_strerror(gai));
         return -1;
@@ -808,8 +815,7 @@ int smtp_auth_class(int code) {
          and sends the fixed PLAIN response unchanged.
    Returns a status class (SMTP_OK on 235, SMTP_TEMPFAIL on 4xx, SMTP_PERMFAIL
    on 5xx, SMTP_ERROR otherwise).  The caller guarantees this is reached only
-   when the transport is already cleared to carry credentials (TLS, or the
-   explicit no-auth-no-TLS plaintext path). */
+   over a certificate-VERIFIED TLS leg (see the M1 gate in smtp_dialogue). */
 static int smtp_auth_plain(SmtpConn *conn, uint32_t tmo,
                            const ConfigRelayAuth *auth, char *status_out,
                            size_t status_sz) {
@@ -941,10 +947,11 @@ static void smtp_backoff(uint32_t attempt) {
     sleep(smtp_backoff_sec(attempt));
 }
 
-static int smtp_dialogue(SmtpConn *conn, const Config *c, uint32_t tmo,
-                         uint32_t dtmo, const char *body, size_t bodylen,
-                         const char *mail_cmd, const char *rcpt_cmd,
-                         char *status_out, size_t status_sz) {
+static int smtp_dialogue(SmtpConn *conn, const Config *c, const char *host,
+                         uint32_t tmo, uint32_t dtmo, const char *body,
+                         size_t bodylen, const char *mail_cmd,
+                         const char *rcpt_cmd, char *status_out,
+                         size_t status_sz) {
     char text[SMTP_MAX_LINE];
     char caps[SMTP_MAX_REPLY];
     size_t caplen = 0;
@@ -956,7 +963,20 @@ static int smtp_dialogue(SmtpConn *conn, const Config *c, uint32_t tmo,
     const char *tlsv = c->relay.tls;
     bool tls_opp    = (tlsv && strcmp(tlsv, "starttls") == 0);        /* opportunistic */
     bool tls_verify = (tlsv && strcmp(tlsv, "starttls-verify") == 0); /* mandatory TLS */
+    bool tls_implicit = (tlsv && strcmp(tlsv, "implicit") == 0);      /* TLS-on-connect */
     bool want_tls = tls_opp || tls_verify;
+
+    /* 0. implicit TLS (SMTPS, RFC 8314): the handshake runs immediately over
+       the raw socket — no greeting/EHLO/STARTTLS in the clear.  VERIFY_NONE
+       (like opportunistic STARTTLS): an internal relay typically presents a
+       private/self-signed cert, so we authenticate the transport (privacy)
+       without CA verification. */
+    if (tls_implicit) {
+        int hr = smtp_tls_handshake(conn, host, false, c->relay.tls_ca, tmo,
+                                    status_out, status_sz);
+        if (hr != 0)
+            return SMTP_TEMPFAIL;   /* status_out carries the mbedTLS error */
+    }
 
     /* 1. greeting: expect 220 */
     if (smtp_read_reply(conn, tmo, &code, text, sizeof text) != 0) {
@@ -1006,7 +1026,7 @@ static int smtp_dialogue(SmtpConn *conn, const Config *c, uint32_t tmo,
                               status_sz) != 0)
                 return SMTP_TEMPFAIL;
             if (code == 220) {
-                int hr = smtp_tls_handshake(conn, c->relay.host, tls_verify,
+                int hr = smtp_tls_handshake(conn, host, tls_verify,
                                             c->relay.tls_ca, tmo,
                                             status_out, status_sz);
                 if (hr != 0) {
@@ -1068,8 +1088,22 @@ static int smtp_dialogue(SmtpConn *conn, const Config *c, uint32_t tmo,
         /* no auth and no TLS: opportunistic plaintext fallback */
     }
 
-    /* 4. AUTH PLAIN (if enabled; over TLS iff we did STARTTLS) */
+    /* 4. AUTH PLAIN (if enabled; only over a VERIFIED TLS leg) */
     if (c->relay.auth.enabled) {
+        /* Hard rule (M1): credentials never travel over an unverified
+           channel.  Only starttls-verify produces one (VERIFY_REQUIRED +
+           CA chain + hostname); "implicit" and "starttls" are privacy-only
+           (VERIFY_NONE — an active MITM terminates the TLS leg itself and
+           captures the password) and "none" is plaintext.  This also covers
+           the implicit/none paths that skip the STARTTLS block above, and
+           is belt-and-suspenders behind the config-load rejection of
+           auth + {none, implicit}. */
+        if (!(tls_verify && did_tls)) {
+            set_status(status_out, status_sz,
+                       "refusing AUTH over unverified TLS "
+                       "(relay.tls must be \"starttls-verify\")");
+            return SMTP_PERMFAIL;
+        }
         cls = smtp_auth_plain(conn, tmo, &c->relay.auth, status_out, status_sz);
         if (cls != SMTP_OK)
             return cls;
@@ -1118,18 +1152,19 @@ static int smtp_dialogue(SmtpConn *conn, const Config *c, uint32_t tmo,
 /* Public entry point                                                 */
 /* ------------------------------------------------------------------ */
 
-int smtp_out_send(Store *s, const Config *c, const char *from, const char *to,
-                  const char *body, size_t bodylen, char *status_out,
-                  size_t status_sz) {
-    (void)s;   /* reserved for delivery logging (later slices) */
+/* Deliver a single envelope to an EXPLICIT host:port (the direct-delivery
+   path used by outbox for per-MX delivery).  Identical to smtp_out_send except
+   the connect target and TLS SNI host are the given `host`/`port` rather than
+   Config.relay.host/port.  The caller drives retry/backoff across targets by
+   passing a Config with relay.retries == 0 (this function never sleeps or
+   retries on its own). */
+int smtp_out_send_host(const Config *c, const char *host, uint32_t port,
+                       const char *from, const char *to, const char *body,
+                       size_t bodylen, char *status_out, size_t status_sz) {
     set_status(status_out, status_sz, "");
 
-    if (!c || !from || !to || !body) {
+    if (!c || !host || !*host || !from || !to || !body) {
         set_status(status_out, status_sz, "bad arguments");
-        return SMTP_ERROR;
-    }
-    if (!c->relay.host || !*c->relay.host) {
-        set_status(status_out, status_sz, "no relay host configured");
         return SMTP_ERROR;
     }
     if (smtp_tls_valid(c->relay.tls) != 0) {
@@ -1141,11 +1176,6 @@ int smtp_out_send(Store *s, const Config *c, const char *from, const char *to,
         set_status(status_out, status_sz, "invalid envelope address");
         return SMTP_ERROR;
     }
-    /* `from` may be the empty string = the null reverse-path (<>).  RFC 5321
-       forbids bouncing a null-reverse-path message, so preserving MAIL FROM:<>
-       is what breaks a bounce loop; build_addr_cmd already emits `<>` for an
-       empty from.  Only an empty `to` (which can never legitimately occur — a
-       recipient is always a non-empty address) is rejected here. */
     if (!*to) {
         set_status(status_out, status_sz, "empty envelope address");
         return SMTP_ERROR;
@@ -1168,7 +1198,7 @@ int smtp_out_send(Store *s, const Config *c, const char *from, const char *to,
         if (attempt > 0)
             smtp_backoff(attempt);
 
-        int fd = smtp_connect(c, status_out, status_sz);
+        int fd = smtp_connect(host, port, status_out, status_sz);
         if (fd < 0) {
             if (attempt >= retries)
                 return SMTP_TEMPFAIL;
@@ -1177,8 +1207,8 @@ int smtp_out_send(Store *s, const Config *c, const char *from, const char *to,
 
         SmtpConn conn;
         smtp_conn_init(&conn, fd);
-        int rc = smtp_dialogue(&conn, c, tmo, dtmo, body, bodylen, mail_cmd,
-                               rcpt_cmd, status_out, status_sz);
+        int rc = smtp_dialogue(&conn, c, host, tmo, dtmo, body, bodylen,
+                               mail_cmd, rcpt_cmd, status_out, status_sz);
         smtp_conn_close(&conn, rc == SMTP_OK);
 
         if (rc == SMTP_OK || rc == SMTP_PERMFAIL || rc == SMTP_ERROR)
@@ -1187,4 +1217,26 @@ int smtp_out_send(Store *s, const Config *c, const char *from, const char *to,
         if (attempt >= retries)
             return SMTP_TEMPFAIL;
     }
+}
+
+int smtp_out_send(Store *s, const Config *c, const char *from, const char *to,
+                  const char *body, size_t bodylen, char *status_out,
+                  size_t status_sz) {
+    (void)s;   /* reserved for delivery logging (later slices) */
+    set_status(status_out, status_sz, "");
+
+    if (!c || !from || !to || !body) {
+        set_status(status_out, status_sz, "bad arguments");
+        return SMTP_ERROR;
+    }
+    if (!c->relay.host || !*c->relay.host) {
+        set_status(status_out, status_sz, "no relay host configured");
+        return SMTP_ERROR;
+    }
+    return smtp_out_send_host(c, c->relay.host, c->relay.port, from, to, body,
+                              bodylen, status_out, status_sz);
+}
+
+const ConfigRelay *smtp_relay_for(const Config *cfg, bool is_reply) {
+    return is_reply ? &cfg->reply_relay : &cfg->relay;
 }

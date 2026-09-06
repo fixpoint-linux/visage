@@ -171,44 +171,45 @@ static int read_file(const char *path, char **out, size_t *outlen) {
     return 0;
 }
 
-/* Read only the header block (up to IMAPD_HDR_CAP or the blank line),
-   NUL-terminated.  Cheaper than reading a whole large message for a
-   header-only SEARCH/SORT. */
+/* Read only the header block (up to the blank line, or IMAPD_HDR_CAP for a
+   pathological header), NUL-terminated.  Reads in small chunks and stops the
+   moment the header is complete, so a SEARCH that only inspects headers does
+   not read whole large messages — on a 30k-message mailbox reading 256KB (or
+   the full file) per message turned a Message-ID search into ~50s and made
+   clients time out. */
 static size_t msg_hdr_end(const char *msg, size_t len);   /* fwd */
 static int read_hdr(const char *path, char **out, size_t *outlen) {
     int fd;
     char *buf;
-    size_t got = 0, want, he;
-    struct stat st;
+    size_t got = 0;
     if (!path || !out || !outlen) return -1;
     *out = NULL;
     *outlen = 0;
+    buf = malloc(IMAPD_HDR_CAP + 1);
+    if (!buf) return -1;
     fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
-    /* Allocate at most the header cap, but not more than the file size
-       (typical headers are a few KB; the full cap is only for huge ones). */
-    if (fstat(fd, &st) != 0 || st.st_size < 0) { close(fd); return -1; }
-    want = (size_t)st.st_size < IMAPD_HDR_CAP ? (size_t)st.st_size
-                                              : IMAPD_HDR_CAP;
-    buf = malloc(want + 1);
-    if (!buf) { close(fd); return -1; }
-    while (got < want) {
-        ssize_t r = read(fd, buf + got, want - got);
+    if (fd < 0) { free(buf); return -1; }
+    while (got < IMAPD_HDR_CAP) {
+        char chunk[8192];
+        size_t need = sizeof chunk;
+        ssize_t r;
+        if (IMAPD_HDR_CAP - got < need) need = IMAPD_HDR_CAP - got;
+        r = read(fd, chunk, need);
         if (r < 0) {
             if (errno == EINTR) continue;
-            free(buf);
-            close(fd);
-            return -1;
+            break;
         }
         if (r == 0) break;
+        memcpy(buf + got, chunk, (size_t)r);
         got += (size_t)r;
+        if (msg_hdr_end(buf, got) < got) break;   /* header block complete */
     }
     close(fd);
     buf[got] = '\0';
-    he = msg_hdr_end(buf, got);
-    buf[he] = '\0';
+    got = msg_hdr_end(buf, got);
+    buf[got] = '\0';
     *out = buf;
-    *outlen = he;
+    *outlen = got;
     return 0;
 }
 
@@ -379,22 +380,36 @@ int imapd_parse_plain_list(const char **p, char ***out, size_t *nout) {
     for (;;) {
         char *atom;
         size_t alen;
+        size_t k;
         while (*s == ' ') s++;
         if (*s == ')') { s++; break; }
-        if (*s == '\0') { free(v); return -1; }
+        if (*s == '\0') {
+            for (k = 0; k < n; k++) free(v[k]);
+            free(v);
+            return -1;
+        }
         {
             const char *start = s;
             while (*s && *s != ' ' && *s != ')') s++;
             alen = (size_t)(s - start);
             atom = malloc(alen + 1);
-            if (!atom) { free(v); return -1; }
+            if (!atom) {
+                for (k = 0; k < n; k++) free(v[k]);
+                free(v);
+                return -1;
+            }
             memcpy(atom, start, alen);
             atom[alen] = '\0';
         }
         if (n == cap) {
             size_t nc = cap ? cap * 2 : 4;
             char **nv = realloc(v, nc * sizeof *nv);
-            if (!nv) { free(atom); free(v); return -1; }
+            if (!nv) {
+                free(atom);
+                for (k = 0; k < n; k++) free(v[k]);
+                free(v);
+                return -1;
+            }
             v = nv;
             cap = nc;
         }
@@ -456,9 +471,9 @@ static int imapd_search_parse_depth(const char **p, SearchKey **out,
             SearchKey *sub;
             while (*s == ' ') s++;
             if (*s == ')') { s++; break; }
-            if (*s == '\0') return -1;
+            if (*s == '\0') { imapd_search_free(grp); return -1; }
             r = imapd_search_parse_depth(&s, &sub, depth + 1);
-            if (r <= 0) return -1;
+            if (r <= 0) { imapd_search_free(grp); return -1; }
             if (!grp) {
                 grp = sk_new(SK_AND);
                 if (!grp) { imapd_search_free(sub); return -1; }
@@ -697,9 +712,12 @@ int imapd_search_parse_program(const char **p, SearchKey **out) {
             grp = nn;
             tail = nn;
         } else {
+            /* right-leaning chain: wrap the previous leaf (tail->b) so no key
+               is orphaned.  nn->a = old leaf, nn->b = new key. */
             SearchKey *nn = sk_new(SK_AND);
             if (!nn) { imapd_search_free(sub); imapd_search_free(grp); return -1; }
-            nn->a = sub;
+            nn->a = tail->b;
+            nn->b = sub;
             tail->b = nn;
             tail = nn;
         }
@@ -748,6 +766,28 @@ static bool imapd_search_needs_hdr(const SearchKey *k) {
     }
 }
 
+/* True if every content-bearing key is a Message-ID HEADER search.  These
+   are served from the persisted per-message index, so the search needs to
+   read no message file at all (reading 30k files per search is what made
+   FairEmail's post-move Message-ID lookup time out). */
+static bool imapd_search_only_msgid(const SearchKey *k) {
+    if (!k) return true;
+    switch (k->kind) {
+    case SK_HEADER:
+        return k->hdr && ascii_ieq_str(k->hdr, "Message-ID");
+    case SK_FROM: case SK_TO: case SK_SUBJECT: case SK_BODY: case SK_TEXT:
+        return false;
+    case SK_NOT:
+        return imapd_search_only_msgid(k->a);
+    case SK_OR:
+        return imapd_search_only_msgid(k->a) && imapd_search_only_msgid(k->b);
+    case SK_AND:
+        return imapd_search_only_msgid(k->a) && imapd_search_only_msgid(k->b);
+    default:
+        return true;   /* metadata/date keys need no message content */
+    }
+}
+
 /* Byte offset just past the header block (incl. the blank separator line). */
 static size_t msg_hdr_end(const char *msg, size_t len) {
     size_t i;
@@ -783,6 +823,11 @@ bool imapd_search_match(const SearchKey *k, const ImailDoc *d,
     case SK_TO:
     case SK_SUBJECT:
     case SK_HEADER:
+        /* Message-ID is served from the persisted per-message index, so no
+           file read is needed. */
+        if (k->hdr && ascii_ieq_str(k->hdr, "Message-ID") &&
+            d->m && d->m->mid)
+            return ci_strstr(d->m->mid, strlen(d->m->mid), k->str) != NULL;
         if (!d->msg) return false;
         if (mail_header_get(d->msg, d->msglen,
                             k->hdr ? k->hdr :
@@ -1133,6 +1178,13 @@ static void do_list(ImapdServer *srv, Conn *c, const char *tag,
     char *full;
     char **names = NULL;
     size_t nnames = 0, i;
+    /* LIST/LSUB are only valid once authenticated (RFC 3501 6.3.8): the
+       folder enumeration is per-user, so c->user must be set. */
+    if (c->ist == IST_NOT_AUTH) {
+        conn_replyf(c, "%s BAD %s not allowed now\r\n", tag,
+                    sub ? "LSUB" : "LIST");
+        return;
+    }
     if (imapd_next_astring(&rest, &ref, &rl) != 1 ||
         imapd_next_astring(&rest, &pat, &pl) != 1) {
         conn_replyf(c, "%s BAD LIST requires reference and pattern\r\n", tag);
@@ -1579,28 +1631,111 @@ static void do_file(ImapdServer *srv, Conn *c, const char *tag,
     imapd_fetch_free(c);
     {
         uint32_t star = uid ? c->mb.uidnext : (uint32_t)c->mb.nmsgs;
+        uint32_t uvv = 0;                 /* destination UIDVALIDITY */
+        struct UidPair { uint32_t s, d; } *pairs = NULL;  /* src<->dest UID */
+        size_t nn = 0, cp = 0;
+        size_t i;
+        /* append a (source,dest) UID pair */
+        #define FILE_PAIR(s_, d_) do {                                       \
+            if (nn == cp) {                                                  \
+                size_t nc = cp ? cp * 2 : 8;                                 \
+                struct UidPair *np = realloc(pairs, nc * sizeof *np);        \
+                if (!np) goto file_oom;                                      \
+                pairs = np; cp = nc;                                         \
+            }                                                                \
+            pairs[nn].s = (s_); pairs[nn].d = (d_); nn++;                    \
+        } while (0)
+
         if (move) {
-            size_t i;
-            for (i = c->mb.nmsgs; i > 0; i--) {
-                Imail *m = &c->mb.msgs[i - 1];
-                uint32_t v = uid ? m->uid : (uint32_t)i;
-                if (!imapd_seqset_has(set, v, star)) continue;
-                if (imapd_mbox_file(&srv->cfg, c->user, &c->mb, m->uid,
-                                    name, true) == 0)
-                    conn_replyf(c, "* %zu EXPUNGE\r\n", i);
-            }
-        } else {
-            size_t i;
+            /* Move in ascending sequence order so the destination UIDs are
+               assigned monotonically with the source (clients expect the
+               COPYUID dest set ascending).  EXPUNGE responses go out in
+               descending ORIGINAL sequence order (see below). */
+            struct Mv { uint32_t seq, uid; } *mv = NULL;
+            size_t nm = 0, mcap = 0;
             for (i = 0; i < c->mb.nmsgs; i++) {
                 Imail *m = &c->mb.msgs[i];
                 uint32_t v = uid ? m->uid : (uint32_t)(i + 1);
                 if (!imapd_seqset_has(set, v, star)) continue;
-                imapd_mbox_file(&srv->cfg, c->user, &c->mb, m->uid, name,
-                                false);
+                if (nm == mcap) {
+                    size_t nc = mcap ? mcap * 2 : 8;
+                    struct Mv *nv = realloc(mv, nc * sizeof *nv);
+                    if (!nv) goto file_oom;
+                    mv = nv; mcap = nc;
+                }
+                mv[nm].seq = (uint32_t)(i + 1);
+                mv[nm].uid = m->uid;
+                nm++;
+            }
+            for (i = 0; i < nm; i++) {
+                uint32_t duv = 0, duid = 0;
+                if (imapd_mbox_file(&srv->cfg, c->user, &c->mb, mv[i].uid,
+                                    name, true, &duv, &duid) == 0) {
+                    uvv = duv;
+                    FILE_PAIR(mv[i].uid, duid);
+                }
+            }
+            /* EXPUNGE responses in descending ORIGINAL sequence order: the
+               client removes by its own sequence numbers, so they must be the
+               source-message numbers, not the post-removal current ones. */
+            for (i = nm; i > 0; i--)
+                conn_replyf(c, "* %u EXPUNGE\r\n", mv[i - 1].seq);
+            free(mv);
+        } else {
+            for (i = 0; i < c->mb.nmsgs; i++) {
+                Imail *m = &c->mb.msgs[i];
+                uint32_t v = uid ? m->uid : (uint32_t)(i + 1);
+                uint32_t duv = 0, duid = 0;
+                if (!imapd_seqset_has(set, v, star)) continue;
+                if (imapd_mbox_file(&srv->cfg, c->user, &c->mb, m->uid,
+                                    name, false, &duv, &duid) == 0) {
+                    uvv = duv;
+                    FILE_PAIR(m->uid, duid);
+                }
             }
         }
+        /* UIDPLUS (RFC 4315 / 6851): report the parallel source/dest UID
+           sets so the client can track the moved messages in the target.
+           Without this the client guesses the new UIDs and loses track of
+           the copies. */
+        if (nn > 0) {
+            /* present ascending by source UID (the convention clients use) */
+            for (i = 0; i < nn; i++) {
+                size_t j;
+                for (j = i + 1; j < nn; j++)
+                    if (pairs[j].s < pairs[i].s) {
+                        struct UidPair t = pairs[i];
+                        pairs[i] = pairs[j]; pairs[j] = t;
+                    }
+            }
+            {
+                char sb[512], db[512], *sp = sb, *dp = db;
+                size_t left = sizeof sb, dleft = sizeof db;
+                int first = 1;
+                for (i = 0; i < nn; i++) {
+                    int ns = snprintf(sp, left, "%s%u", first ? "" : ",",
+                                      pairs[i].s);
+                    int nd = snprintf(dp, dleft, "%s%u", first ? "" : ",",
+                                      pairs[i].d);
+                    if (ns < 0 || (size_t)ns >= left || nd < 0 ||
+                        (size_t)nd >= dleft) goto file_oom;
+                    sp += ns; left -= (size_t)ns;
+                    dp += nd; dleft -= (size_t)nd;
+                    first = 0;
+                }
+                conn_replyf(c, "%s OK [COPYUID %u %s %s] %s completed\r\n",
+                            tag, uvv, sb, db, cmd);
+            }
+        } else {
+            conn_replyf(c, "%s OK %s completed\r\n", tag, cmd);
+        }
+        free(pairs);
+        goto file_done;
+file_oom:
+        free(pairs);
+        conn_replyf(c, "%s BAD %s out of memory\r\n", tag, cmd);
     }
-    conn_replyf(c, "%s OK %s completed\r\n", tag, cmd);
+file_done:
     free(set);
     free(name);
 }
@@ -1662,7 +1797,7 @@ static void do_store(ImapdServer *srv, Conn *c, const char *tag,
     size_t ilen;
     bool silent = false;
     int op = 0;   /* +1 set, -1 clear, 0 replace */
-    uint8_t bits = 0, mask = 0;
+    uint8_t bits = 0;
     if (c->ist != IST_SELECTED) {
         conn_replyf(c, "%s BAD STORE not allowed now\r\n", tag);
         return;
@@ -1715,10 +1850,7 @@ static void do_store(ImapdServer *srv, Conn *c, const char *tag,
             free(set);
             return;
         }
-        if (b) {
-            bits |= (uint8_t)b;
-            mask |= (uint8_t)b;
-        }
+        if (b) bits |= (uint8_t)b;
         free(fl);
     }
     if (c->examine) {
@@ -1794,6 +1926,7 @@ static void do_search(ImapdServer *srv, Conn *c, const char *tag,
     }
     needs = imapd_search_needs_body(prog);
     needhdr = imapd_search_needs_hdr(prog);
+    if (imapd_search_only_msgid(prog)) { needs = false; needhdr = false; }
     (void)buf_append(&out, &outlen, &outcap, "* SEARCH", 8);
     for (i = 0; i < c->mb.nmsgs; i++) {
         Imail *m = &c->mb.msgs[i];
@@ -3178,6 +3311,14 @@ static void dispatch(ImapdServer *srv, Conn *c) {
     const char *p = cmd;
     char *tag = NULL, *word = NULL;
     size_t tl, wl;
+
+    /* RFC 3501 5.5: an empty command line (e.g. a stray CRLF) is ignored.
+       imap_process's buf_append of an empty line is a no-op, so c->cmd can be
+       NULL here; the tokenizer below would dereference it and crash. */
+    if (c->cmd == NULL || c->cmd[0] == '\0') {
+        c->cmd_len = 0;
+        return;
+    }
 
     /* RFC 2177: while IDLE, the only valid client input is the untagged
        continuation "DONE" (no tag).  Anything else is rejected. */

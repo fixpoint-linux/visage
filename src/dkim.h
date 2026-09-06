@@ -28,6 +28,11 @@ int dkim_sign(const char *msg, size_t msglen, const char *domain,
  * successful verification, nonzero on any parse/verify failure. */
 int dkim_verify(const char *msg, size_t len, const char *key_path);
 
+/* Verify the leading DKIM-Signature of `msg` against a public key supplied as
+ * a PEM string (e.g. reconstructed from a DNS TXT "p=" tag).  Returns 0 on a
+ * successful verification, nonzero on any parse/verify failure. */
+int dkim_verify_key(const char *msg, size_t len, const char *pem);
+
 /* --- test-facing canonicalization (used by dkim_check) ------------------- */
 /* Relaxed-canonicalize one logical header (hdr[0..len), `colon` = index of
  * ':') with NO trailing CRLF into *out (heap, NUL-terminated; *outlen excludes

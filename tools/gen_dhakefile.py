@@ -3,8 +3,9 @@
 
 Builds a single Dhakefile.dhall that:
   - compiles the mbedTLS objects (no pattern rules => an explicit `mbedtls` target)
-  - builds all C binaries (*_check, visage.com, tests/*.com) with cosmocc
-  - builds the wasm demo (emscripten) into docs/
+  - builds all C binaries with host `cc`: the datalog/dhall-linking daemons and
+    check tools against the Zig-built libdatalog.so + libdhall.so (glibc dynamic
+    ELFs), the standalone mbedTLS check tools as plain ELFs (no APE/cosmocc)
   - builds the Elm MFE docs site
 Every non-phony output pins `hash` (expected sha256) and every input source
 pins `depsHash`.  Run `dhake --warn-hash-mismatch` to (re)capture actual output
@@ -34,19 +35,8 @@ DHALL_C  = "vendor/dhall-c"
 DATALOG  = "vendor/datalog-dafsa"
 MBDIR    = "vendor/mbedtls"
 
-dhall_core = [
- "arena.c","lexer.c","parser.c","ast.c","normalize.c","typecheck.c","builtins.c",
- "serialize.c","import.c","bignum.c","sha256.c","ssrf.c","http.c",
-]
-datalog_core = [
- "dafsa.c","dafsa_state.c","dafsa_core.c","dafsa_persist.c","dafsa_view.c",
- "dafsa_crc32.c","dafsa_wal.c","dafsa_build.c","dafsa_rank.c","dafsa_view_rank.c",
-] + [
- "intern.c","termstore.c","relation.c","vrelation.c","tupleset.c","parser.c",
- "compiler.c","vm.c","snapshot.c","regexwalk.c","permindex.c","util.c","dl.c",
- "iter.c","magic.c","topdown.c","analyze.c","schema.c","typecheck.c","txnwal.c",
- "index.c","vector.c",
-]
+def mb(*ns): return [exists(f"{MBDIR}/library/{n}") for n in ns]
+
 mbedtls_lib = [
  "aes.c","asn1parse.c","asn1write.c","base64.c","bignum.c","bignum_core.c",
  "bignum_mod.c","bignum_mod_raw.c","cipher.c","cipher_wrap.c","constant_time.c",
@@ -57,28 +47,23 @@ mbedtls_lib = [
  "ssl_ciphersuites.c","ssl_client.c","ssl_msg.c","ssl_tls.c","ssl_tls12_client.c",
  "ssl_tls12_server.c","version.c","x509.c","x509_crt.c",
 ]
-
-def dh(*ns): return [exists(f"{DHALL_C}/src/{n}") for n in ns]
-def dl(*ns): return [exists(f"{DATALOG}/src/{n}") for n in ns]
-def dlv(*ns): return [exists(f"{DATALOG}/vendor/{n}") for n in ns]
-def mb(*ns): return [exists(f"{MBDIR}/library/{n}") for n in ns]
-
-CORE_DHALL = dh(*dhall_core)
-CORE_DATALOG = dlv(*datalog_core[:10]) + dl(*datalog_core[10:])
 MBEDTLS_SRC = mb(*mbedtls_lib)
 MBEDTLS_CONFIG = "src/mbedtls_visage_config.h"
 DATA_CACERT = "src/data/cacert_pem.c"
 DATA_ADMIN = "src/data/admin_ui.c"
 
 SRC = ["src/config.c","src/store.c","src/smtp_in.c","src/smtp_in_tls.c","src/smtp_out.c",
-       "src/mail.c","src/reply.c","src/dkim.c","src/http.c","src/admin.c","src/http_parse.c",
-       "src/json.c","src/main.c"]
+       "src/mail.c","src/reply.c","src/dkim.c","src/auth_results.c","src/http.c","src/admin.c",
+       "src/http_parse.c","src/json.c","src/main.c"]
 HDRS = ["src/visage.h","src/config.h","src/store.h","src/mail.h","src/reply.h",
-        "src/smtp.h","src/dkim.h","src/http_parse.h","src/json.h"]
+        "src/smtp.h","src/dkim.h","src/auth_results.h","src/http_parse.h","src/json.h"]
 HDRS = [exists(h) for h in HDRS]
 
 CFLAGS = ("-std=c11 -O2 -g -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L "
           f"-I {DHALL_C}/src -I {DATALOG}/src -I {DATALOG}/vendor")
+CCFLAGS = ("-std=c11 -O2 -g -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L "
+           "-D_DEFAULT_SOURCE "
+           f"-I {DHALL_C}/src -I {DATALOG}/src -I {DATALOG}/vendor")
 MBFLAGS = f"-I {MBDIR}/include -I src -DMBEDTLS_CONFIG_FILE='\"mbedtls_visage_config.h\"'"
 
 # ---------- helpers to emit Dhall ----------
@@ -134,7 +119,7 @@ mb_obj_shell = ("set -e; mkdir -p %s/build; " % MBDIR)
 for c in mbedtls_lib:
     obj = f"{MBDIR}/build/{c[:-2]}.o"
     mb_obj_shell += (f"if [ ! -f {obj} ] || [ {MBDIR}/library/{c} -nt {obj} ]; then "
-                     f"cosmocc {CFLAGS} {MBFLAGS} -c -o {obj} {MBDIR}/library/{c}; fi; ")
+                     f"cc {CCFLAGS} {MBFLAGS} -c -o {obj} {MBDIR}/library/{c}; fi; ")
 mb_obj_shell += f"touch {MBDIR}/build/.stamp"
 # dhake uses the target NAME as the output file path, so this target must be
 # named after its output stamp. Binaries depend on 'vendor/mbedtls/build/.stamp'.
@@ -150,61 +135,146 @@ mbtls_objs = [f"{MBDIR}/build/{c[:-2]}.o" for c in mbedtls_lib]
 mbtls_objs_join = " ".join(mbtls_objs)
 
 def link_cmd(out, srcs, extra_flags=""):
-    return f"cosmocc {CFLAGS} {extra_flags} -o {out} {' '.join(srcs)}"
+    return f"cc {CCFLAGS} {extra_flags} -o {out} {' '.join(srcs)}"
+
+# --- datalog targets: host `cc` + Zig-built libdatalog.so ---
+# Every target that links the datalog-dafsa engine uses the Zig-built glibc
+# libdatalog.so in the sibling ../datalog-dafsa checkout instead of compiling
+# the stale vendored C engine.  Targets compile with host `cc` into glibc
+# dynamic ELFs and link the .so with an absolute rpath.  The vendored
+# vendor/datalog-dafsa HEADERS are still used at compile time (the .so preserves
+# the dl_*/dafsa_* ABI); only the vendored C engine sources are dropped from
+# deps/recipe/depsHash.
+DATALOG_SO_DIR = os.path.abspath(os.path.join(ROOT, "..", "datalog-dafsa", "zig-out", "lib"))
+DLOG_LINK = f"-L {DATALOG_SO_DIR} -ldatalog -Wl,-rpath,{DATALOG_SO_DIR}"
+
+def cc_link_datalog(out, srcs, extra_flags=""):
+    return f"cc {CCFLAGS} {extra_flags} -o {out} {' '.join(srcs)} {DLOG_LINK}"
+
+# The Zig-built engine .so these targets link.  Pinning it as a hash_src makes
+# `dhake --verify` (and the dependency graph) detect an engine rebuild/output
+# drift instead of silently relinking against a stale .so.
+DATALOG_SO = os.path.join(DATALOG_SO_DIR, "libdatalog.so")
+
+# --- dhall targets: host `cc` + Zig-built libdhall.so ---
+# Same pattern as libdatalog.so: the vendored vendor/dhall-c submodule is pinned
+# pre-Zig (07a069c, no zig/ dir), so visage links the Zig engine .so from the
+# sibling ../dhall-c checkout instead of compiling the stale vendored C engine.
+# The vendored dhall.h HEADER is still used at compile time (config.c compiles
+# against the C ABI the .so mirrors); only the vendored C engine sources are
+# dropped from deps/recipe/depsHash.
+DHALL_SRC_DIR = os.path.abspath(os.path.join(ROOT, "..", "dhall-c", "zig", "src"))
+DHALL_SO_DIR  = os.path.abspath(os.path.join(ROOT, "..", "dhall-c", "zig-out", "lib"))
+DHALL_SO      = os.path.join(DHALL_SO_DIR, "libdhall.so")
+DHALL_LINK    = f"-L {DHALL_SO_DIR} -ldhall -Wl,-rpath,{DHALL_SO_DIR}"
+
+# abi.zig's transitive import closure (abi -> dhall/arena/ast/parser/normalize/
+# import/sha256/typecheck, and their own imports).  Pinned so an engine-source
+# change invalidates the .so build.
+DHALL_ZIG = ["abi.zig","dhall.zig","arena.zig","ast.zig","parser.zig","normalize.zig",
+             "import.zig","sha256.zig","bignum.zig","lexer.zig","builtins.zig",
+             "http.zig","ssrf.zig","typecheck.zig"]
+def dhz(*ns): return [exists(f"{DHALL_SRC_DIR}/{n}") for n in ns]
+DHALL_ZIG_SRCS = dhz(*DHALL_ZIG)
+
+def cc_link_dhall(out, srcs, extra_flags=""):
+    return f"cc {CCFLAGS} {extra_flags} -o {out} {' '.join(srcs)} {DHALL_LINK}"
+
+def cc_link_dhall_datalog(out, srcs, extra_flags=""):
+    return f"cc {CCFLAGS} {extra_flags} -o {out} {' '.join(srcs)} {DHALL_LINK} {DLOG_LINK}"
+
+# --- libdhall.so (Zig engine) ---
+# The dhall-c interpreter core as a shared library, built from the Zig port via
+# the proven build-obj + cc -shared + strip chain (build-obj emits deterministic
+# output, so the hash pins).  The recipe runs from DHALL_SRC_DIR so abi.zig's
+# sibling imports resolve; the .so lands next to libdatalog.so in the sibling
+# checkout's zig-out/lib.
+T.append(target(DHALL_SO,
+    deps=DHALL_ZIG_SRCS,
+    recipe=[
+        f"mkdir -p {DHALL_SO_DIR} && cd {DHALL_SRC_DIR} && rm -f {DHALL_SO} && "
+        "ZIG_GLOBAL_CACHE_DIR=/tmp/.zcache ZIG_LOCAL_CACHE_DIR=/tmp/.zlcache "
+        "zig build-obj abi.zig -lc -dynamic -O ReleaseSafe -fno-stack-check "
+        "-femit-bin=/tmp/visage-libdhall.o && "
+        f"cc -shared -o {DHALL_SO} /tmp/visage-libdhall.o -lc "
+        "-Wl,-soname,libdhall.so -Wl,--build-id=none && "
+        f"strip --strip-all {DHALL_SO}"
+    ],
+    out=DHALL_SO))
 
 # --- visage.com ---
-v_srcs = SRC + CORE_DHALL + CORE_DATALOG + mbtls_objs + [DATA_CACERT, DATA_ADMIN]
+v_srcs = SRC + MBEDTLS_SRC + [DATA_CACERT, DATA_ADMIN]
 T.append(target("visage.com",
-    deps=[STAMP] + SRC + HDRS + CORE_DHALL + CORE_DATALOG + [DATA_CACERT, DATA_ADMIN, MBEDTLS_CONFIG],
-    recipe=[link_cmd("visage.com", v_srcs, MBFLAGS)],
-    out="visage.com"))
+    deps=SRC + HDRS + MBEDTLS_SRC + [DATA_CACERT, DATA_ADMIN, MBEDTLS_CONFIG, DHALL_SO],
+    recipe=[cc_link_dhall_datalog("visage.com", v_srcs, MBFLAGS)],
+    out="visage.com",
+    hash_srcs=SRC + HDRS + MBEDTLS_SRC + [DATA_CACERT, DATA_ADMIN, MBEDTLS_CONFIG, DATALOG_SO, DHALL_SO]))
 
 # --- *_check tools (no mbedTLS unless noted) ---
 T.append(target("config_check.com",
-    deps=["src/config.c","src/config_check.c","src/config.h","src/visage.h"] + CORE_DHALL,
-    recipe=[link_cmd("config_check.com", ["src/config.c","src/config_check.c"] + CORE_DHALL)],
-    out="config_check.com"))
+    deps=["src/config.c","src/config_check.c","src/config.h","src/visage.h", DHALL_SO],
+    recipe=[cc_link_dhall("config_check.com", ["src/config.c","src/config_check.c"])],
+    out="config_check.com",
+    hash_srcs=["src/config.c","src/config_check.c","src/config.h","src/visage.h", DHALL_SO]))
 T.append(target("store_check.com",
-    deps=["src/store.c","src/store_check.c","src/store.h","src/visage.h"] + CORE_DATALOG,
-    recipe=[link_cmd("store_check.com", ["src/store.c","src/store_check.c"] + CORE_DATALOG)],
-    out="store_check.com"))
+    deps=["src/store.c","src/store_check.c","src/store.h","src/visage.h"],
+    recipe=[cc_link_datalog("store_check.com", ["src/store.c","src/store_check.c"])],
+    out="store_check.com",
+    hash_srcs=["src/store.c","src/store_check.c","src/store.h","src/visage.h", DATALOG_SO]))
 T.append(target("store_bench.com",
-    deps=["src/store.c","src/store_bench.c","src/store.h","src/visage.h"] + CORE_DATALOG,
-    recipe=[link_cmd("store_bench.com", ["src/store.c","src/store_bench.c"] + CORE_DATALOG)],
-    out="store_bench.com"))
+    deps=["src/store.c","src/store_bench.c","src/store.h","src/visage.h"],
+    recipe=[cc_link_datalog("store_bench.com", ["src/store.c","src/store_bench.c"])],
+    out="store_bench.com",
+    hash_srcs=["src/store.c","src/store_bench.c","src/store.h","src/visage.h", DATALOG_SO]))
 T.append(target("mail_check.com",
     deps=["src/mail.c","src/mail_check.c","src/mail.h","src/visage.h"],
     recipe=[link_cmd("mail_check.com", ["src/mail.c","src/mail_check.c"])],
     out="mail_check.com"))
 T.append(target("reply_check.com",
     deps=["src/reply.c","src/reply_check.c","src/reply.h","src/store.c","src/store.h",
-          "src/mail.c","src/mail.h","src/config.h","src/visage.h"] + CORE_DATALOG,
-    recipe=[link_cmd("reply_check.com", ["src/reply.c","src/reply_check.c","src/store.c",
-                "src/mail.c"] + CORE_DATALOG)],
-    out="reply_check.com"))
+          "src/mail.c","src/mail.h","src/config.h","src/visage.h"],
+    recipe=[cc_link_datalog("reply_check.com", ["src/reply.c","src/reply_check.c","src/store.c",
+                "src/mail.c"])],
+    out="reply_check.com",
+    hash_srcs=["src/reply.c","src/reply_check.c","src/reply.h","src/store.c","src/store.h",
+          "src/mail.c","src/mail.h","src/config.h","src/visage.h", DATALOG_SO]))
 T.append(target("smtp_check.com",
-    deps=[STAMP] + ["src/smtp_in.c","src/smtp_in_tls.c","src/smtp_out.c","src/store.c",
-          "src/reply.c","src/dkim.c","src/config.c","src/smtp_check.c","src/smtp.h",
-          "src/store.h","src/reply.h","src/mail.h","src/mail.c","src/config.h",
-          "src/visage.h","src/dkim.h"]
-          + CORE_DHALL + CORE_DATALOG + [DATA_CACERT, MBEDTLS_CONFIG],
-    recipe=[link_cmd("smtp_check.com", ["src/smtp_in.c","src/smtp_in_tls.c","src/smtp_out.c",
-                "src/store.c","src/reply.c","src/dkim.c","src/config.c","src/smtp_check.c",
-                "src/mail.c"]
-                + CORE_DHALL + CORE_DATALOG + mbtls_objs + [DATA_CACERT], MBFLAGS)],
-    out="smtp_check.com"))
+    deps=["src/smtp_in.c","src/smtp_in_tls.c","src/smtp_out.c","src/store.c",
+          "src/reply.c","src/dkim.c","src/auth_results.c","src/config.c","src/smtp_check.c",
+          "src/smtp.h","src/store.h","src/reply.h","src/mail.h","src/mail.c","src/config.h",
+          "src/visage.h","src/dkim.h","src/auth_results.h"]
+          + MBEDTLS_SRC + [DATA_CACERT, MBEDTLS_CONFIG, DHALL_SO],
+    recipe=[cc_link_dhall_datalog("smtp_check.com", ["src/smtp_in.c","src/smtp_in_tls.c","src/smtp_out.c",
+                "src/store.c","src/reply.c","src/dkim.c","src/auth_results.c","src/config.c",
+                "src/smtp_check.c","src/mail.c"]
+                + MBEDTLS_SRC + [DATA_CACERT], MBFLAGS)],
+    out="smtp_check.com",
+    hash_srcs=["src/smtp_in.c","src/smtp_in_tls.c","src/smtp_out.c","src/store.c",
+          "src/reply.c","src/dkim.c","src/auth_results.c","src/config.c","src/smtp_check.c",
+          "src/smtp.h","src/store.h","src/reply.h","src/mail.h","src/mail.c","src/config.h",
+          "src/visage.h","src/dkim.h","src/auth_results.h"]
+          + MBEDTLS_SRC + [DATA_CACERT, MBEDTLS_CONFIG, DATALOG_SO, DHALL_SO]))
 T.append(target("http_check.com",
     deps=["src/http_parse.c","src/http_check.c","src/http_parse.h","src/admin.c",
           "src/store.c","src/json.c","src/config.c","src/visage.h","src/config.h",
-          "src/store.h","src/json.h"] + CORE_DATALOG + CORE_DHALL + [DATA_ADMIN],
-    recipe=[link_cmd("http_check.com", ["src/admin.c","src/http_parse.c","src/store.c",
-                "src/json.c","src/config.c","src/http_check.c"] + CORE_DATALOG + CORE_DHALL
+          "src/store.h","src/json.h"] + [DATA_ADMIN, DHALL_SO],
+    recipe=[cc_link_dhall_datalog("http_check.com", ["src/admin.c","src/http_parse.c","src/store.c",
+                "src/json.c","src/config.c","src/http_check.c"]
                 + [DATA_ADMIN])],
-    out="http_check.com"))
+    out="http_check.com",
+    hash_srcs=["src/http_parse.c","src/http_check.c","src/http_parse.h","src/admin.c",
+          "src/store.c","src/json.c","src/config.c","src/visage.h","src/config.h",
+          "src/store.h","src/json.h"] + [DATA_ADMIN, DATALOG_SO, DHALL_SO]))
 T.append(target("dkim_check.com",
     deps=[STAMP] + ["src/dkim.c","src/dkim_check.c","src/dkim.h", MBEDTLS_CONFIG],
     recipe=[link_cmd("dkim_check.com", ["src/dkim.c","src/dkim_check.c"] + mbtls_objs, MBFLAGS)],
     out="dkim_check.com"))
+T.append(target("auth_check.com",
+    deps=[STAMP] + ["src/auth_results.c","src/dkim.c","src/mail.c","src/auth_check.c",
+                    "src/auth_results.h","src/dkim.h", MBEDTLS_CONFIG],
+    recipe=[link_cmd("auth_check.com", ["src/auth_results.c","src/dkim.c","src/mail.c",
+                "src/auth_check.c"] + mbtls_objs, MBFLAGS)],
+    out="auth_check.com"))
 
 # --- imapd.com (companion IMAP mailbox server; STARTTLS via mbedTLS) ---
 IMAPD_SRCS = ["src/imapd.c","src/imapd_ingest.c","src/imapd_imap.c",
@@ -223,6 +293,37 @@ T.append(target("imap_check.com",
                 "src/imapd_tls.c","src/mail.c","src/imap_check.c"] + mbtls_objs,
                 MBFLAGS)],
     out="imap_check.com"))
+T.append(target("imap_fuzz.com",
+    deps=[STAMP] + ["src/imap_maildir.c","src/imapd_imap.c","src/imapd_tls.c",
+                    "src/mail.c","src/imap_fuzz.c"]
+         + IMAPD_HDRS + [MBEDTLS_CONFIG],
+    recipe=[link_cmd("imap_fuzz.com", ["src/imap_maildir.c","src/imapd_imap.c",
+                "src/imapd_tls.c","src/mail.c","src/imap_fuzz.c"] + mbtls_objs,
+                MBFLAGS)],
+    out="imap_fuzz.com"))
+
+# --- outbox.com (standalone SMTP submission + direct-MX delivery daemon) ---
+OUTBOX_SRCS = ["src/outbox_main.c","src/outbox_submit.c","src/outbox_deliver.c",
+               "src/outbox_auth.c","src/smtp_out.c","src/mail.c",
+               "src/auth_results.c","src/dkim.c","src/smtp_in_tls.c"]
+OUTBOX_HDRS = ["src/outbox.h","src/smtp.h","src/mail.h","src/auth_results.h",
+               "src/dkim.h","src/visage.h"]
+# outbox_check.com shares everything except outbox_main.c (it has its own main).
+OUTBOX_CHECK_SRCS = ["src/outbox_check.c","src/outbox_submit.c","src/outbox_deliver.c",
+                     "src/outbox_auth.c","src/smtp_out.c","src/mail.c",
+                     "src/auth_results.c","src/dkim.c","src/smtp_in_tls.c"]
+T.append(target("outbox.com",
+    deps=[STAMP] + OUTBOX_SRCS + OUTBOX_HDRS + [MBEDTLS_CONFIG, DATA_CACERT],
+    recipe=[link_cmd("outbox.com", OUTBOX_SRCS + [DATA_CACERT] + mbtls_objs,
+                     MBFLAGS + " -pthread")],
+    out="outbox.com"))
+T.append(target("outbox_check.com",
+    deps=[STAMP] + ["src/outbox_check.c"] + OUTBOX_SRCS + OUTBOX_HDRS
+         + [MBEDTLS_CONFIG, DATA_CACERT],
+    recipe=[link_cmd("outbox_check.com",
+                OUTBOX_CHECK_SRCS + [DATA_CACERT] + mbtls_objs,
+                MBFLAGS + " -pthread")],
+    out="outbox_check.com"))
 
 # --- tests ---
 T.append(target("tests/tls_selfcheck.com",
@@ -242,20 +343,6 @@ T.append(target("tests/relay_fake.com",
     deps=[STAMP] + ["tests/relay_fake.c", MBEDTLS_CONFIG],
     recipe=[link_cmd("tests/relay_fake.com", ["tests/relay_fake.c"] + mbtls_objs, MBFLAGS)],
     out="tests/relay_fake.com"))
-
-# --- wasm (docs/visage.js + visage.wasm) ---
-# The wasm build needs emscripten (host-only; the CI site deploy must NOT
-# rebuild it). It is therefore a PHONY 'wasm' target (build + smoke) that is NOT
-# a dependency of dist/index.html — the docs site consumes the COMMITTED
-# docs/visage.js + docs/visage.wasm as plain source files (hashed via depsHash).
-wasm_deps = ["src/visage-wasm.c","src/visage-wasm-no-remote.c","src/config.c","src/mail.c",
-             "scripts/build-wasm.sh"] + dh(*["arena.c","lexer.c","parser.c","ast.c",
-             "normalize.c","typecheck.c","builtins.c","serialize.c","import.c",
-             "bignum.c","sha256.c"])
-T.append(target("wasm",
-    deps=wasm_deps,
-    recipe=["./scripts/build-wasm.sh", "node tests/wasm-smoke.cjs"],
-    out=None))
 
 # --- bench, e2e, gen-admin (phony) ---
 T.append(target("bench",
@@ -295,7 +382,7 @@ ssg_deps = ["dist/elm.js","vendor-mfe","shell/index.html","shell/pages.js","shel
             "shell/templates/visage-cli.html","shell/templates/visage-playground.html",
             "shell/templates/fixpoint.html","shell/mfe/visage-page.js",
             "shell/mfe/visage-playground.js","scripts/ssg.mjs","docs/visage.js",
-            "docs/visage.wasm","docs/app.js","docs/bench-size.svg","docs/bench-latency.svg",
+            "docs/app.js","docs/bench-size.svg","docs/bench-latency.svg",
             "docs/vendor/codemirror.min.js","docs/vendor/codemirror.css",
             "docs/vendor/codemirror-simple.js","docs/vendor/dhall-mode.js"]
 T.append(target("dist/index.html",
@@ -303,19 +390,19 @@ T.append(target("dist/index.html",
     recipe=["node scripts/ssg.mjs"],
     out="dist/index.html"))
 
-# --- `all` aggregate (default): all C binaries + wasm; site reachable by name ---
+# --- `all` aggregate (default): all C binaries; site reachable by name ---
 all_deps = ["visage.com","config_check.com","store_check.com","store_bench.com",
             "mail_check.com","reply_check.com","smtp_check.com","http_check.com",
-            "dkim_check.com","imapd.com","imap_check.com",
+            "dkim_check.com","auth_check.com","imapd.com","imap_check.com","imap_fuzz.com",
             "tests/tls_selfcheck.com","tests/verify_selfcheck.com",
-            "tests/smtptest.com","tests/relay_fake.com","wasm"]
+            "tests/smtptest.com","tests/relay_fake.com"]
 T.append(target("all", deps=all_deps, recipe=[], out=None))
 
 # ---------- emit Dhakefile.dhall ----------
 out = []
 out.append("""-- Dhakefile.dhall — build the entire visage repo with dhake (no Make).
 --
--- One buildfile drives every build target (C binaries + mbedTLS + wasm + Elm
+-- One buildfile drives every build target (C binaries + mbedTLS + Elm
 -- docs site), with hash-verified builds:
 --   * `hash`     — expected sha256 of each non-phony output (verified after build)
 --   * `depsHash` — expected sha256 of every input source (verified before build)

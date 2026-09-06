@@ -108,11 +108,13 @@ typedef struct Imail {
     uint64_t modseq;            /* CONDSTORE: monotonic change counter   */
     char    *base;              /* owned: unique base name (no ":2,")    */
     char    *path;              /* owned: current full path              */
+    char    *mid;               /* owned: Message-ID (for fast SEARCH)   */
 } Imail;
 
 /* A single uidlist entry (uid -> base name + CONDSTORE modseq). */
 typedef struct UidEnt {
     char    *base;
+    char    *mid;               /* owned: Message-ID (persisted in uidlist) */
     uint32_t uid;
     uint64_t modseq;   /* CONDSTORE: persisted per-message change counter */
 } UidEnt;
@@ -396,7 +398,8 @@ int imapd_mbox_expunge(Mbox *mb, uint32_t uid);
 /* Move or copy one message (by uid) out of mb into the mailbox dest_name.
    See imap_maildir.c.  Returns 0 on success, -1 on failure. */
 int imapd_mbox_file(const ImapdConfig *cfg, const char *user, Mbox *mb,
-                    uint32_t uid, const char *dest_name, bool move);
+                    uint32_t uid, const char *dest_name, bool move,
+                    uint32_t *uv_out, uint32_t *uid_out);
 
 /* List folder names (IMAP-visible, WITHOUT the INBOX) under the user's dir
    matching the LIST pattern.  Heap-allocates *out and *nout (caller frees
