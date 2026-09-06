@@ -12,6 +12,8 @@ Usage:
     plaintext-auth user pass   -> plaintext EHLO + AUTH PLAIN, print code (530)
     implicit-auth  user pass   -> implicit TLS, EHLO, AUTH PLAIN
     submit  user pass mailfrom rcpt  -> auth, MAIL/RCPT/DATA, print final code
+    submit-large user pass mailfrom rcpt [body_size] -> auth, MAIL/RCPT/DATA
+        with a dot-safe body of body_size bytes (default 1600000), print code
     from-mismatch user pass mailfrom rcpt -> DATA with From: me@evil.com
     unauthed-rcpt  mailfrom rcpt -> no auth: MAIL then RCPT (print RCPT code)
     auth-login user pass       -> STARTTLS + AUTH LOGIN (two-step)
@@ -107,6 +109,30 @@ def submit_data(c, mailfrom, rcpt, from_hdr, body="Hello outbox\r\n"):
     return c.read_reply()
 
 
+def submit_large(c, mailfrom, rcpt, body_size):
+    """Submit a message whose body is exactly body_size bytes (dot-safe, no
+    leading-dot lines).  Returns the final DATA reply (code, text)."""
+    c.cmd(f"MAIL FROM:<{mailfrom}>")
+    code, text = c.cmd(f"RCPT TO:<{rcpt}>")
+    if code != 250:
+        return code, text
+    code, text = c.cmd("DATA")
+    if code != 354:
+        return code, text
+    header = (f"From: <{mailfrom}>\r\n"
+              f"To: <{rcpt}>\r\n"
+              "Subject: outbox large test\r\n"
+              "Message-ID: <outbox-large@jaye.ch>\r\n"
+              "\r\n")
+    # 60-byte lines ("x"*58 + CRLF): no leading dots, so no dot-stuffing.
+    line = "x" * 58 + "\r\n"
+    body = (line * (body_size // len(line)) +
+            ("y" * (body_size % len(line))))
+    payload = header + body
+    c.sock.sendall(payload.encode("utf-8") + b"\r\n.\r\n")
+    return c.read_reply()
+
+
 def main():
     host, port, scenario = sys.argv[1], int(sys.argv[2]), sys.argv[3]
     args = sys.argv[4:]
@@ -157,6 +183,19 @@ def main():
             print(code, text)
             return
         code, text = submit_data(c, args[2], args[3], f"<{args[2]}>")
+        print(code, text)
+
+    elif scenario == "submit-large":
+        c.read_reply()
+        c.cmd("EHLO client.test")
+        c.starttls()
+        c.cmd("EHLO client.test")
+        code, text = auth_plain(c, args[0], args[1])
+        if code != 235:
+            print(code, text)
+            return
+        body_size = int(args[4]) if len(args) > 4 else 1600000
+        code, text = submit_large(c, args[2], args[3], body_size)
         print(code, text)
 
     elif scenario == "from-mismatch":

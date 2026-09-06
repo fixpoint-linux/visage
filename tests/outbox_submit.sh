@@ -152,5 +152,16 @@ after=$(ls "$T/mx"/msg-*.eml 2>/dev/null | wc -l)
 [ "$before" = "$after" ] || fail "From-mismatch message was delivered"
 pass "From-mismatch message was NOT delivered"
 
+# ---- positive: large (>1.5MB) message over STARTTLS -> 250 ---------------
+# Regression for the TLS DATA stall: mbedTLS buffers decrypted record bytes
+# that poll() cannot see, so a large body whose ".\r\n" terminator lands past
+# the first recv chunk used to strand the tail and never send the 250.
+# 1600000 bytes is >1.5MB and lands the terminator deep in the final 16 KiB
+# TLS record, so it deterministically stalls on the unfixed daemon.
+out=$($CLIENT "$STARTTLS_PORT" submit-large null secret me@jaye.ch \
+      any@deliver.test 1600000)
+echo "$out" | grep -q '^250 ' || fail "large submit should be 250, got: $out"
+pass "large (>1.5MB) STARTTLS DATA -> 250"
+
 echo
 echo "ALL OUTBOX INTEGRATION CHECKS PASSED"

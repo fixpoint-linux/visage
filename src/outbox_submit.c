@@ -1058,6 +1058,15 @@ void outbox_conn_readable(OutboxServer *srv, OutboxConn *c, time_t now) {
 
     if (c->tls) {
         if (!smtp_in_tls_established(c->tls)) return;
+        /* Drain until smtp_in_tls_recv reports WANT_READ (no decrypted bytes
+           left AND the socket would block).  Do NOT stop early just because the
+           connection entered DATA state: mbedTLS buffers up to a full TLS record
+           (16 KiB) of decrypted bytes internally, and poll() only watches the
+           raw socket fd, so bytes left in mbedTLS's buffer would never re-raise
+           POLLIN once the socket is drained.  Stopping after the first 4 KiB
+           chunk of a large body strands the rest of the record — including the
+           ".\r\n" terminator when it falls past that boundary — and the daemon
+           then idles in poll() forever (Recv-Q 0, no 250). */
         for (;;) {
             int n = smtp_in_tls_recv(c->tls, tmp, sizeof tmp);
             if (n < 0) { c->closed = true; return; }
@@ -1065,7 +1074,6 @@ void outbox_conn_readable(OutboxServer *srv, OutboxConn *c, time_t now) {
             c->last_act = now;
             conn_take_bytes(srv, c, tmp, (size_t)n, now);
             if (c->closed) return;
-            if (c->state == OB_ST_DATA) return;   /* bulk DATA: next POLLIN */
         }
     }
 

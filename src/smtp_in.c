@@ -1765,7 +1765,6 @@ static void conn_readable(Server *srv, Conn *c, time_t now) {
             c->last_act = now;
             conn_take_bytes(srv, c, tmp, (size_t)n, now);
             if (c->closed) return;
-            if (c->state == ST_DATA) return;   /* bulk DATA: next POLLIN */
         }
     }
 
