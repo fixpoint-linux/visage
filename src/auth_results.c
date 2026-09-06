@@ -11,6 +11,9 @@
  *
  * All DNS work is blocking and happens in the single-threaded poll loop, which
  * is the same discipline smtp_out.c already uses (getaddrinfo at relay time).
+ * DNS answers are memoized in a small (name,qtype) TTL cache and the resolver
+ * endpoint / urandom source are resolved once per process (see the cache
+ * block near dns_query_raw), so repeated lookups are cheap.
  */
 #include "visage.h"
 #include "auth_results.h"
@@ -20,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -43,11 +47,17 @@
  * Empty = auto-detect from /etc/resolv.conf. */
 static char g_resolver[128];
 
+/* Resolver generation: bumped whenever the configured resolver changes so
+ * cached DNS replies (see the cache near dns_query_raw) are never served
+ * across a resolver switch (tests point this at per-suite fake servers). */
+static unsigned g_dns_gen;
+
 void auth_dns_set_resolver(const char *server) {
     if (server && server[0])
         snprintf(g_resolver, sizeof g_resolver, "%s", server);
     else
         g_resolver[0] = '\0';
+    g_dns_gen++;
 }
 
 /* Find the first "nameserver" IP in /etc/resolv.conf into out (NUL-terminated).
@@ -75,47 +85,65 @@ static int resolver_file_addr(char *out, size_t outsz) {
     return -1;
 }
 
+/* Cached resolver endpoint: the g_resolver override string is split and/or
+ * /etc/resolv.conf is parsed ONCE, on first use — not per query (the parse
+ * used to run for every lookup).  Recomputed only when auth_dns_set_resolver
+ * installs a different value. */
+static char     g_ns_addr[128];
+static uint16_t g_ns_port;
+static char     g_ns_from[sizeof g_resolver];
+static bool     g_ns_cached;
+
 /* Resolve the DNS server address + port for a query.  Honour the g_resolver
  * override ("addr[:port]" or "[v6]:port"); otherwise read /etc/resolv.conf
  * (port stays 53).  Never fails: falls back to 127.0.0.53:53. */
 static void resolver_addrport(char *addr, size_t addr_sz, uint16_t *port) {
-    *port = AUTH_DNS_PORT;
-    addr[0] = '\0';
+    if (!g_ns_cached || strcmp(g_resolver, g_ns_from) != 0) {
+        char a[sizeof g_ns_addr];
+        uint16_t p = AUTH_DNS_PORT;
+        a[0] = '\0';
 
-    if (g_resolver[0]) {
-        const char *src = g_resolver;
-        if (src[0] == '[') {   /* "[addr]:port" */
-            const char *close = strchr(src, ']');
-            if (close) {
-                size_t alen = (size_t)(close - src - 1);
-                if (alen > 0 && alen < addr_sz) {
-                    memcpy(addr, src + 1, alen);
-                    addr[alen] = '\0';
+        if (g_resolver[0]) {
+            const char *src = g_resolver;
+            if (src[0] == '[') {   /* "[addr]:port" */
+                const char *close = strchr(src, ']');
+                if (close) {
+                    size_t alen = (size_t)(close - src - 1);
+                    if (alen > 0 && alen < sizeof a) {
+                        memcpy(a, src + 1, alen);
+                        a[alen] = '\0';
+                    }
+                    if (close[1] == ':') {
+                        unsigned long pv = strtoul(close + 2, NULL, 10);
+                        if (pv > 0 && pv <= 65535) p = (uint16_t)pv;
+                    }
                 }
-                if (close[1] == ':') {
-                    unsigned long p = strtoul(close + 2, NULL, 10);
-                    if (p > 0 && p <= 65535) *port = (uint16_t)p;
-                }
-            }
-        } else {
-            const char *colon = strrchr(src, ':');
-            if (colon) {       /* "addr:port" */
-                size_t alen = (size_t)(colon - src);
-                if (alen > 0 && alen < addr_sz) {
-                    memcpy(addr, src, alen);
-                    addr[alen] = '\0';
-                }
-                unsigned long p = strtoul(colon + 1, NULL, 10);
-                if (p > 0 && p <= 65535) *port = (uint16_t)p;
             } else {
-                snprintf(addr, addr_sz, "%s", src);
+                const char *colon = strrchr(src, ':');
+                if (colon) {       /* "addr:port" */
+                    size_t alen = (size_t)(colon - src);
+                    if (alen > 0 && alen < sizeof a) {
+                        memcpy(a, src, alen);
+                        a[alen] = '\0';
+                    }
+                    unsigned long pv = strtoul(colon + 1, NULL, 10);
+                    if (pv > 0 && pv <= 65535) p = (uint16_t)pv;
+                } else {
+                    snprintf(a, sizeof a, "%s", src);
+                }
             }
         }
-        if (addr[0]) return;
+        if (!a[0]) {
+            if (resolver_file_addr(a, sizeof a) != 0 || !a[0])
+                snprintf(a, sizeof a, "%s", "127.0.0.53");
+        }
+        memcpy(g_ns_addr, a, sizeof g_ns_addr);
+        g_ns_port = p;
+        snprintf(g_ns_from, sizeof g_ns_from, "%s", g_resolver);
+        g_ns_cached = true;
     }
-
-    if (resolver_file_addr(addr, addr_sz) != 0 || !addr[0])
-        snprintf(addr, addr_sz, "%s", "127.0.0.53");
+    snprintf(addr, addr_sz, "%s", g_ns_addr);
+    *port = g_ns_port;
 }
 
 /* Encode `name` ("a.b") into a DNS label sequence.  Returns the byte count, or
@@ -170,27 +198,32 @@ static uint16_t get16(const unsigned char *b) { return (uint16_t)((b[0] << 8) | 
 /* 16 random bits from /dev/urandom for a DNS transaction ID (unpredictable
  * IDs make off-path response spoofing materially harder).  Returns 1 on
  * success, 0 on any failure (open/read error or short read) — callers fail the
- * query closed rather than fall back to a predictable ID. */
+ * query closed rather than fall back to a predictable ID.  The descriptor is
+ * opened once per process and reused (each query used to re-open it); on a
+ * read error it is closed so the next call re-opens it. */
 static int urandom16(uint16_t *out) {
+    static int fd = -1;
     unsigned char b[2];
-    int fd = open("/dev/urandom", O_RDONLY);
     size_t got = 0;
 
+    if (fd < 0)
+        fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) return 0;
     while (got < 2) {
         ssize_t r = read(fd, b + got, 2 - got);
         if (r < 0) {
             if (errno == EINTR) continue;
             close(fd);
+            fd = -1;
             return 0;
         }
         if (r == 0) {          /* unexpected EOF: treat as failure */
             close(fd);
+            fd = -1;
             return 0;
         }
         got += (size_t)r;
     }
-    close(fd);
     *out = (uint16_t)((b[0] << 8) | b[1]);
     return 1;
 }
@@ -201,77 +234,37 @@ static int dns_check_question(const unsigned char *msg, size_t msglen,
                               const char *name, uint16_t qtype,
                               const unsigned char **pp);
 
+/* Generic RFC 1035 query transport with the (name,qtype) reply cache in front
+ * of it (defined with the delivery-DNS helpers below).  auth_dns_txt and
+ * auth_dns_a route through it so every lookup in this file shares one code
+ * path — and one cache. */
+static int dns_query_raw(const char *name, uint16_t qtype,
+                         unsigned char *r, size_t rsz);
+
 /* Blocking DNS TXT query for `name`.  Populates out[0..*n) with heap strings.
  * Returns record count (>=0) or -1. */
 int auth_dns_txt(const char *name, AuthTxt *out, size_t cap, size_t *n) {
-    unsigned char q[AUTH_DNS_BUFSZ];
     unsigned char r[AUTH_DNS_BUFSZ];
-    char ns[128];
-    uint16_t nsport;
-    struct sockaddr_in sa;
-    int fd, len, rc;
-    size_t i;
-    uint16_t qid;
+    const unsigned char *p;
+    unsigned ancount;
+    size_t i, found = 0;
+    int msglen;
 
     *n = 0;
     if (!name || !name[0]) return -1;
-    if (!urandom16(&qid)) return -1;
-    resolver_addrport(ns, sizeof ns, &nsport);
-
-    fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return -1;
-
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(nsport);
-    if (inet_pton(AF_INET, ns, &sa.sin_addr) != 1) {
-        close(fd);
-        return -1;
-    }
-
-    /* Build query: header (12) + QNAME + QTYPE(TXT=16) + QCLASS(IN=1). */
-    memset(q, 0, sizeof q);
-    put16(q, qid);             /* ID */
-    put16(q + 2, 0x0100);      /* RD */
-    put16(q + 4, 1);           /* QDCOUNT */
-    len = dns_encode_name(name, q + 12, sizeof q - 12);
-    if (len < 0) { close(fd); return -1; }
-    len += 12;
-    if (len + 4 > (int)sizeof q) { close(fd); return -1; }
-    put16(q + (size_t)len, 16);      /* TXT */
-    put16(q + (size_t)len + 2, 1);   /* IN */
-    len += 4;
-
-    rc = sendto(fd, q, (size_t)len, 0, (struct sockaddr *)&sa, sizeof sa);
-    if (rc < 0) { close(fd); return -1; }
-
-    /* blocking recv with a timeout */
-    {
-        struct pollfd pfd;
-        pfd.fd = fd;
-        pfd.events = POLLIN;
-        int pr = poll(&pfd, 1, AUTH_DNS_TIMEOUT);
-        if (pr <= 0) { close(fd); return -1; }
-    }
-    rc = (int)recv(fd, r, sizeof r, 0);
-    close(fd);
-    if (rc < 12) return -1;
-    if (get16(r) != qid) return -1;          /* mismatched id: ignore */
-
-    size_t msglen = (size_t)rc;
-    const unsigned char *p;
-    if (dns_check_question(r, msglen, name, 16, &p) != 0) return -1;
-    unsigned ancount = get16(r + 6);
+    msglen = dns_query_raw(name, 16 /* TXT */, r, sizeof r);
+    if (msglen < 0) return -1;
+    if (dns_check_question(r, (size_t)msglen, name, 16, &p) != 0) return -1;
+    ancount = get16(r + 6);
     if (ancount == 0) return 0;              /* NXDOMAIN/NODATA -> 0 records */
 
-    size_t found = 0;
     for (i = 0; i < ancount && found < cap; i++) {
-        p = dns_skip_name(r, msglen, p); if (!p) return -1;
-        if (p + 10 > r + msglen) return -1;
+        p = dns_skip_name(r, (size_t)msglen, p); if (!p) return -1;
+        if (p + 10 > r + (size_t)msglen) return -1;
         uint16_t rtype = get16(p);
         uint16_t rdlen = get16(p + 8);
         p += 10;
-        if (p + rdlen > r + msglen) return -1;
+        if (p + rdlen > r + (size_t)msglen) return -1;
         if (rtype == 16) {   /* TXT */
             char *s = NULL;
             size_t sl = 0;
@@ -351,58 +344,30 @@ char *auth_env_from_domain(const char *env_from) {
 /* SPF (RFC 7208 subset)                                               */
 /* ------------------------------------------------------------------ */
 
-/* Blocking DNS A query for `name`; fills out[0..*n).  Reuses the TXT
+/* Blocking DNS A query for `name`; fills out[0..*n).  Reuses the generic
  * transport with qtype A (1).  Returns record count (>=0) or -1. */
 static int auth_dns_a(const char *name, AuthAddr *out, size_t cap, size_t *n) {
-    unsigned char q[AUTH_DNS_BUFSZ], r[AUTH_DNS_BUFSZ];
-    char ns[128];
-    uint16_t nsport;
-    struct sockaddr_in sa;
-    int fd, len, rc;
-    size_t i;
-    uint16_t qid;
+    unsigned char r[AUTH_DNS_BUFSZ];
+    const unsigned char *p;
+    unsigned ancount;
+    size_t i, found = 0;
+    int msglen;
+
     *n = 0;
     if (!name || !name[0]) return -1;
-    if (!urandom16(&qid)) return -1;
-    resolver_addrport(ns, sizeof ns, &nsport);
-    fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return -1;
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(nsport);
-    if (inet_pton(AF_INET, ns, &sa.sin_addr) != 1) { close(fd); return -1; }
-    memset(q, 0, sizeof q);
-    put16(q, qid);
-    put16(q + 2, 0x0100);
-    put16(q + 4, 1);
-    len = dns_encode_name(name, q + 12, sizeof q - 12);
-    if (len < 0) { close(fd); return -1; }
-    len += 12;
-    put16(q + (size_t)len, 1);       /* A */
-    put16(q + (size_t)len + 2, 1);   /* IN */
-    len += 4;
-    rc = sendto(fd, q, (size_t)len, 0, (struct sockaddr *)&sa, sizeof sa);
-    if (rc < 0) { close(fd); return -1; }
-    {
-        struct pollfd pfd;
-        pfd.fd = fd;
-        pfd.events = POLLIN;
-        if (poll(&pfd, 1, AUTH_DNS_TIMEOUT) <= 0) { close(fd); return -1; }
-    }
-    rc = (int)recv(fd, r, sizeof r, 0);
-    close(fd);
-    if (rc < 12 || get16(r) != qid) return -1;
-    size_t msglen = (size_t)rc;
-    const unsigned char *p;
-    if (dns_check_question(r, msglen, name, 1, &p) != 0) return -1;
-    uint16_t ancount = get16(r + 6);
-    size_t found = 0;
+    msglen = dns_query_raw(name, 1 /* A */, r, sizeof r);
+    if (msglen < 0) return -1;
+    if (dns_check_question(r, (size_t)msglen, name, 1, &p) != 0) return -1;
+    ancount = get16(r + 6);
+
     for (i = 0; i < ancount && found < cap; i++) {
-        p = dns_skip_name(r, msglen, p); if (!p) return -1;
-        if (p + 10 > r + msglen) return -1;
-        uint16_t rtype = get16(p), rdlen = get16(p + 8);
+        uint16_t rtype, rdlen;
+        p = dns_skip_name(r, (size_t)msglen, p); if (!p) return -1;
+        if (p + 10 > r + (size_t)msglen) return -1;
+        rtype = get16(p);
+        rdlen = get16(p + 8);
         p += 10;
-        if (p + rdlen > r + msglen) return -1;
+        if (p + rdlen > r + (size_t)msglen) return -1;
         if (rtype == 1 && rdlen == 4) {
             memcpy(out[found].ip, p, 4);
             out[found].len = 4;
@@ -458,22 +423,28 @@ static int spf_ip6_match(const unsigned char *ip, uint8_t iplen,
     return 1;
 }
 
-/* RFC 7208 §4.6.4 caps the include:/redirect= terms at 10 per SPF check; the
- * 11th (or deeper) lookup returns none instead of recursing without bound. */
+/* RFC 7208 §4.6.4: at most 10 DNS-requiring TERMS per SPF check — the limit
+ * is on the total across a:/mx:/include:/redirect= (a non-recursive a:/mx:
+ * counts too), not just the include/redirect recursion depth (which is all
+ * the old depth counter capped, leaving ~140 a: mechanisms per record
+ * unbounded).  The counter is threaded through the whole evaluation and
+ * incremented for every such term whether or not the query happens; an
+ * over-budget term simply does not match, so records within the budget
+ * evaluate exactly as before. */
 #define AUTH_SPF_MAX_LOOKUPS 10
 
 static AuthSpf auth_spf_eval_depth(const char *domain,
                                    const unsigned char *ip, uint8_t iplen,
-                                   int depth);
+                                   int *lookups);
 
 /* Evaluate one SPF mechanism list against ip.  `rec` is the v=spf1 record
  * (without "v=spf1"); `def_dom` is the envelope-from domain used by the plain
- * "a" / "mx" mechanisms (may be NULL).  `depth` is the number of
- * include:/redirect= lookups already performed.  Returns the first matching
+ * "a" / "mx" mechanisms (may be NULL).  `lookups` is the shared DNS-term
+ * budget counter for the whole evaluation.  Returns the first matching
  * result. */
 static AuthSpf auth_spf_eval_record_depth(const char *rec, const char *def_dom,
                                           const unsigned char *ip, uint8_t iplen,
-                                          int depth) {
+                                          int *lookups) {
     const char *p = rec;
     while (*p) {
         while (*p == ' ') p++;
@@ -522,7 +493,8 @@ static AuthSpf auth_spf_eval_record_depth(const char *rec, const char *def_dom,
             } else {
                 dd = def_dom;
             }
-            if (dd && auth_dns_a(dd, addrs, AUTH_MAX_ADDRS, &n) >= 0) {
+            if (++*lookups <= AUTH_SPF_MAX_LOOKUPS &&
+                dd && auth_dns_a(dd, addrs, AUTH_MAX_ADDRS, &n) >= 0) {
                 for (i = 0; i < n; i++) {
                     if (addrs[i].len == iplen &&
                         memcmp(addrs[i].ip, ip, iplen) == 0)
@@ -545,7 +517,8 @@ static AuthSpf auth_spf_eval_record_depth(const char *rec, const char *def_dom,
             } else {
                 dd = def_dom;
             }
-            if (dd && auth_dns_a(dd, addrs, AUTH_MAX_ADDRS, &n) >= 0) {
+            if (++*lookups <= AUTH_SPF_MAX_LOOKUPS &&
+                dd && auth_dns_a(dd, addrs, AUTH_MAX_ADDRS, &n) >= 0) {
                 for (i = 0; i < n; i++)
                     if (addrs[i].len == iplen &&
                         memcmp(addrs[i].ip, ip, iplen) == 0)
@@ -559,9 +532,9 @@ static AuthSpf auth_spf_eval_record_depth(const char *rec, const char *def_dom,
             dom[dl] = '\0';
             /* redirect= must be the last mechanism; evaluate the target
                (respecting the RFC 7208 §4.6.4 lookup budget). */
-            AuthSpf r = depth >= AUTH_SPF_MAX_LOOKUPS
+            AuthSpf r = ++*lookups > AUTH_SPF_MAX_LOOKUPS
                             ? AUTH_SPF_NONE
-                            : auth_spf_eval_depth(dom, ip, iplen, depth + 1);
+                            : auth_spf_eval_depth(dom, ip, iplen, lookups);
             if (r == AUTH_SPF_PASS) return q;
             if (r == AUTH_SPF_FAIL) return AUTH_SPF_FAIL;
             if (r == AUTH_SPF_SOFTFAIL) return AUTH_SPF_SOFTFAIL;
@@ -576,23 +549,27 @@ static AuthSpf auth_spf_eval_record_depth(const char *rec, const char *def_dom,
             if (dl >= sizeof dom) dl = sizeof dom - 1;
             memcpy(dom, mech + 8, dl);
             dom[dl] = '\0';
-            if (depth < AUTH_SPF_MAX_LOOKUPS &&
-                auth_spf_eval_depth(dom, ip, iplen, depth + 1) == AUTH_SPF_PASS)
+            if (++*lookups <= AUTH_SPF_MAX_LOOKUPS &&
+                auth_spf_eval_depth(dom, ip, iplen, lookups) == AUTH_SPF_PASS)
                 return q;
         }
     }
     return AUTH_SPF_NEUTRAL;   /* record present but no mechanism matched */
 }
 
-/* Public, non-static wrapper for the auth_check harness (depth starts at 0). */
+/* Public, non-static wrapper for the auth_check harness (fresh budget). */
 AuthSpf auth_spf_eval_record(const char *rec, const char *def_dom,
                              const unsigned char *ip, uint8_t iplen) {
-    return auth_spf_eval_record_depth(rec, def_dom, ip, iplen, 0);
+    int lookups = 0;
+    return auth_spf_eval_record_depth(rec, def_dom, ip, iplen, &lookups);
 }
 
+/* Fetch and evaluate `domain`'s SPF record.  The initial TXT fetch is not a
+ * "term" (RFC 7208 §4.6.4 counts mechanisms/modifiers); an include's fetch is
+ * covered by the include itself having consumed budget. */
 static AuthSpf auth_spf_eval_depth(const char *domain,
                                    const unsigned char *ip, uint8_t iplen,
-                                   int depth) {
+                                   int *lookups) {
     AuthTxt v[AUTH_TXT_MAX_RECORDS];
     size_t n = 0, i;
     if (!domain || !domain[0] || !ip) return AUTH_SPF_NONE;
@@ -605,7 +582,7 @@ static AuthSpf auth_spf_eval_depth(const char *domain,
         if (strncasecmp(v[i].s, "v=spf1", 6) == 0) {
             const char *rec = v[i].s + 6;
             while (*rec == ' ') rec++;
-            res = auth_spf_eval_record_depth(rec, domain, ip, iplen, depth);
+            res = auth_spf_eval_record_depth(rec, domain, ip, iplen, lookups);
             break;
         }
     }
@@ -615,7 +592,8 @@ static AuthSpf auth_spf_eval_depth(const char *domain,
 
 AuthSpf auth_spf_eval(const char *domain,
                       const unsigned char *ip, uint8_t iplen) {
-    return auth_spf_eval_depth(domain, ip, iplen, 0);
+    int lookups = 0;
+    return auth_spf_eval_depth(domain, ip, iplen, &lookups);
 }
 
 /* ------------------------------------------------------------------ */
@@ -891,8 +869,104 @@ char *auth_results_build(const char *hostname, const char *msg, size_t msglen,
 }
 
 /* ------------------------------------------------------------------ */
-/* Delivery DNS (MX + A/AAAA)                                          */
+/* DNS reply cache                                                     */
 /* ------------------------------------------------------------------ */
+
+/* Small (name,qtype) cache of raw replies so repeated lookups within the
+ * answer's TTL do not re-query — one inbound message repeats the same
+ * TXT/A queries across SPF/DKIM/DMARC, and so do consecutive messages from
+ * the same sender.  Round-robin eviction; entries belong to the resolver
+ * generation they were fetched under and are ignored once
+ * auth_dns_set_resolver changes it.  Hard failures (timeouts, malformed
+ * replies) are never cached.  Single-threaded per process, like the rest of
+ * this file (each process does its DNS from one thread). */
+#define AUTH_DNS_CACHE_SLOTS   64
+#define AUTH_DNS_CACHE_NEG_TTL 30     /* s: cache empty answers (NODATA/NXDOMAIN) briefly */
+#define AUTH_DNS_CACHE_MAX_TTL 3600   /* s: staleness ceiling even for long-TTL answers */
+
+typedef struct {
+    char           name[256];
+    uint16_t       qtype;
+    unsigned       gen;       /* g_dns_gen the reply was fetched under */
+    unsigned char *reply;     /* heap copy of the raw reply, header..end */
+    size_t         len;
+    time_t         expires;   /* unix seconds; 0 = free slot */
+} DnsCacheEnt;
+
+static DnsCacheEnt g_dns_cache[AUTH_DNS_CACHE_SLOTS];
+static size_t      g_dns_cache_victim;
+
+static uint32_t get32(const unsigned char *b) {
+    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+           ((uint32_t)b[2] << 8) | b[3];
+}
+
+/* Cache lifetime for a raw reply: the minimum TTL across its answer records
+ * (an empty answer gets the short negative TTL).  Returns 0, or -1 when the
+ * answer section is malformed (the reply is then not cached). */
+static int dns_reply_ttl(const unsigned char *r, size_t msglen, uint32_t *out) {
+    const unsigned char *p = r + 12;
+    unsigned ancount, i;
+    uint32_t ttl = 0;
+
+    if (msglen < 12) return -1;
+    p = dns_skip_name(r, msglen, p);
+    if (!p) return -1;
+    p += 4;   /* QTYPE + QCLASS */
+    ancount = get16(r + 6);
+    if (ancount == 0) { *out = AUTH_DNS_CACHE_NEG_TTL; return 0; }
+    for (i = 0; i < ancount; i++) {
+        uint32_t t;
+        uint16_t rdlen;
+        p = dns_skip_name(r, msglen, p);
+        if (!p || p + 10 > r + msglen) return -1;
+        t = get32(p + 4);       /* TTL, between CLASS and RDLENGTH */
+        rdlen = get16(p + 8);
+        p += 10;
+        if (p + rdlen > r + msglen) return -1;
+        if (i == 0 || t < ttl) ttl = t;
+        p += rdlen;
+    }
+    if (ttl > AUTH_DNS_CACHE_MAX_TTL) ttl = AUTH_DNS_CACHE_MAX_TTL;
+    *out = ttl;
+    return 0;
+}
+
+/* Serve a fresh cached reply into `r`; returns 1 on hit, 0 on miss. */
+static int dns_cache_get(const char *name, uint16_t qtype,
+                         unsigned char *r, size_t rsz, int *outlen) {
+    time_t now = time(NULL);
+    size_t i;
+    for (i = 0; i < AUTH_DNS_CACHE_SLOTS; i++) {
+        DnsCacheEnt *e = &g_dns_cache[i];
+        if (e->expires == 0 || e->gen != g_dns_gen) continue;
+        if (e->qtype != qtype || strcasecmp(e->name, name) != 0) continue;
+        if (now >= e->expires) {         /* expired: free the slot */
+            free(e->reply); e->reply = NULL; e->expires = 0;
+            continue;
+        }
+        if (e->len > rsz) continue;      /* cannot happen; guard anyway */
+        memcpy(r, e->reply, e->len);
+        *outlen = (int)e->len;
+        return 1;
+    }
+    return 0;
+}
+
+static void dns_cache_put(const char *name, uint16_t qtype,
+                          const unsigned char *reply, size_t len, time_t expires) {
+    DnsCacheEnt *e = &g_dns_cache[g_dns_cache_victim++ % AUTH_DNS_CACHE_SLOTS];
+    unsigned char *copy = malloc(len);
+    if (!copy) return;                   /* cache is best-effort */
+    free(e->reply);
+    snprintf(e->name, sizeof e->name, "%s", name);
+    e->qtype = qtype;
+    e->gen = g_dns_gen;
+    e->reply = copy;
+    memcpy(copy, reply, len);
+    e->len = len;
+    e->expires = expires;
+}
 
 /* Generic RFC 1035 query (header + QNAME + QTYPE + QCLASS, RD set).  Returns
  * the raw reply length (>= 12), or -1 on a hard failure (resolver, socket,
@@ -905,8 +979,10 @@ static int dns_query_raw(const char *name, uint16_t qtype,
     struct sockaddr_in sa;
     int fd, len, rc;
     uint16_t qid;
+    int cached;
 
     if (!name || !name[0]) return -1;
+    if (dns_cache_get(name, qtype, r, rsz, &cached)) return cached;
     if (!urandom16(&qid)) return -1;
     resolver_addrport(ns, sizeof ns, &nsport);
     fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -940,6 +1016,12 @@ static int dns_query_raw(const char *name, uint16_t qtype,
     close(fd);
     if (rc < 12 || get16(r) != qid) return -1;
     if (dns_check_question(r, (size_t)rc, name, qtype, NULL) != 0) return -1;
+
+    {
+        uint32_t ttl;
+        if (dns_reply_ttl(r, (size_t)rc, &ttl) == 0)
+            dns_cache_put(name, qtype, r, (size_t)rc, time(NULL) + (time_t)ttl);
+    }
     return rc;
 }
 
@@ -1004,6 +1086,10 @@ static int dns_check_question(const unsigned char *msg, size_t msglen,
     if (pp) *pp = p + 4;
     return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/* Delivery DNS (MX + A/AAAA)                                          */
+/* ------------------------------------------------------------------ */
 
 int auth_dns_mx(const char *name, AuthMx *out, size_t cap, size_t *n) {
     unsigned char r[AUTH_DNS_BUFSZ];

@@ -143,6 +143,12 @@ int store_queue_set_status(Store *s, uint32_t msgid, uint32_t k,
                            const char *status, uint32_t attempts,
                            uint32_t next_ts);
 
+/* Delete every queue row for (msgid, k).  Used by the retention/GC sweep to
+ * prune terminal (delivered/permfail) rows once their spool body has aged out;
+ * never called for an active (queued/delivering) row.  Returns 0 on success
+ * (including the no-row case). */
+int store_queue_delete(Store *s, uint32_t msgid, uint32_t k);
+
 /* Full-walk deliveries with status == "queued" and next_ts <= now, invoking
  * cb(msgid, k, from, to, attempts, user) per due tuple.  from/to are interned
  * string pointers valid only for the duration of the callback; cb returns
@@ -162,7 +168,9 @@ int store_queue_reset_delivering(Store *s);
 
 /* Soonest next_ts among deliveries with status == "queued", or UINT32_MAX if
  * none are queued.  A next_ts of 0 means "due now".  Used by the poll loop to
- * compute the re-drive wakeup deadline.  Never returns a negative value. */
+ * compute the re-drive wakeup deadline.  Never returns a negative value.
+ * Cached in memory (invalidated by queue mutations) so idle ticks avoid a
+ * full queue walk. */
 uint32_t store_queue_next_due(Store *s);
 
 /* Return the current status of the (msgid, k) delivery.  On success returns

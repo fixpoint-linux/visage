@@ -12,6 +12,11 @@
 
 struct Store {
     dl_db *db;
+    /* Cached soonest next_ts among "queued" rows (UINT32_MAX = none queued),
+     * recomputed lazily when next_due_dirty is set by a queue mutation.  Lets
+     * the poll loop skip both full queue walks when nothing is due. */
+    uint32_t next_due;
+    bool     next_due_dirty;
 };
 
 /* --- relation names + fixed arities (must match store.h exactly) --- */
@@ -174,6 +179,8 @@ Store *store_open(const char *path) {
     s = calloc(1, sizeof *s);
     if (!s) { dl_close(db); return NULL; }
     s->db = db;
+    s->next_due = UINT32_MAX;   /* unknown until first read */
+    s->next_due_dirty = true;
     return s;
 
 fail:
@@ -749,6 +756,10 @@ int store_queue_add(Store *s, uint32_t msgid, uint32_t k,
 
     rc = dl_add_fact(s->db, REL_QUEUE, cols, AR_QUEUE);
     if (rc < 0) return VISAGE_ESTORE;
+    /* A fresh queued row always has next_ts == 0 (due now), so the cached
+       soonest-due can only move DOWN to 0 — update it directly, no walk. */
+    s->next_due = 0;
+    s->next_due_dirty = false;
     return VISAGE_OK;
 }
 
@@ -762,6 +773,10 @@ int store_queue_set_status(Store *s, uint32_t msgid, uint32_t k,
     int rc;
 
     if (!s || !s->db || !status || !status[0]) return VISAGE_EPARAM;
+
+    /* Any transition can change the set of queued rows or their next_ts, so
+       invalidate the cached soonest-due; it is recomputed lazily on read. */
+    s->next_due_dirty = true;
 
     /* Intern the new status BEFORE mutating, so an OOM cannot strand the
      * delivery in a half-deleted state. */
@@ -808,6 +823,27 @@ int store_queue_set_status(Store *s, uint32_t msgid, uint32_t k,
     if (rc < 0) return VISAGE_ESTORE;
     for (i = 0; i < qc.n; i++)
         (void)dl_delete_fact(s->db, REL_QUEUE, qc.rows[i], AR_QUEUE);
+    return VISAGE_OK;
+}
+
+int store_queue_delete(Store *s, uint32_t msgid, uint32_t k) {
+    uint32_t leading[2];
+    QueueReadCtx qc;
+    long n;
+    size_t i;
+
+    if (!s || !s->db) return VISAGE_EPARAM;
+
+    leading[0] = msgid;
+    leading[1] = k;
+    memset(&qc, 0, sizeof qc);
+    n = dl_prefix(s->db, REL_QUEUE, leading, 2, queue_read_cb, &qc);
+    if (n < 0) return VISAGE_ESTORE;
+
+    for (i = 0; i < qc.n; i++)
+        (void)dl_delete_fact(s->db, REL_QUEUE, qc.rows[i], AR_QUEUE);
+    /* Only terminal (delivered/permfail) rows are ever pruned, and those do
+       not contribute to the cached soonest-due, so next_due stays valid. */
     return VISAGE_OK;
 }
 
@@ -959,13 +995,17 @@ uint32_t store_queue_next_due(Store *s) {
     NextDueCtx c;
 
     if (!s || !s->db) return UINT32_MAX;
+    if (!s->next_due_dirty) return s->next_due;   /* cached, nothing changed */
+
     c.queued_id = dl_intern_str(s->db, QUEUE_STATUS_QUEUED);
     if (!c.queued_id) return UINT32_MAX;
     c.min_next = UINT32_MAX;
 
     if (dl_prefix(s->db, REL_QUEUE, NULL, 0, next_due_cb, &c) < 0)
-        return UINT32_MAX;
-    return c.min_next;
+        return UINT32_MAX;   /* keep dirty; retry on the next read */
+    s->next_due = c.min_next;
+    s->next_due_dirty = false;
+    return s->next_due;
 }
 
 int store_queue_status(Store *s, uint32_t msgid, uint32_t k,

@@ -148,6 +148,7 @@ void outbox_conn_reset_txn(OutboxConn *c, int state) {
     c->data = NULL;
     c->data_len = 0;
     c->data_cap = 0;
+    c->data_scan_pos = 0;
     c->auth_pending = OB_AUTH_NONE;
     free(c->pending_user);
     c->pending_user = NULL;
@@ -788,6 +789,7 @@ static void do_data(OutboxServer *srv, OutboxConn *c) {
     c->data = NULL;
     c->data_len = 0;
     c->data_cap = 0;
+    c->data_scan_pos = 0;
     c->state = OB_ST_DATA;
 }
 
@@ -858,10 +860,24 @@ static void handle_command(OutboxServer *srv, OutboxConn *c, char *line,
 /* DATA input                                                         */
 /* ------------------------------------------------------------------ */
 
-static int data_scan(const char *buf, size_t len, uint32_t max_line,
-                     uint64_t max_total, size_t *msg_end, size_t *term_len) {
-    size_t i = 0;
-    size_t line_start = 0;
+/* Scan raw (dot-stuffed) DATA bytes for the end-of-message terminator
+   (verbatim from smtp_in.c data_scan, made resumable): *scan_pos is the
+   offset of the last confirmed line start, so each call only examines the
+   newly appended tail instead of restarting from byte 0 (O(n^2) over a
+   large message).  Bytes [0, *scan_pos) hold no terminator and no
+   over-limit line — every check they would produce already ran when the
+   bytes arrived.  On return 0 (need more data) *scan_pos is updated; a
+   trailing bare CR at the buffer end stays pending because a following
+   '\n' may still turn it into CRLF (the from-scratch scan merged it on
+   the rescan). */
+static int data_scan(const char *buf, size_t len, size_t *scan_pos,
+                     uint32_t max_line, uint64_t max_total,
+                     size_t *msg_end, size_t *term_len) {
+    size_t i = *scan_pos;
+    size_t line_start = *scan_pos;
+    size_t resume = *scan_pos;   /* next call's start: the last confirmed
+                                    line start (pre-CR while a trailing
+                                    bare CR may still merge with '\n') */
     uint64_t line_max = (uint64_t)max_line + 1;
 
     while (i < len) {
@@ -879,6 +895,7 @@ static int data_scan(const char *buf, size_t len, uint32_t max_line,
                 return 1;
             }
             line_start = i + 1;
+            resume = line_start;
             i++;
             continue;
         }
@@ -894,7 +911,17 @@ static int data_scan(const char *buf, size_t len, uint32_t max_line,
                 *term_len = i + 1 - line_start;
                 return 1;
             }
+            if (i + 1 == len) {
+                /* Bare CR at the buffer end: the checks above ran exactly
+                   as in the from-scratch scan and the pending line counts
+                   as ended (line_start below), but the stored resume point
+                   stays at the line start — the next recv may begin with
+                   the '\n' that turns this CR into CRLF. */
+                line_start = i + 1;
+                break;
+            }
             line_start = i + 1;
+            resume = line_start;
             i++;
             continue;
         }
@@ -902,6 +929,7 @@ static int data_scan(const char *buf, size_t len, uint32_t max_line,
     }
     if ((uint64_t)len > max_total) return -1;
     if ((uint64_t)(len - line_start) > line_max) return -1;
+    *scan_pos = resume;
     return 0;
 }
 
@@ -909,8 +937,8 @@ static void process_commands(OutboxServer *srv, OutboxConn *c, time_t now);
 
 static void process_data(OutboxServer *srv, OutboxConn *c, time_t now) {
     size_t msg_end = 0, term_len = 0;
-    int r = data_scan(c->data, c->data_len, srv->max_line, srv->raw_cap,
-                      &msg_end, &term_len);
+    int r = data_scan(c->data, c->data_len, &c->data_scan_pos, srv->max_line,
+                      srv->raw_cap, &msg_end, &term_len);
     if (r < 0) {
         outbox_conn_reply(c, "552 5.3.4 Message exceeds fixed limits\r\n");
         c->closed = true;

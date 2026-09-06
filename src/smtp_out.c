@@ -254,6 +254,9 @@ typedef struct SmtpConn {
     int        fd;
     bool       tls;              /* handshake completed; speak TLS           */
     uint32_t   tmo;              /* current op timeout (s) for the BIO poll  */
+    unsigned char rbuf[4096];    /* read-ahead (one recv/read per buffer,    */
+    size_t     rbuf_len;         /*   not one syscall per reply byte)        */
+    size_t     rbuf_off;
     mbedtls_ssl_context ssl;     /* in-place storage (valid once setup'd)    */
 } SmtpConn;
 
@@ -420,6 +423,8 @@ static void smtp_conn_init(SmtpConn *conn, int fd) {
     conn->fd = fd;
     conn->tls = false;
     conn->tmo = 0;
+    conn->rbuf_len = 0;
+    conn->rbuf_off = 0;
     mbedtls_ssl_init(&conn->ssl);
 }
 
@@ -440,14 +445,28 @@ static void smtp_conn_close(SmtpConn *conn, bool graceful) {
 /* ------------------------------------------------------------------ */
 
 /* Read one byte with a bounded timeout.  Returns 1 (byte stored in *b), 0
-   (EOF), -1 (timeout/error).  The TLS path dispatches to mbedtls_ssl_read,
-   whose BIO callbacks enforce the timeout; the plaintext path polls + reads
-   directly (byte-identical to the original smtp_read_line inner loop). */
+   (EOF), -1 (timeout/error).  Reads go through a small per-conn read-ahead
+   buffer: one poll+read (or one mbedtls_ssl_read) fills it, so a multi-KB
+   reply costs a handful of syscalls instead of one per byte.  Byte order and
+   line/reply framing are unchanged; the timeout now bounds each FILL instead
+   of each byte.  The TLS path dispatches to mbedtls_ssl_read (leftover
+   plaintext stays inside the TLS context — nothing is dropped); the
+   plaintext path polls + reads directly. */
 static int conn_read_byte(SmtpConn *conn, uint32_t tmo, unsigned char *b) {
+    if (conn->rbuf_off < conn->rbuf_len) {
+        *b = conn->rbuf[conn->rbuf_off++];
+        return 1;
+    }
     if (conn->tls) {
         conn->tmo = tmo;
-        int r = mbedtls_ssl_read(&conn->ssl, b, 1);
-        if (r == 1) return 1;
+        int r = mbedtls_ssl_read(&conn->ssl, conn->rbuf, sizeof conn->rbuf);
+        if (r > 0) {
+            conn->rbuf_len = (size_t)r;
+            conn->rbuf_off = 1;
+            *b = conn->rbuf[0];
+            return 1;
+        }
+        conn->rbuf_len = conn->rbuf_off = 0;
         if (r == 0 || r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return 0;
         return -1;   /* MBEDTLS_ERR_SSL_TIMEOUT (propagated) or other error */
     }
@@ -462,12 +481,15 @@ static int conn_read_byte(SmtpConn *conn, uint32_t tmo, unsigned char *b) {
             return -1;
         }
         if (pr == 0) return -1;                /* timed out */
-        ssize_t r = read(conn->fd, b, 1);
+        ssize_t r = read(conn->fd, conn->rbuf, sizeof conn->rbuf);
         if (r < 0) {
             if (errno == EINTR) continue;
             return -1;
         }
         if (r == 0) return 0;                  /* EOF */
+        conn->rbuf_len = (size_t)r;
+        conn->rbuf_off = 1;
+        *b = conn->rbuf[0];
         return 1;
     }
 }
@@ -1026,6 +1048,11 @@ static int smtp_dialogue(SmtpConn *conn, const Config *c, const char *host,
                               status_sz) != 0)
                 return SMTP_TEMPFAIL;
             if (code == 220) {
+                /* The 220 ends the plaintext dialogue: drop anything the
+                   read-ahead buffered past it (a compliant server sends
+                   nothing after 220) so only the socket feeds the TLS
+                   record layer. */
+                conn->rbuf_len = conn->rbuf_off = 0;
                 int hr = smtp_tls_handshake(conn, host, tls_verify,
                                             c->relay.tls_ca, tmo,
                                             status_out, status_sz);

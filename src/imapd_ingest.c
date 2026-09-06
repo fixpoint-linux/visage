@@ -124,6 +124,7 @@ static void conn_reset(Conn *c, int new_state) {
     c->data = NULL;
     c->data_len = 0;
     c->data_cap = 0;
+    c->data_scan_pos = 0;
     c->st = new_state;
 }
 
@@ -181,11 +182,13 @@ static bool path_clean(const char *p) {
 }
 
 /* Scan raw (dot-stuffed) DATA bytes for the end-of-message terminator
-   (verbatim from smtp_in.c data_scan). */
-static int data_scan(const char *buf, size_t len, uint64_t max_total,
-                     size_t *msg_end, size_t *term_len) {
-    size_t i = 0;
-    size_t line_start = 0;
+   (verbatim from smtp_in.c data_scan, made resumable — see outbox_submit.c
+   data_scan for the resume-point rules). */
+static int data_scan(const char *buf, size_t len, size_t *scan_pos,
+                     uint64_t max_total, size_t *msg_end, size_t *term_len) {
+    size_t i = *scan_pos;
+    size_t line_start = *scan_pos;
+    size_t resume = *scan_pos;
     const uint64_t line_max = (uint64_t)INGEST_MAX_LINE + 1;
 
     while (i < len) {
@@ -203,6 +206,7 @@ static int data_scan(const char *buf, size_t len, uint64_t max_total,
                 return 1;
             }
             line_start = i + 1;
+            resume = line_start;
             i++;
             continue;
         }
@@ -218,7 +222,14 @@ static int data_scan(const char *buf, size_t len, uint64_t max_total,
                 *term_len = i + 1 - line_start;
                 return 1;
             }
+            if (i + 1 == len) {
+                /* Bare CR at the buffer end: keep it pending (may still
+                   merge with a following '\n'); pending counts as ended. */
+                line_start = i + 1;
+                break;
+            }
             line_start = i + 1;
+            resume = line_start;
             i++;
             continue;
         }
@@ -226,6 +237,7 @@ static int data_scan(const char *buf, size_t len, uint64_t max_total,
     }
     if ((uint64_t)len > max_total) return -1;
     if ((uint64_t)(len - line_start) > line_max) return -1;
+    *scan_pos = resume;
     return 0;
 }
 
@@ -422,6 +434,7 @@ static void ingest_command(ImapdServer *srv, Conn *c, char *line) {
         c->data = NULL;
         c->data_len = 0;
         c->data_cap = 0;
+        c->data_scan_pos = 0;
         c->st = ST_DATA;
     } else if (vlen == 4 && ascii_strncasecmp(p, "RSET", 4) == 0) {
         conn_reset(c, (c->st == ST_INIT) ? ST_INIT : ST_HELO);
@@ -528,7 +541,8 @@ static void ingest_commands(ImapdServer *srv, Conn *c, time_t now) {
 static void ingest_data(ImapdServer *srv, Conn *c, time_t now) {
     size_t msg_end = 0, term_len = 0;
     uint64_t raw_cap = (uint64_t)srv->cfg.max_msg * 2 + 16;
-    int r = data_scan(c->data, c->data_len, raw_cap, &msg_end, &term_len);
+    int r = data_scan(c->data, c->data_len, &c->data_scan_pos, raw_cap,
+                      &msg_end, &term_len);
     if (r < 0) {
         conn_reply(c, "552 5.3.4 Message exceeds fixed limits\r\n");
         c->closed = true;

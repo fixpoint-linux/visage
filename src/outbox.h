@@ -158,6 +158,8 @@ typedef struct OutboxConn {
     size_t in_len, in_cap;
     char  *data;              /* DATA input buffer (dot-stuffed)      */
     size_t data_len, data_cap;
+    size_t data_scan_pos;     /* resumable DATA scan: offset of the last
+                                 confirmed line start (see data_scan) */
     char  *out;               /* reply output buffer (owned)          */
     size_t out_len, out_off, out_cap;
     time_t last_act;          /* idle-timeout clock                   */
@@ -168,13 +170,19 @@ typedef struct OutboxConn {
 
 /* One queued outbound message: the DKIM-signed bytes + its envelope, owned by
  * the delivery queue.  Built by the poll thread at DATA completion and drained
- * by the single delivery worker thread (outbox_deliver.c). */
+ * by the single delivery worker thread (outbox_deliver.c).  A TEMPFAILing job
+ * is re-appended with a due-time instead of sleeping in the worker, so one
+ * temp-failing recipient cannot hold the single worker (and its remaining
+ * recipients) hostage. */
 typedef struct OutboxDeliveryJob {
     char  *from;            /* envelope MAIL FROM (owned; "" = null)   */
     char **rcpts;           /* recipient addresses (owned)             */
     size_t nrcpts;
     char  *msg;             /* DKIM-signed message bytes (owned)       */
     size_t msglen;
+    time_t due;             /* worker delivers only when now >= due    */
+    uint32_t attempt;       /* current per-recipient attempt (1-based) */
+    unsigned char *rcpt_done; /* per-recipient terminal mark (owned)   */
     struct OutboxDeliveryJob *next;
 } OutboxDeliveryJob;
 

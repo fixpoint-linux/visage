@@ -238,6 +238,9 @@ typedef struct Conn {
     size_t nrcpts, rcpt_cap;
     char  *data;               /* DATA buffer (owned, dot-stuffed) */
     size_t data_len, data_cap;
+    size_t data_scan_pos;      /* ingest-only: resumable DATA terminator
+                                  scan (offset of last confirmed line
+                                  start; see imapd_ingest.c data_scan) */
     /* imap-only (kind == CONN_IMAP) */
     char  *user;               /* logged-in user (owned) */
     int    ist;                /* IST_* */

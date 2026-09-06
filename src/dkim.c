@@ -3,8 +3,12 @@
  * a=rsa-sha256, c=relaxed/relaxed.  The canonicalization primitives
  * (relaxed_header / relaxed_body / collect / build_value / canon_dkim_hdr) and
  * the sign/verify cores (dkim_sign_core / dkim_verify_core) are transcribed
- * VERBATIM from the verified prototype tools/dkim_proto.c (which was
- * cross-checked against openssl + Python).  The public entry points add a
+ * from the verified prototype tools/dkim_proto.c (which was cross-checked
+ * against openssl + Python).  relaxed_body and dkim_sign_core were later
+ * reworked to feed SHA-256 incrementally (no canonicalized-body/-header copy,
+ * no per-byte buffer calls); the hashed byte streams are identical to the
+ * prototype's buffer form (dkim_check pins the golden bh values).  The public
+ * entry points add a
  * process-wide lazy entropy/ctr_drbg (mirroring smtp_out.c smtp_tls_global_init)
  * and a single-entry pk_context cache keyed by key_path (the daemon's signing
  * keys are fixed at startup).  On any key-load/sign failure the caller forwards
@@ -18,6 +22,7 @@
 
 #include "mbedtls/pk.h"
 #include "mbedtls/md.h"
+#include "mbedtls/sha256.h"
 #include "mbedtls/base64.h"
 #include "mbedtls/entropy.h"
 #include "mbedtls/ctr_drbg.h"
@@ -103,33 +108,99 @@ static int relaxed_header(const char *hdr, size_t len, size_t colon, Buf *out) {
 /* Body canonicalization + hash                                        */
 /* ------------------------------------------------------------------ */
 
-/* Relaxed body (3.4.4): strip trailing WSP per line, collapse WSP runs to
- * single SP, remove trailing empty lines; canonicalized body ends with a
- * single CRLF (empty body -> a single CRLF, 2 octets).  Body is CRLF. */
-static int relaxed_body(const char *body, size_t len, char **out, size_t *outlen) {
-    Buf o; buf_init(&o);
+/* Relaxed body (RFC 6376 3.4.4), fed straight into SHA-256: strip trailing
+ * WSP per line, collapse WSP runs to single SP, remove trailing empty lines;
+ * the canonicalized body ends with a single CRLF (empty body -> a single
+ * CRLF, 2 octets).  Body is CRLF.
+ *
+ * The canonicalized body is never materialized as one buffer: bytes are
+ * staged in a small growable scratch and folded into the hash in chunks.
+ * Trailing empty lines cannot be retracted once hashed, so each line's CRLF
+ * is staged only when a later non-empty line proves it is not a trailing
+ * one; at EOF exactly one CRLF pair is staged (this also covers the empty
+ * body).  The staged byte stream is identical to canonicalizing into a
+ * single buffer first, so bh/b= values are unchanged. */
+#define RELAXED_BODY_FLUSH 32768   /* staged bytes before a hash update */
+
+typedef struct {
+    mbedtls_sha256_context md;
+    Buf    s;      /* canonical bytes staged but not yet folded into the hash */
+    size_t owed;   /* CRLF pairs proven non-trailing, not yet staged */
+} BodyHash;
+
+/* Make room for `need` more scratch bytes without per-byte capacity checks
+ * (fold what is staged once past the flush threshold; grow only for a single
+ * line longer than that). */
+static int bh_reserve(BodyHash *b, size_t need) {
+    if (b->s.len + need > RELAXED_BODY_FLUSH && b->s.len) {
+        if (mbedtls_sha256_update(&b->md, (const unsigned char *)b->s.p,
+                                  b->s.len) != 0) return -1;
+        b->s.len = 0;
+    }
+    if (b->s.len + need > b->s.cap)
+        return buf_grow(&b->s, b->s.len + need);
+    return 0;
+}
+
+/* Stage `n` CRLF pairs. */
+static int bh_crlf(BodyHash *b, size_t n) {
+    while (n--) {
+        if (bh_reserve(b, 2) != 0) return -1;
+        b->s.p[b->s.len++] = '\r';
+        b->s.p[b->s.len++] = '\n';
+    }
+    return 0;
+}
+
+/* Canonicalize `body` (relaxed) into SHA-256 `out`.  Returns 0 or -1. */
+static int relaxed_body_sha256(const char *body, size_t len,
+                               unsigned char out[32]) {
+    BodyHash b;
     size_t i = 0;
+
+    if (buf_init(&b.s) != 0) return -1;
+    mbedtls_sha256_init(&b.md);
+    b.owed = 0;
+    if (mbedtls_sha256_starts(&b.md, 0) != 0) goto fail;
+
     while (i < len) {
-        size_t ls = i;
+        size_t ls = i, j;
         while (i < len && !(body[i] == '\r' && i + 1 < len && body[i + 1] == '\n')) i++;
-        size_t le = i;
-        Buf line; buf_init(&line);
-        bool pending = false, seen = false;
-        for (size_t j = ls; j < le; j++) {
-            char c = body[j];
-            if (is_wsp(c)) { if (seen) pending = true; continue; }
-            if (pending) { buf_putc(&line, ' '); pending = false; }
-            buf_putc(&line, c); seen = true;
+        j = ls;
+        while (j < i && is_wsp(body[j])) j++;
+        if (j < i) {                 /* non-empty line: earlier CRLFs are not trailing */
+            bool pending = false, seen = false;
+            char *w;
+            if (bh_crlf(&b, b.owed) != 0) goto fail;
+            if (bh_reserve(&b, i - ls) != 0) goto fail;
+            b.owed = 1;
+            w = b.s.p + b.s.len;
+            for (j = ls; j < i; j++) {
+                char c = body[j];
+                if (is_wsp(c)) { if (seen) pending = true; continue; }
+                if (pending) { *w++ = ' '; pending = false; }
+                *w++ = c; seen = true;
+            }
+            b.s.len = (size_t)(w - b.s.p);
+        } else {
+            b.owed++;                /* empty line: CRLF staged only if a later line follows */
         }
-        buf_put(&o, line.p, line.len);
-        buf_put(&o, "\r\n", 2);
-        buf_free(&line);
         if (i < len) { if (body[i] == '\r' && i + 1 < len && body[i + 1] == '\n') i += 2; else i += 1; }
     }
-    while (o.len >= 2 && o.p[o.len - 2] == '\r' && o.p[o.len - 1] == '\n') o.len -= 2;
-    buf_put(&o, "\r\n", 2);
-    o.p[o.len] = '\0';
-    *out = o.p; *outlen = o.len; return 0;
+
+    if (bh_crlf(&b, 1) != 0) goto fail;   /* canonical body ends with one CRLF */
+    if (b.s.len &&
+        mbedtls_sha256_update(&b.md, (const unsigned char *)b.s.p, b.s.len) != 0)
+        goto fail;
+    if (mbedtls_sha256_finish(&b.md, out) != 0) goto fail;
+    mbedtls_sha256_free(&b.md);
+    buf_free(&b.s);
+    return 0;
+
+fail:
+    mbedtls_sha256_free(&b.md);
+    buf_free(&b.s);
+    return -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -292,20 +363,17 @@ static int sha256(const unsigned char *in, size_t len, unsigned char out[32]) {
 static int dkim_sign_core(const char *msg, size_t len, mbedtls_pk_context *pk,
                           const char *d, const char *s, uint32_t t,
                           mbedtls_ctr_drbg_context *drbg,
-                          char **sig_hdr, Buf *sig_input_out, unsigned char bodyhash_out[32]) {
+                          char **sig_hdr, unsigned char bodyhash_out[32]) {
     HdrList h; memset(&h, 0, sizeof h);
     if (collect(msg, len, &h) != 0) return -1;
     if (h.n == 0) { hdrlist_free(&h); return -1; }
 
-    /* body hash */
+    /* body hash (streamed; no canonicalized-body copy) */
     size_t blank = find_blank(msg, len);
     size_t bs = blank;
     if (bs < len) { if (msg[bs] == '\r') bs++; if (bs < len && msg[bs] == '\n') bs++; }
-    char *cb = NULL; size_t cblen = 0;
-    if (relaxed_body(msg + bs, len - bs, &cb, &cblen) != 0) { hdrlist_free(&h); return -1; }
     unsigned char bh[32];
-    if (sha256((const unsigned char *)cb, cblen, bh) != 0) { free(cb); hdrlist_free(&h); return -1; }
-    free(cb);
+    if (relaxed_body_sha256(msg + bs, len - bs, bh) != 0) { hdrlist_free(&h); return -1; }
     memcpy(bodyhash_out, bh, 32);
     char bhb64[64]; size_t bhb64len = 0;
     if (b64(bh, 32, bhb64, sizeof bhb64, &bhb64len) != 0) { hdrlist_free(&h); return -1; }
@@ -313,40 +381,53 @@ static int dkim_sign_core(const char *msg, size_t len, mbedtls_pk_context *pk,
     Buf htv; buf_init(&htv); htag(&h, &htv);
 
     /* signature input = canonicalized signed headers (each + CRLF)
-                        + canonicalized DKIM-Signature (b empty, no CRLF) */
-    Buf in; buf_init(&in);
+                        + canonicalized DKIM-Signature (b empty, no CRLF);
+       hashed incrementally, never accumulated into one buffer */
+    mbedtls_sha256_context sigmd;
+    unsigned char sighash[32];
+    mbedtls_sha256_init(&sigmd);
+    if (mbedtls_sha256_starts(&sigmd, 0) != 0) {
+        mbedtls_sha256_free(&sigmd); buf_free(&htv); hdrlist_free(&h); return -1;
+    }
     for (size_t i = 0; i < h.n; i++) {
         Buf ch; buf_init(&ch);
         relaxed_header(msg + h.start[i], h.end[i] - h.start[i], h.colon[i] - h.start[i], &ch);
-        buf_put(&in, ch.p, ch.len);
-        buf_put(&in, "\r\n", 2);
+        if (mbedtls_sha256_update(&sigmd, (const unsigned char *)ch.p, ch.len) != 0 ||
+            mbedtls_sha256_update(&sigmd, (const unsigned char *)"\r\n", 2) != 0) {
+            buf_free(&ch); mbedtls_sha256_free(&sigmd); buf_free(&htv); hdrlist_free(&h);
+            return -1;
+        }
         buf_free(&ch);
     }
     {
         Buf cd; buf_init(&cd);
         canon_dkim_hdr(d, s, t, bhb64, htv.p, "", &cd);
-        buf_put(&in, cd.p, cd.len);
+        if (mbedtls_sha256_update(&sigmd, (const unsigned char *)cd.p, cd.len) != 0) {
+            buf_free(&cd); mbedtls_sha256_free(&sigmd); buf_free(&htv); hdrlist_free(&h);
+            return -1;
+        }
         buf_free(&cd);
     }
-
-    unsigned char sighash[32];
-    if (sha256((const unsigned char *)in.p, in.len, sighash) != 0) { buf_free(&in); buf_free(&htv); hdrlist_free(&h); return -1; }
+    if (mbedtls_sha256_finish(&sigmd, sighash) != 0) {
+        mbedtls_sha256_free(&sigmd); buf_free(&htv); hdrlist_free(&h); return -1;
+    }
+    mbedtls_sha256_free(&sigmd);
 
     unsigned char sig[512]; size_t siglen = 0;
     if (mbedtls_pk_sign(pk, MBEDTLS_MD_SHA256, sighash, 32, sig, sizeof sig,
                         &siglen, mbedtls_ctr_drbg_random, drbg) != 0) {
-        buf_free(&in); buf_free(&htv); hdrlist_free(&h); return -1;
+        buf_free(&htv); hdrlist_free(&h); return -1;
     }
     char b_b64[1024]; size_t b_b64len = 0;
-    if (b64(sig, siglen, b_b64, sizeof b_b64, &b_b64len) != 0) { buf_free(&in); buf_free(&htv); hdrlist_free(&h); return -1; }
+    if (b64(sig, siglen, b_b64, sizeof b_b64, &b_b64len) != 0) { buf_free(&htv); hdrlist_free(&h); return -1; }
 
     char sigval[2048];
     if (build_value(sigval, sizeof sigval, d, s, t, bhb64, htv.p, b_b64) != 0) {
-        buf_free(&in); buf_free(&htv); hdrlist_free(&h); return -1;
+        buf_free(&htv); hdrlist_free(&h); return -1;
     }
     size_t hvlen = strlen(sigval);
     char *hdr = malloc(DKIM_HDR_NAME_LEN + 2 + hvlen + 3);
-    if (!hdr) { buf_free(&in); buf_free(&htv); hdrlist_free(&h); return -1; }
+    if (!hdr) { buf_free(&htv); hdrlist_free(&h); return -1; }
     memcpy(hdr, DKIM_HDR_NAME, DKIM_HDR_NAME_LEN);
     hdr[DKIM_HDR_NAME_LEN] = ':';
     hdr[DKIM_HDR_NAME_LEN + 1] = ' ';
@@ -355,7 +436,6 @@ static int dkim_sign_core(const char *msg, size_t len, mbedtls_pk_context *pk,
     hdr[DKIM_HDR_NAME_LEN + 2 + hvlen + 1] = '\n';
     hdr[DKIM_HDR_NAME_LEN + 2 + hvlen + 2] = '\0';
 
-    if (sig_input_out) *sig_input_out = in; else buf_free(&in);
     buf_free(&htv);
     hdrlist_free(&h);
     *sig_hdr = hdr;
@@ -669,10 +749,9 @@ int dkim_sign(const char *msg, size_t msglen, const char *domain,
 
     uint32_t t = (uint32_t)time(NULL);
     char *sig_hdr = NULL;
-    Buf sig_input; memset(&sig_input, 0, sizeof sig_input);
     unsigned char bodyhash[32];
     r = dkim_sign_core(msg, msglen, pk, domain, selector, t, &g_drbg,
-                       &sig_hdr, &sig_input, bodyhash);
+                       &sig_hdr, bodyhash);
     if (r != 0) {
         fprintf(stderr, "visage: dkim: sign failed for %s (selector %s)\n",
                 domain, selector);
@@ -683,7 +762,6 @@ int dkim_sign(const char *msg, size_t msglen, const char *domain,
     char *signed_msg = malloc(shlen + msglen + 1);
     if (!signed_msg) {
         free(sig_hdr);
-        buf_free(&sig_input);
         fprintf(stderr, "visage: dkim: out of memory\n");
         return -1;
     }
@@ -691,7 +769,6 @@ int dkim_sign(const char *msg, size_t msglen, const char *domain,
     memcpy(signed_msg + shlen, msg, msglen);
     signed_msg[shlen + msglen] = '\0';
     free(sig_hdr);
-    buf_free(&sig_input);
     *out = signed_msg;
     *outlen = shlen + msglen;
     return 0;
@@ -742,11 +819,8 @@ int dkim_relaxed_header(const char *hdr, size_t len, size_t colon,
 
 int dkim_relaxed_body_b64(const char *body, size_t len, char bh_b64[64]) {
     if (!bh_b64) return -1;
-    char *cb = NULL; size_t cblen = 0;
-    if (relaxed_body(body, len, &cb, &cblen) != 0) return -1;
     unsigned char h[32];
-    if (sha256((const unsigned char *)cb, cblen, h) != 0) { free(cb); return -1; }
-    free(cb);
+    if (relaxed_body_sha256(body, len, h) != 0) return -1;
     size_t olen = 0;
     if (b64(h, 32, bh_b64, 64, &olen) != 0) return -1;
     bh_b64[olen] = '\0';

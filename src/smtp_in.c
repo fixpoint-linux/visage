@@ -48,6 +48,13 @@
    skipped items remain due and are picked up on the next tick). */
 #define SMTP_IN_REDRIVE_BATCH  8
 
+/* Wall-clock budget for one queue_redrive pass (collect + delivery).  Once
+   exceeded, the remaining due items are left queued and the loop returns to
+   poll() so accept/HTTP/SMTP fds get service even while the relay is slow or
+   down.  Each individual smtp_out_send still blocks up to its own connect/
+   reply timeouts (bounded per item); this bounds the AGGREGATE per tick. */
+#define SMTP_IN_REDRIVE_BUDGET_MS 1000
+
 /* Inbound connection limits.  A total cap bounds memory/CPU under a flood, and
    the per-IP cap prevents one host from exhausting the pool (mitigating
    slowloris-style resource hogging).  Both are enforced at accept time, BEFORE
@@ -181,6 +188,9 @@ typedef struct Conn {
     size_t in_len, in_cap;
     char  *data;               /* DATA input buffer (owned, dot-stuffed) */
     size_t data_len, data_cap;
+    size_t scan_pos;           /* DATA terminator scan resume offset (start of
+                                  the current not-yet-terminated line); the
+                                  bytes before it are fully scanned */
     char  *out;                /* reply output buffer (owned) */
     size_t out_len, out_off, out_cap;
     time_t last_act;           /* last activity (idle-timeout clock) */
@@ -479,6 +489,7 @@ static void conn_reset(Conn *c, int new_state) {
     c->data = NULL;
     c->data_len = 0;
     c->data_cap = 0;
+    c->scan_pos = 0;
     c->state = new_state;
 }
 
@@ -830,16 +841,35 @@ static int queue_collect_cb(uint32_t msgid, uint32_t k, const char *from,
     return 0;
 }
 
+/* Monotonic wall-clock milliseconds (CLOCK_MONOTONIC), for the redrive
+   deadline.  Never wall-clock seconds: clock_settime / NTP steps must not
+   shrink the remaining budget. */
+static uint64_t monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
 /* Re-drive every delivery whose status is "queued" and next_ts <= now.
    Collect-then-mutate is load-bearing: the due-walk is read-only, and each
    delivery's transition happens AFTER the walk returns, because dafsa
    add/delete realloc the states array mid-walk (mutating inside the callback
-   would be a use-after-free). */
+   would be a use-after-free).
+
+   Bounded per tick: the cached soonest-due (store_queue_next_due) skips the
+   full due-walk entirely when nothing is due, and a wall-clock deadline stops
+   the delivery loop once the budget elapses so the poll() loop gets service. */
 static void queue_redrive(Server *srv) {
     Store *s = srv->store;
     QueueCollect qc;
     size_t i;
     uint32_t now = (uint32_t)time(NULL);
+    uint32_t next_due;
+    uint64_t deadline = monotonic_ms() + SMTP_IN_REDRIVE_BUDGET_MS;
+
+    /* Nothing queued (UINT32_MAX) or nothing due yet -> skip the due-walk. */
+    next_due = store_queue_next_due(s);
+    if (next_due == UINT32_MAX || next_due > now) return;
 
     memset(&qc, 0, sizeof qc);
     if (store_queue_due(s, now, queue_collect_cb, &qc) != VISAGE_OK || qc.oom) {
@@ -852,6 +882,7 @@ static void queue_redrive(Server *srv) {
     }
 
     for (i = 0; i < qc.n && i < SMTP_IN_REDRIVE_BATCH; i++) {
+        if (monotonic_ms() >= deadline) break;   /* budget gone: next tick */
         queue_deliver_one(srv, qc.items[i].msgid, qc.items[i].k,
                           qc.items[i].from, qc.items[i].to,
                           qc.items[i].attempts);
@@ -918,8 +949,11 @@ static int queue_enqueue(Server *srv, uint32_t msgid, uint32_t k,
        shared re-drive path delivers it through reply_relay. */
     if (reply) reply_mark_push(srv, msgid, k);
 
-    /* 4. Low-latency first attempt via the shared re-drive path. */
-    queue_redrive(srv);
+    /* 4. Low-latency first attempt: deliver ONLY the just-enqueued item (never
+       the whole due queue) so a burst of destinations on one DATA-accept path
+       can't block the poll loop past a single smtp_out_send.  Any other due
+       items are left for the poll-loop re-drive. */
+    queue_deliver_one(srv, msgid, k, from, to, 0);
     return 0;
 }
 
@@ -956,6 +990,60 @@ static void forward_sign(const Config *cfg, const char *alias,
     *slen = signed_len;
 }
 
+/* Prepare the shared sanitized+signed outbound body for a normal alias
+   forward: mint ONE reply token (per message+alias), persist its revmap fact,
+   build the MailRewrite (Reply-To/Return-Path/Received), sanitize, and
+   DKIM-sign.  None of this depends on the destination, so a multi-destination
+   alias shares it across every dest (see forward_alias).  On success sets
+   *sanitized, *slen (caller frees with mail_free) and *env_from (the envelope
+   MAIL FROM).  Returns -1 on any failure; the CALLER logs the per-destination
+   "error" facts (forward_one for a single dest, forward_alias for each dest). */
+static int forward_prepare(Server *srv, const char *msg, size_t msglen,
+                           const char *sender, const char *alias,
+                           char **sanitized, size_t *slen,
+                           const char **env_from) {
+    Store *s = srv->store;
+    const Config *cfg = srv->cfg;
+    MailRewrite rw;
+    char token[64], reverse[384], received[512];
+    int rc;
+
+    memset(&rw, 0, sizeof rw);
+
+    if (sender[0] != '\0') {
+        if (reply_token_gen(token, sizeof token) != VISAGE_OK ||
+            reply_make_reverse(cfg, token, alias, reverse, sizeof reverse) != VISAGE_OK)
+            return -1;
+        /* Persist token -> (sender, alias) so a reply to reply+<token>@alias
+           resolves and routes back to the original sender. */
+        if (store_revmap_add(s, token, sender, alias) != VISAGE_OK)
+            return -1;
+        /* Keep the real From (no rewrite, no Sender header); only Reply-To
+           carries the reply alias so replies route back via the alias. */
+        rw.reply_to = reverse;
+        rw.return_path = alias;
+        *env_from = alias;
+    } else {
+        /* null reverse-path (bounce): route plainly. */
+        rw.from = alias;
+        rw.sender = alias;
+        rw.reply_to = alias;
+        rw.return_path = "";
+        *env_from = "";
+    }
+
+    snprintf(received, sizeof received, "from %s by %s",
+             sender[0] ? sender : "<>",
+             (cfg->hostname && cfg->hostname[0]) ? cfg->hostname : "localhost");
+    rw.received = received;
+
+    rc = mail_sanitize_for_forward(msg, msglen, &rw, sanitized, slen);
+    if (rc != 0) return -1;
+
+    forward_sign(cfg, alias, sanitized, slen);
+    return 0;
+}
+
 /* Forward one sanitized copy of the message through `alias` to `dest`.
    The original From is preserved (the mailbox shows the real sender) and no
    Sender header is added; a reply alias is minted and wired only into
@@ -967,58 +1055,21 @@ static void forward_sign(const Config *cfg, const char *alias,
 static int forward_one(Server *srv, const char *msg, size_t msglen,
                        const char *sender, const char *alias, const char *dest,
                        uint32_t msgid, uint32_t ts, uint32_t k) {
-    Store *s = srv->store;
-    const Config *cfg = srv->cfg;
-    MailRewrite rw;
-    char token[64], reverse[384], received[512];
     char *sanitized = NULL;
     size_t slen = 0;
+    const char *env_from = NULL;
     int rc;
 
-    memset(&rw, 0, sizeof rw);
-
-    if (sender[0] != '\0') {
-        if (reply_token_gen(token, sizeof token) != VISAGE_OK ||
-            reply_make_reverse(cfg, token, alias, reverse, sizeof reverse) != VISAGE_OK) {
-            store_log_add(s, msgid, ts, LOG_DIR_OUT, alias, dest, "error");
-            return -1;
-        }
-        /* Persist token -> (sender, alias) so a reply to reply+<token>@alias
-           resolves and routes back to the original sender. */
-        if (store_revmap_add(s, token, sender, alias) != VISAGE_OK) {
-            store_log_add(s, msgid, ts, LOG_DIR_OUT, alias, dest, "error");
-            return -1;
-        }
-        /* Keep the real From (no rewrite, no Sender header); only Reply-To
-           carries the reply alias so replies route back via the alias. */
-        rw.reply_to = reverse;
-        rw.return_path = alias;
-    } else {
-        /* null reverse-path (bounce): route plainly. */
-        rw.from = alias;
-        rw.sender = alias;
-        rw.reply_to = alias;
-        rw.return_path = "";
-    }
-
-    snprintf(received, sizeof received, "from %s by %s",
-             sender[0] ? sender : "<>",
-             (cfg->hostname && cfg->hostname[0]) ? cfg->hostname : "localhost");
-    rw.received = received;
-
-    rc = mail_sanitize_for_forward(msg, msglen, &rw, &sanitized, &slen);
-    if (rc != 0) {
-        store_log_add(s, msgid, ts, LOG_DIR_OUT, alias, dest, "error");
+    if (forward_prepare(srv, msg, msglen, sender, alias, &sanitized, &slen,
+                        &env_from) != 0) {
+        store_log_add(srv->store, msgid, ts, LOG_DIR_OUT, alias, dest, "error");
         return -1;
     }
-
-    forward_sign(cfg, alias, &sanitized, &slen);
 
     /* Preserve the null reverse-path end-to-end: for a bounce (sender empty)
        the envelope MAIL FROM must be <> (not the alias), otherwise the
        destination bounces the bounce forever.  Only the envelope changes; the
        header rewrite (rw.from=alias etc.) is unchanged. */
-    const char *env_from = (sender[0] != '\0') ? alias : "";
     rc = queue_enqueue(srv, msgid, k, env_from, dest, sanitized, slen, false);
     mail_free(sanitized);
     return (rc == 0) ? 0 : -1;
@@ -1052,10 +1103,28 @@ static int forward_alias(Server *srv, const char *msg, size_t msglen,
         store_free_strvec(dests, ndests);
         return failed ? -1 : 0;
     }
-    for (i = 0; i < ndests; i++)
-        if (forward_one(srv, msg, msglen, sender, rcpt, dests[i], msgid, ts,
-                        (*k)++) != 0)
-            failed = 1;
+
+    /* Multi-destination alias: the token, revmap, sanitize and DKIM sign are
+       destination-independent, so do them ONCE and share the resulting body
+       across every dest (each dest still gets its own spool file + queue row).
+       The envelope RCPT TO differs per dest; MAIL FROM is shared. */
+    {
+        char *sanitized = NULL;
+        size_t slen = 0;
+        const char *env_from = NULL;
+        if (forward_prepare(srv, msg, msglen, sender, rcpt, &sanitized, &slen,
+                            &env_from) != 0) {
+            for (i = 0; i < ndests; i++)
+                store_log_add(s, msgid, ts, LOG_DIR_OUT, rcpt, dests[i], "error");
+            store_free_strvec(dests, ndests);
+            return -1;
+        }
+        for (i = 0; i < ndests; i++)
+            if (queue_enqueue(srv, msgid, (*k)++, env_from, dests[i],
+                              sanitized, slen, false) != 0)
+                failed = 1;
+        mail_free(sanitized);
+    }
     store_free_strvec(dests, ndests);
     return failed ? -1 : 0;
 }
@@ -1233,14 +1302,27 @@ static void tls_advance(Server *srv, Conn *c, time_t now);      /* fwd */
 
 /* Scan raw (dot-stuffed) DATA bytes for the end-of-message terminator
    (CRLF.CRLF, tolerating bare-LF and bare-CR lines). Enforces the per-line
-   limit (allowing one stuffed dot) and a total raw ceiling. Returns 1 when the
-   terminator is found (setting *msg_end to its offset and *term_len to its
-   length), 0 when more data is needed, -1 when a limit is exceeded. */
+   limit (allowing one stuffed dot) and a total raw ceiling.  Resumable: scans
+   only from *scan_pos (the start of the current not-yet-terminated line), so a
+   multi-chunk message is scanned incrementally instead of re-scanning the whole
+   accumulated buffer every recv.  Returns 1 when the terminator is found
+   (setting *msg_end to its offset and *term_len to its length), 0 when more
+   data is needed (advancing *scan_pos), -1 when a limit is exceeded.
+
+   The one deliberately tentative case: a CR as the very last byte could be
+   either a bare-CR line ending or the first half of a CRLF split across the
+   chunk boundary.  A full re-scan would re-read it once the next byte lands,
+   so we keep *scan_pos at that line's start (rather than committing the bare
+   CR) to reproduce identical results — EXCEPT the terminator, which a trailing
+   bare CR resolves immediately (".\r" ends the message), matching the
+   non-resumable scan. */
 static int data_scan(const char *buf, size_t len, uint32_t max_line,
-                     uint64_t max_total, size_t *msg_end, size_t *term_len) {
-    size_t i = 0;
-    size_t line_start = 0;
+                     uint64_t max_total, size_t *scan_pos,
+                     size_t *msg_end, size_t *term_len) {
+    size_t i = *scan_pos;
+    size_t line_start = i;
     uint64_t line_max = (uint64_t)max_line + 1;
+    int trailing_cr = 0;
 
     while (i < len) {
         char ch = buf[i];
@@ -1272,6 +1354,10 @@ static int data_scan(const char *buf, size_t len, uint32_t max_line,
                 *term_len = i + 1 - line_start;
                 return 1;
             }
+            if (i + 1 == len) {
+                trailing_cr = 1;   /* re-examine this CR on the next recv */
+                break;
+            }
             line_start = i + 1;
             i++;
             continue;
@@ -1279,7 +1365,8 @@ static int data_scan(const char *buf, size_t len, uint32_t max_line,
         i++;
     }
     if ((uint64_t)len > max_total) return -1;
-    if ((uint64_t)(len - line_start) > line_max) return -1;
+    if (!trailing_cr && (uint64_t)(len - line_start) > line_max) return -1;
+    *scan_pos = line_start;
     return 0;
 }
 
@@ -1288,7 +1375,7 @@ static void process_commands(Server *srv, Conn *c, time_t now);
 static void process_data(Server *srv, Conn *c, time_t now) {
     size_t msg_end = 0, term_len = 0;
     int r = data_scan(c->data, c->data_len, srv->max_line, srv->raw_cap,
-                      &msg_end, &term_len);
+                      &c->scan_pos, &msg_end, &term_len);
     if (r < 0) {
         conn_reply(c, "552 5.3.4 Message exceeds fixed limits\r\n");
         c->closed = true;
@@ -1306,6 +1393,7 @@ static void process_data(Server *srv, Conn *c, time_t now) {
                 free(c->data);
                 c->data = NULL;
                 c->data_len = c->data_cap = 0;
+                c->scan_pos = 0;
                 return;
             }
         }
@@ -1458,6 +1546,7 @@ static void do_data(Server *srv, Conn *c) {
     c->data = NULL;
     c->data_len = 0;
     c->data_cap = 0;
+    c->scan_pos = 0;
     c->state = ST_DATA;
 }
 
@@ -1790,6 +1879,12 @@ static void spool_gc(Server *srv) {
                 continue;
         }
         (void)unlink(path);
+        /* Prune the terminal queue row alongside its body: once the retained
+           audit/replay copy is gone, the delivered/permfail row is dead weight
+           and would otherwise accumulate forever (and force the due-walk and
+           next-due walk to scan it every tick). */
+        if (shape == 2)
+            (void)store_queue_delete(srv->store, msgid, k);
     }
     closedir(d);
 }
