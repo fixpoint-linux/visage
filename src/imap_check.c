@@ -474,6 +474,54 @@ static void deliver_test(const char *root) {
     EXPECT(imapd_mbox_name_ok("a..b") == -1, "mbox_name_ok rejects ..");
 }
 
+/* ---- (7b) APPEND uid registration (RFC 4315 APPENDUID) ---- */
+
+static void appenduid_test(const char *root) {
+    ImapdConfig cfg;
+    Mbox mb;
+    char msg[] = "Message-ID: <a1@test>\r\nSubject: a\r\n\r\nbody\r\n";
+    char msg2[] = "Message-ID: <a2@test>\r\nSubject: b\r\n\r\nbody\r\n";
+    uint32_t uv1 = 0, uid1 = 0, uv2 = 0, uid2 = 0, uv3 = 0, uid3 = 0;
+
+    memset(&cfg, 0, sizeof cfg);
+    cfg.root = root;
+    cfg.hostname = "test";
+
+    EXPECT(imapd_mbox_deliver_uid(&cfg, "erin", "Sent", msg, strlen(msg),
+                                  0, NULL, &uv1, &uid1) == 0 &&
+               uid1 == 1 && uv1 > 0,
+           "APPEND registers the first uid");
+    EXPECT(imapd_mbox_deliver_uid(&cfg, "erin", "Sent", msg2, strlen(msg2),
+                                  0, NULL, &uv2, &uid2) == 0 &&
+               uid2 == 2 && uv2 == uv1,
+           "APPEND registers uidnext, uidvalidity stable");
+
+    /* The scan must adopt the registered uids, not hand out fresh ones:
+       that is exactly what a UIDPLUS client relies on. */
+    EXPECT(imapd_mbox_peek(&cfg, "erin", "Sent", &mb) == 0 &&
+               mb.nmsgs == 2 && mb.uidnext == 3 &&
+               mb.msgs[0].uid == 1 && mb.msgs[1].uid == 2 &&
+               mb.uidvalidity == uv1,
+           "registered uids survive the maildir scan");
+    imapd_mbox_close(&mb);
+
+    /* a flagged APPEND (file goes to cur/) is registered the same way */
+    EXPECT(imapd_mbox_deliver_uid(&cfg, "erin", "Sent", msg, strlen(msg),
+                                  IMAIL_SEEN, NULL, &uv3, &uid3) == 0 &&
+               uid3 == 3 && uv3 == uv1,
+           "flagged APPEND registers the uid too");
+
+    /* a rejected delivery must not consume a uid */
+    {
+        char bad[] = "Subject: x\r\n\r\n\x01" "bad\r\n";
+        uint32_t uvb = 1, uidb = 1;
+        EXPECT(imapd_mbox_deliver_uid(&cfg, "erin", "Sent", bad, strlen(bad),
+                                      0, NULL, &uvb, &uidb) == -1 &&
+                   uidb == 0,
+               "APPEND rejects control bytes and reports no uid");
+    }
+}
+
 /* ---- (8) flag rename keeps base + uid ---- */
 
 static void flags_store_test(const char *root) {
@@ -882,6 +930,7 @@ int main(void) {
 
         uidlist_test(root);
         deliver_test(root);
+        appenduid_test(root);
         flags_store_test(root);
         move_copy_test(root);
         mid_index_test(root);

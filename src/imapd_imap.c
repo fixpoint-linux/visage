@@ -1539,7 +1539,6 @@ static void do_append(ImapdServer *srv, Conn *c, const char *tag,
     char *name = NULL, *a1 = NULL, *a2 = NULL;
     size_t nl, a1l, a2l;
     uint8_t flags = 0;
-    char dir[4096];
     if (c->ist == IST_NOT_AUTH) {
         conn_replyf(c, "%s BAD APPEND not allowed now\r\n", tag);
         return;
@@ -1579,13 +1578,49 @@ static void do_append(ImapdServer *srv, Conn *c, const char *tag,
         a1 = a2;
         a1l = a2l;
     }
-    if (imapd_mbox_dir(&srv->cfg, c->user,
-                       ascii_ieq_str(name, "INBOX") ? "INBOX" : name,
-                       dir, sizeof dir) != 0 ||
-        imapd_mbox_deliver(dir, a1, a1l, flags, NULL) != 0) {
-        conn_replyf(c, "%s NO APPEND failed\r\n", tag);
-    } else {
-        conn_replyf(c, "%s OK APPEND completed\r\n", tag);
+    {
+        /* APPEND reports a UID via APPENDUID (RFC 4315).  Registering it
+           needs the target mailbox's uidlist, so drop the in-memory view
+           first when it is the one selected here (its uidmap would otherwise
+           be re-saved on close without the new entry), then rescan below. */
+        const char *box = ascii_ieq_str(name, "INBOX") ? "INBOX" : name;
+        bool selected = (c->ist == IST_SELECTED && c->mb_open && !c->fg &&
+                         strcmp(c->mbname, box) == 0);
+        size_t n_before = selected ? c->mb.nmsgs : 0;
+        uint32_t uv = 0, uid = 0;
+
+        if (selected) {
+            imapd_mbox_close(&c->mb);
+            c->mb_open = false;
+        }
+
+        if (imapd_mbox_deliver_uid(&srv->cfg, c->user, box, a1, a1l,
+                                   flags, NULL, &uv, &uid) != 0) {
+            conn_replyf(c, "%s NO APPEND failed\r\n", tag);
+        } else {
+            if (selected) {
+                if (imapd_mbox_open(&srv->cfg, c->user, c->mbname, &c->mb) != 0) {
+                    /* the view is gone: the client has to SELECT again */
+                    c->ist = IST_AUTH;
+                    c->examine = false;
+                    c->mbname[0] = '\0';
+                } else {
+                    size_t i, recent = 0;
+                    c->mb_open = true;
+                    if (c->mb.nmsgs != n_before) {
+                        for (i = 0; i < c->mb.nmsgs; i++)
+                            if (c->mb.msgs[i].recent) recent++;
+                        conn_replyf(c, "* %zu EXISTS\r\n* %zu RECENT\r\n",
+                                    c->mb.nmsgs, recent);
+                    }
+                }
+            }
+            if (uid > 0)
+                conn_replyf(c, "%s OK [APPENDUID %u %u] APPEND completed\r\n",
+                            tag, uv, uid);
+            else
+                conn_replyf(c, "%s OK APPEND completed\r\n", tag);
+        }
     }
     free(name);
     free(a1);

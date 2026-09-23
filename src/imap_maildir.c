@@ -448,8 +448,13 @@ static int msg_path(const char *dir, const char *sub, const char *base,
     return 0;
 }
 
-int imapd_mbox_deliver(const char *dir, const char *msg, size_t len,
-                       uint8_t flags, const char *unk) {
+/* Shared body of the deliver entry points.  Writes <dir>/tmp/<uniq> then
+   renames into new/ (no flags) or cur/ (with the ":2," info suffix), and
+   copies the maildir base name into base_out when given (so a caller can
+   register a UID for the file).  Returns 0, or -1. */
+static int deliver_file(const char *dir, const char *msg, size_t len,
+                        uint8_t flags, const char *unk,
+                        char *base_out, size_t base_sz) {
     char tmp[4096 + 8], dst[4096 + 64], uniq[128], info[32];
     bool has_flags = (flags != 0) || (unk && unk[0]);
     if (mail_data_has_ctl(msg, len)) return -1;
@@ -477,7 +482,17 @@ int imapd_mbox_deliver(const char *dir, const char *msg, size_t len,
         (void)unlink(tmp);
         return -1;
     }
+    if (base_out && base_sz) {
+        size_t bl = strlen(uniq);
+        if (bl + 1 > base_sz) return -1;
+        memcpy(base_out, uniq, bl + 1);
+    }
     return 0;
+}
+
+int imapd_mbox_deliver(const char *dir, const char *msg, size_t len,
+                       uint8_t flags, const char *unk) {
+    return deliver_file(dir, msg, len, flags, unk, NULL, 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1107,6 +1122,41 @@ static int mbox_register(const ImapdConfig *cfg, const char *user,
     if (uv_out) *uv_out = uidvalidity;
     if (uid_out) *uid_out = uid;
     uidlist_free(v, n);
+    return 0;
+}
+
+/* Deliver msg into mailbox `name` and register a fresh UID for the new file
+   in its uidlist sidecar (an O(1) append, no rescan) so the caller can report
+   APPENDUID (RFC 4315).  On success returns 0 and sets *uv_out and *uid_out; a
+   message that was delivered but whose UID could not be registered returns 0
+   with *uid_out = 0 (the next scan assigns it then).  Returns -1 only when
+   the delivery itself failed.
+
+   The caller must NOT have the same mailbox open in this session: closing
+   that view later would re-save its (older) in-memory uidmap over the entry
+   registered here.  imapd_append closes/reopens the selected view around
+   this call for exactly that reason. */
+int imapd_mbox_deliver_uid(const ImapdConfig *cfg, const char *user,
+                           const char *name, const char *msg, size_t len,
+                           uint8_t flags, const char *unk,
+                           uint32_t *uv_out, uint32_t *uid_out) {
+    char dir[4096], base[128];
+    char *mid;
+    uint32_t uv = 0, uid = 0;
+    if (uv_out) *uv_out = 0;
+    if (uid_out) *uid_out = 0;
+    if (!cfg || !user || !name || !msg) return -1;
+    if (imapd_mbox_dir(cfg, user, name, dir, sizeof dir) != 0) return -1;
+    if (deliver_file(dir, msg, len, flags, unk, base, sizeof base) != 0)
+        return -1;
+    /* The message is durably delivered now; a registration failure below
+       must not turn the APPEND into an error. */
+    mid = imapd_msgid_of_buf(msg, len);
+    if (mbox_register(cfg, user, name, base, mid, &uv, &uid) == 0) {
+        if (uv_out) *uv_out = uv;
+        if (uid_out) *uid_out = uid;
+    }
+    free(mid);
     return 0;
 }
 

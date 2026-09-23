@@ -195,6 +195,27 @@ static void from_domain_test(void) {
     from_domain_case("From: malformed-no-at", NULL, "From malformed");
 }
 
+/* ---- flush: a fatal send error must drain the pending output ---- */
+static void flush_fatal_test(void) {
+    OutboxConn c;
+    memset(&c, 0, sizeof c);
+    /* A bad write end makes send() fail with EBADF: it takes exactly the
+       fatal-error branch a dead peer (EPIPE/ECONNRESET) does, with no socket. */
+    c.fd = -1;
+    c.out = malloc(64);
+    c.out_cap = 64;
+    c.out_len = 32;
+    c.out_off = 0;
+    memcpy(c.out, "220 pending reply that never drains", 32);
+    outbox_conn_flush(&c);
+    /* The reaper only frees a closed conn once out_off >= out_len, and a
+       POLLHUP fd reports writable forever — so a fatal error that left
+       out_len set would spin the poll loop at 100% CPU. */
+    EXPECT(c.closed && c.out_len == 0 && c.out_off == 0,
+           "flush: fatal send error closes the conn and drains its output");
+    free(c.out);
+}
+
 int main(void) {
     b64_roundtrip("b64 decode roundtrip (AUTH PLAIN vector)");
     b64_reject("b64 decode rejects malformed");
@@ -202,6 +223,7 @@ int main(void) {
     domain_policy_test();
     internal_domain_test();
     from_domain_test();
+    flush_fatal_test();
 
     printf("%d checks, %d failures\n", nchecks, nfails);
     return nfails == 0 ? 0 : 1;

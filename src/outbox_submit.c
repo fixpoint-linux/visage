@@ -110,9 +110,15 @@ void outbox_conn_flush(OutboxConn *c) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             c->closed = true;
+            /* Drop the pending output: a dead peer (EPIPE/ECONNRESET) leaves
+               POLLHUP set forever, so poll() reports the fd writable and the
+               main loop would retry this send until the reaper sees
+               out_off >= out_len.  Clearing both lets it be reaped (mirrors
+               the TLS branch above). */
+            c->out_len = c->out_off = 0;
             return;
         }
-        if (n == 0) { c->closed = true; return; }
+        if (n == 0) { c->closed = true; c->out_len = c->out_off = 0; return; }
         c->out_off += (size_t)n;
     }
     c->out_len = c->out_off = 0;

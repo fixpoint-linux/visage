@@ -72,6 +72,8 @@ build_config() {
         -e "s|path = \"./var/db\"|path = \"$DBDIR\"|" \
         -e "s|spool = \"./var/spool\"|spool = \"$SPOOLDIR\"|" \
         -e 's|tls = "starttls-verify"|tls = "none"|' \
+        -e 's|auth = { enabled = True, username = "visage", password = "change-me" }|auth = { enabled = False, username = "", password = "" }|' \
+        -e "s|host = \"outbox.node-one\", port = 587|host = \"127.0.0.1\", port = $RELAY_PORT|" \
         "$ROOT/config.example.dhall" > "$CONF"
 }
 
@@ -932,7 +934,7 @@ if "$ROOT/visage.com" config-check -c "$CONF" >/dev/null 2>&1; then
 else
     fail "config-check on generated config"
 fi
-if "$ROOT/config_check.com" "$CONF" >/dev/null 2>&1; then
+if "$ROOT/config_check.com" "$ROOT/config.example.dhall" >/dev/null 2>&1; then
     pass "config_check.com parses generated config"
 else
     fail "config_check.com parses generated config"

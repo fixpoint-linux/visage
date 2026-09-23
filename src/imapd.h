@@ -372,6 +372,17 @@ int imapd_mbox_delete(const char *dir);
 int imapd_mbox_deliver(const char *dir, const char *msg, size_t len,
                        uint8_t flags, const char *unk);
 
+/* Deliver msg into mailbox `name` and register a fresh UID for the new file
+   in the uidlist sidecar so APPEND can report APPENDUID (RFC 4315).  On
+   success returns 0 and sets *uv_out and *uid_out; a delivered message whose UID
+   could not be registered returns 0 with *uid_out = 0.  Returns -1 only when
+   the delivery failed.  The caller must not have the same mailbox open in
+   this session (close/reopen it around this call). */
+int imapd_mbox_deliver_uid(const ImapdConfig *cfg, const char *user,
+                           const char *name, const char *msg, size_t len,
+                           uint8_t flags, const char *unk,
+                           uint32_t *uv_out, uint32_t *uid_out);
+
 /* Scan the mailbox into mb (assigning UIDs to new files via the uidlist
    sidecar, pruning vanished entries).  When move_new is true, files still
    in new/ are moved to cur/ and flagged \Recent for this session (SELECT
