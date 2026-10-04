@@ -100,7 +100,7 @@ fails the build. All binaries are plain glibc ELFs linked with `cc` (no APE/cosm
 
 ```sh
 git submodule update --init --recursive   # first checkout: fetch all vendored submodules
-# build libdatalog.so + libdhall.so once in the sibling checkouts (see their READMEs)
+# build libdatalog.so in the sibling ../datalog-dafsa checkout (see its README)
 ./vendor/dhake/dhake.com                  # default target `all`: visage.com + all *_check tools + tests
 ./vendor/dhake/dhake.com visage.com       # build one binary
 ./vendor/dhake/dhake.com e2e              # host integration tests (tests/run.sh)
@@ -109,6 +109,22 @@ git submodule update --init --recursive   # first checkout: fetch all vendored s
 ./vendor/dhake/dhake.com --verify         # CI pre-flight: check pinned hashes + up-to-dateness
 ./vendor/dhake/dhake.com --list           # list all targets
 ```
+
+`libdhall.so` is built by this Dhakefile (Zig port in `../dhall-c/zig/src`, pinned as a
+target); `libdatalog.so` comes from the sibling `../datalog-dafsa` checkout. Both are
+linked dynamically, and every linked target carries **two** rpaths: the build-tree `.so`
+directory and `$ORIGIN/lib`. So the same artifact runs straight from the checkout
+(`dhake e2e`) and from an install layout that puts the engines next to the binary:
+
+```sh
+install -m 0755 visage.com                 <prefix>/visage-elf
+install -m 0644 ../dhall-c/zig-out/lib/libdhall.so     <prefix>/lib/
+install -m 0644 ../datalog-dafsa/zig-out/lib/libdatalog.so  <prefix>/lib/
+```
+
+No `LD_LIBRARY_PATH` is needed in either case. Install the `libdatalog.so` the build
+pinned (`dhake --verify` checks it) — the engine is a build input, so running a
+different one than the artifact was linked against is drift.
 
 When a pinned hash goes stale (source or toolchain changed), rebuild with
 `./vendor/dhake/dhake.com --warn-hash-mismatch TARGET` to print the new hashes, then regenerate

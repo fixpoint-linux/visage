@@ -6,6 +6,10 @@ Builds a single Dhakefile.dhall that:
   - builds all C binaries with host `cc`: the datalog/dhall-linking daemons and
     check tools against the Zig-built libdatalog.so + libdhall.so (glibc dynamic
     ELFs), the standalone mbedTLS check tools as plain ELFs (no APE/cosmocc)
+  - builds libdhall.so itself (Zig engine) and links every dhall/datalog target
+    with BOTH the build-tree `.so` dir and a `$ORIGIN/lib` rpath, so the same
+    artifact runs from the checkout and from an install layout that puts the
+    engines in <prefix>/lib next to the binary
   - builds the Elm MFE docs site
 Every non-phony output pins `hash` (expected sha256) and every input source
 pins `depsHash`.  Run `dhake --warn-hash-mismatch` to (re)capture actual output
@@ -137,6 +141,17 @@ mbtls_objs_join = " ".join(mbtls_objs)
 def link_cmd(out, srcs, extra_flags=""):
     return f"cc {CCFLAGS} {extra_flags} -o {out} {' '.join(srcs)}"
 
+# --- runtime library search path ---------------------------------------------
+# A deployment lays both engine .so files out under <prefix>/lib next to the
+# binary (e.g. /opt/visage/visage-elf + /opt/visage/lib/libdatalog.so and
+# libdhall.so), so every dynamically-linked target also carries a $ORIGIN/lib
+# rpath.  It is appended AFTER the build-tree path: a local run (`dhake e2e`)
+# resolves the engines from the sibling checkouts, and an installed copy
+# resolves them from its own lib/ with no LD_LIBRARY_PATH.  Single-quoted so the
+# $ORIGIN token reaches the linker instead of being expanded (to nothing) by the
+# recipe shell.
+DEPLOY_RPATH = "-Wl,-rpath,'$ORIGIN/lib'"
+
 # --- datalog targets: host `cc` + Zig-built libdatalog.so ---
 # Every target that links the datalog-dafsa engine uses the Zig-built glibc
 # libdatalog.so in the sibling ../datalog-dafsa checkout instead of compiling
@@ -146,7 +161,7 @@ def link_cmd(out, srcs, extra_flags=""):
 # the dl_*/dafsa_* ABI); only the vendored C engine sources are dropped from
 # deps/recipe/depsHash.
 DATALOG_SO_DIR = os.path.abspath(os.path.join(ROOT, "..", "datalog-dafsa", "zig-out", "lib"))
-DLOG_LINK = f"-L {DATALOG_SO_DIR} -ldatalog -Wl,-rpath,{DATALOG_SO_DIR}"
+DLOG_LINK = f"-L {DATALOG_SO_DIR} -ldatalog -Wl,-rpath,{DATALOG_SO_DIR} {DEPLOY_RPATH}"
 
 def cc_link_datalog(out, srcs, extra_flags=""):
     return f"cc {CCFLAGS} {extra_flags} -o {out} {' '.join(srcs)} {DLOG_LINK}"
@@ -166,7 +181,7 @@ DATALOG_SO = os.path.join(DATALOG_SO_DIR, "libdatalog.so")
 DHALL_SRC_DIR = os.path.abspath(os.path.join(ROOT, "..", "dhall-c", "zig", "src"))
 DHALL_SO_DIR  = os.path.abspath(os.path.join(ROOT, "..", "dhall-c", "zig-out", "lib"))
 DHALL_SO      = os.path.join(DHALL_SO_DIR, "libdhall.so")
-DHALL_LINK    = f"-L {DHALL_SO_DIR} -ldhall -Wl,-rpath,{DHALL_SO_DIR}"
+DHALL_LINK    = f"-L {DHALL_SO_DIR} -ldhall -Wl,-rpath,{DHALL_SO_DIR} {DEPLOY_RPATH}"
 
 # abi.zig's transitive import closure (abi -> dhall/arena/ast/parser/normalize/
 # import/sha256/typecheck, and their own imports).  Pinned so an engine-source
