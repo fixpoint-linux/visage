@@ -1474,6 +1474,33 @@ static void do_mail(Server *srv, Conn *c, const char *rest) {
     conn_reply(c, "250 2.1.0 OK\r\n");
 }
 
+/* A refused RCPT otherwise leaves no trace at all: the client gets a 550 and
+   the daemon forgets it, so a message rejected for an unknown alias is
+   indistinguishable after the fact from one that never arrived.  Log the
+   recipient, the reverse-path (or the peer address when the reverse-path is
+   the null path) and a status, on the same msgid counter the message flow
+   uses so refusals sort chronologically with deliveries. */
+static void log_rcpt_reject(Server *srv, Conn *c, const char *rcpt,
+                            const char *status) {
+    char peer[INET6_ADDRSTRLEN];
+    const char *remote = c->from;
+    uint32_t msgid = store_next_msgid(srv->store);
+
+    if (!remote || !remote[0]) {
+        const unsigned char *ip = c->peer_ip_len ? c->peer_ip : c->real_ip;
+        uint8_t iplen = c->peer_ip_len ? c->peer_ip_len : c->real_ip_len;
+
+        if (ip && iplen &&
+            inet_ntop(iplen == 4 ? AF_INET : AF_INET6, ip, peer, sizeof peer))
+            remote = peer;
+        else
+            remote = "<>";
+    }
+    if (msgid == 0) return;   /* counter wrapped: never log under a shared id */
+    (void)store_log_add(srv->store, msgid, (uint32_t)time(NULL), LOG_DIR_IN,
+                        rcpt, remote, status);
+}
+
 static void do_rcpt(Server *srv, Conn *c, const char *rest) {
     char path[SMTP_MAX_LINE];
     const char *params = NULL;
@@ -1523,9 +1550,11 @@ static void do_rcpt(Server *srv, Conn *c, const char *rest) {
         conn_reply(c, "250 2.1.5 OK\r\n");
         break;
     case RCPT_ERR:
+        log_rcpt_reject(srv, c, path, "error");
         conn_reply(c, "451 4.3.0 Temporary routing failure\r\n");
         break;
     default:
+        log_rcpt_reject(srv, c, path, "rejected");
         conn_reply(c, "550 5.1.1 User unknown\r\n");
         break;
     }
