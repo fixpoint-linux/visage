@@ -107,6 +107,12 @@ int store_log_add(Store *s, uint32_t msgid, uint32_t ts, uint32_t dir,
 /* Number of log facts.  Returns -1 on error. */
 long store_log_count(Store *s);
 
+/* Delete every log row whose ts (cols[1]) is at least LOG_RETENTION_SEC
+ * (store.c, 30 days) behind `now` — called by the hourly sweep.  Pruning
+ * reclaims ROW storage only: the interned local/remote/status strings are
+ * never reclaimed (the interner is append-only).  Returns 0 on success. */
+int store_log_expire(Store *s, uint32_t now);
+
 /* A single log entry (one log fact).  Strings are heap-allocated and owned by
  * the array returned from store_log_recent. */
 typedef struct {

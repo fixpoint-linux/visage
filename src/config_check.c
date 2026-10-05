@@ -188,7 +188,7 @@ int main(int argc, char **argv) {
         printf("\n");
     }
     printf("http:              %s:%u\n", cfg.http.address, cfg.http.port);
-    printf("admin:             token=%s\n", cfg.admin.token);
+    printf("admin:             token=<%zu chars>\n", strlen(cfg.admin.token));
     printf("dkim (%zu):\n", cfg.ndkim);
     for (size_t i = 0; i < cfg.ndkim; i++)
         printf("  domain=%s selector=%s private_key=%s\n",

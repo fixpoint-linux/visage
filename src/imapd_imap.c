@@ -260,9 +260,15 @@ static void conn_flush(Conn *c) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             c->closed = true;
+            /* Drop the pending output: a dead peer (EPIPE/ECONNRESET) leaves
+               POLLHUP set forever, so poll() reports the fd writable and the
+               main loop would retry this send until the reaper sees
+               out_off >= out_len.  Clearing both lets it be reaped (mirrors
+               the TLS branch above). */
+            c->out_len = c->out_off = 0;
             return;
         }
-        if (n == 0) { c->closed = true; return; }
+        if (n == 0) { c->closed = true; c->out_len = c->out_off = 0; return; }
         c->out_off += (size_t)n;
     }
     c->out_len = c->out_off = 0;
@@ -1563,7 +1569,11 @@ static void do_status(ImapdServer *srv, Conn *c, const char *tag,
         return;
     }
     if (imapd_mbox_peek(&srv->cfg, c->user, name, &mb) != 0) {
-        conn_replyf(c, "%s NO Mailbox doesn't exist: %s\r\n", tag, name);
+        /* Strip CR/LF so the raw name can't smuggle protocol bytes into
+           the untagged reply (same scrub do_select applies). */
+        char clean[IMAPD_MAX_MBOX + 1];
+        imapd_clean_reply_name(name, clean, sizeof clean);
+        conn_replyf(c, "%s NO Mailbox doesn't exist: %s\r\n", tag, clean);
         for (i = 0; i < nitems; i++) free(items[i]);
         free(items);
         free(name);
@@ -3274,6 +3284,19 @@ static void do_fetch(ImapdServer *srv, Conn *c, const char *tag,
 
 static void dispatch(ImapdServer *srv, Conn *c);
 
+/* Total byte budget for one assembled command (all {n} literals combined).
+   A legitimate APPEND carries one max-size literal, which the reader's
+   quote/backslash wrapping can double, plus a full command line of
+   overhead — so the budget is 2*max_msg + slack.  Without it a client
+   could stream unlimited literals into one command and grow c->cmd to
+   exhaustion. */
+#define IMAPD_CMD_SLACK 1024
+static int cmd_over_budget(const ImapdServer *srv, const Conn *c,
+                           size_t more) {
+    return (uint64_t)c->cmd_len + (uint64_t)more >
+           2 * (uint64_t)srv->cfg.max_msg + IMAPD_CMD_SLACK;
+}
+
 /* Assemble complete commands (collecting {n} literals) and dispatch them. */
 static void imap_process(ImapdServer *srv, Conn *c, time_t now) {
     (void)now;
@@ -3286,6 +3309,8 @@ static void imap_process(ImapdServer *srv, Conn *c, time_t now) {
             size_t take;
             size_t k = 0;
             take = c->in_len < c->lit_left ? c->in_len : c->lit_left;
+            if (cmd_over_budget(srv, c, 2 * take + 1))
+                goto cmd_toobig;   /* closing quote included in the +1 */
             while (k < take) {
                 char ch = c->in[k];
                 if (ch == '"' || ch == '\\') {
@@ -3359,6 +3384,11 @@ static void imap_process(ImapdServer *srv, Conn *c, time_t now) {
                         free(line);
                         return;
                     }
+                    if (cmd_over_budget(srv, c,
+                                        2 * (size_t)sz + strlen(line) + 2)) {
+                        free(line);
+                        goto cmd_toobig;
+                    }
                     while (mstart > 0 && line[mstart] != '{') mstart--;
                     line[mstart] = '\0';   /* strip the {n[+]} marker */
                     if (buf_append(&c->cmd, &c->cmd_len, &c->cmd_cap,
@@ -3375,6 +3405,10 @@ static void imap_process(ImapdServer *srv, Conn *c, time_t now) {
                     continue;
                 }
             }
+            if (cmd_over_budget(srv, c, strlen(line) + 1)) {
+                free(line);
+                goto cmd_toobig;
+            }
             if (buf_append(&c->cmd, &c->cmd_len, &c->cmd_cap,
                            line, strlen(line)) != 0) {
                 free(line);
@@ -3385,6 +3419,14 @@ static void imap_process(ImapdServer *srv, Conn *c, time_t now) {
             /* dispatch resets c->cmd */
         }
     }
+cmd_toobig:
+    conn_reply(c, "* BYE command too large\r\n");
+    c->closed = true;
+    free(c->cmd);
+    c->cmd = NULL;
+    c->cmd_len = 0;
+    c->cmd_cap = 0;
+    return;
 oom:
     conn_reply(c, "* BYE out of memory\r\n");
     c->closed = true;
@@ -3468,8 +3510,8 @@ static void dispatch(ImapdServer *srv, Conn *c) {
     }
     while (*p == ' ') p++;
 
-    imapd_dbg("CMD user=%s tag=%s word=%s rest=%s",
-              c->user ? c->user : "(preauth)", tag, word, p);
+    imapd_dbg("CMD user=%s tag=%s word=%s",
+              c->user ? c->user : "(preauth)", tag, word);
 
     if (ascii_ieq_str(word, "CAPABILITY")) {
         conn_replyf(c, "* CAPABILITY %s\r\n", cap_of(srv, c));

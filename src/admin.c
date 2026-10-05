@@ -18,6 +18,7 @@
 #include "visage.h"
 #include "json.h"
 #include "http_parse.h"
+#include "mail.h"
 
 #include <string.h>
 
@@ -125,18 +126,19 @@ static int parse_request_line(const char *req, size_t reqlen,
 }
 
 /* Constant-time equality of `supplied` against the configured `token`.
-   The loop bound is the FIXED secret length, so runtime is independent of the
-   supplied token's value; `supplied[i]` is only ever read while i < strlen(supplied)
-   (never past its NUL), and a length mismatch is folded into d so both shorter and
-   longer supplied tokens are rejected without any over-read.  No early exit. */
+   One uniform loop over max(ns, nc) bytes, padding the shorter side with 0
+   (port of the ct_equal implementations in imap_maildir.c / outbox_auth.c),
+   so runtime reveals neither the token value nor its length.  No early exit. */
 static int token_eq_ct(const char *supplied, const char *configured) {
     size_t ns = strlen(supplied);
     size_t nc = strlen(configured);
+    volatile unsigned char d = 0;
+    size_t n = ns > nc ? ns : nc;
     size_t i;
-    unsigned char d = (ns == nc) ? 0 : 1;
-    for (i = 0; i < nc; i++) {
+    for (i = 0; i < n; i++) {
         unsigned char ac = (i < ns) ? (unsigned char)supplied[i] : 0u;
-        d |= (unsigned char)(ac ^ (unsigned char)configured[i]);
+        unsigned char bc = (i < nc) ? (unsigned char)configured[i] : 0u;
+        d = (unsigned char)(d | (unsigned char)(ac ^ bc));
     }
     return d == 0;
 }
@@ -262,6 +264,21 @@ static void handle_alias(const Config *cfg, Store *s, AdminResp *r, int rm,
         json_obj_get_str(body, "destination", dest, sizeof dest) != 0) {
         ar_err(r, 400, "Bad Request", "expected {\"alias\",\"destination\"}");
         return;
+    }
+
+    /* Shape-validate both addresses before they reach the store (mail_addr_parse
+       is the same validator the SMTP/ingest paths apply).  Add-only: a row that
+       fails the parse (legacy/malformed) must still be deletable, so the rm
+       path skips validation and goes straight to store_alias_rm. */
+    if (!rm) {
+        char *al = NULL, *ad = NULL, *dl = NULL, *dd = NULL;
+        int ok = mail_addr_parse(alias, &al, &ad) == 0 &&
+                 mail_addr_parse(dest, &dl, &dd) == 0;
+        free(al); free(ad); free(dl); free(dd);
+        if (!ok) {
+            ar_err(r, 400, "Bad Request", "alias and destination must be valid mail addresses");
+            return;
+        }
     }
 
     if (config_alias_read_only(cfg, alias)) {

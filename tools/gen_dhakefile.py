@@ -271,14 +271,14 @@ T.append(target("smtp_check.com",
           + MBEDTLS_SRC + [DATA_CACERT, MBEDTLS_CONFIG, DATALOG_SO, DHALL_SO]))
 T.append(target("http_check.com",
     deps=["src/http_parse.c","src/http_check.c","src/http_parse.h","src/admin.c",
-          "src/store.c","src/json.c","src/config.c","src/visage.h","src/config.h",
+          "src/store.c","src/json.c","src/config.c","src/mail.c","src/visage.h","src/config.h",
           "src/store.h","src/json.h"] + [DATA_ADMIN, DHALL_SO],
     recipe=[cc_link_dhall_datalog("http_check.com", ["src/admin.c","src/http_parse.c","src/store.c",
-                "src/json.c","src/config.c","src/http_check.c"]
+                "src/json.c","src/config.c","src/mail.c","src/http_check.c"]
                 + [DATA_ADMIN])],
     out="http_check.com",
     hash_srcs=["src/http_parse.c","src/http_check.c","src/http_parse.h","src/admin.c",
-          "src/store.c","src/json.c","src/config.c","src/visage.h","src/config.h",
+          "src/store.c","src/json.c","src/config.c","src/mail.c","src/visage.h","src/config.h",
           "src/store.h","src/json.h"] + [DATA_ADMIN, DATALOG_SO, DHALL_SO]))
 T.append(target("dkim_check.com",
     deps=[STAMP] + ["src/dkim.c","src/dkim_check.c","src/dkim.h", MBEDTLS_CONFIG],

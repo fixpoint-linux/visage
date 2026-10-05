@@ -231,6 +231,14 @@ static void http_process(HttpConn *c) {
     }
 
     /* Full request buffered. */
+    /* One request per connection (Connection: close), so anything past
+       header_end + body_len is a pipelined/garbage tail: reject rather than
+       let it leak into the JSON body parser. */
+    if (c->recv_len != header_end + body_len) {
+        http_respond_err(c, 400, "Bad Request",
+                         "body does not match Content-Length");
+        return;
+    }
     c->header_end = header_end;
     c->body_len = body_len;
     c->recv[c->recv_len] = '\0';

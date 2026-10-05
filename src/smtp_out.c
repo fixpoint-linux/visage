@@ -867,26 +867,34 @@ static int smtp_auth_plain(SmtpConn *conn, uint32_t tmo,
     *w++ = '\0';
     memcpy(w, p, plen); w += plen;
 
+    /* Wipe credential-bearing plaintext on every exit path below
+       (explicit_bzero is not elided by the compiler, unlike memset-before-free). */
+
     size_t b64cap = ((plainlen + 2) / 3) * 4;
     char *b64 = malloc(b64cap + 1);
     if (!b64) {
+        explicit_bzero(plain, plainlen);
         free(plain);
         set_status(status_out, status_sz, "out of memory");
         return SMTP_ERROR;
     }
     size_t elen = 0;
     if (smtp_b64_encode(plain, plainlen, b64, b64cap + 1, &elen) != 0) {
+        explicit_bzero(plain, plainlen);
         free(plain);
+        explicit_bzero(b64, b64cap + 1);
         free(b64);
         set_status(status_out, status_sz, "base64 encode failed");
         return SMTP_ERROR;
     }
+    explicit_bzero(plain, plainlen);
     free(plain);
 
     /* (a) single-line form: "AUTH PLAIN " (11 bytes) + encoded + CRLF */
     size_t cmdlen = 11 + elen + 2;
     char *cmd = malloc(cmdlen + 1);
     if (!cmd) {
+        explicit_bzero(b64, elen);
         free(b64);
         set_status(status_out, status_sz, "out of memory");
         return SMTP_ERROR;
@@ -898,8 +906,10 @@ static int smtp_auth_plain(SmtpConn *conn, uint32_t tmo,
 
     int code = 0;
     int r = smtp_exchange(conn, tmo, cmd, &code, status_out, status_sz);
+    explicit_bzero(cmd, cmdlen);
     free(cmd);
     if (r != 0) {
+        explicit_bzero(b64, elen);
         free(b64);
         return SMTP_TEMPFAIL;
     }
@@ -913,6 +923,7 @@ static int smtp_auth_plain(SmtpConn *conn, uint32_t tmo,
         size_t resplen = elen + 2;
         char *resp = malloc(resplen + 1);
         if (!resp) {
+            explicit_bzero(b64, elen);
             free(b64);
             set_status(status_out, status_sz, "out of memory");
             return SMTP_ERROR;
@@ -920,14 +931,17 @@ static int smtp_auth_plain(SmtpConn *conn, uint32_t tmo,
         memcpy(resp, b64, elen);
         memcpy(resp + elen, "\r\n", 2);
         resp[resplen] = '\0';
+        explicit_bzero(b64, elen);
         free(b64);
 
         r = smtp_exchange(conn, tmo, resp, &code, status_out, status_sz);
+        explicit_bzero(resp, resplen);
         free(resp);
         if (r != 0) return SMTP_TEMPFAIL;
         return smtp_auth_class(code);
     }
 
+    explicit_bzero(b64, elen);
     free(b64);
     return smtp_auth_class(code);
 }

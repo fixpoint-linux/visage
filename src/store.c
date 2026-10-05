@@ -621,6 +621,64 @@ int store_log_add(Store *s, uint32_t msgid, uint32_t ts, uint32_t dir,
     return VISAGE_OK;
 }
 
+/* Log rows older than this are pruned by the hourly sweep: the /log audit
+ * history keeps this window, older rows are deleted.  Matches the revmap TTL
+ * (same 30-day generosity). */
+#define LOG_RETENTION_SEC (30u * 24u * 3600u)
+
+/* Collect-then-mutate walk for the log sweep: collect the full 6-col tuple of
+   every row, then dl_delete_fact the expired ones AFTER the walk returns.
+   (dafsa add/delete realloc the states array, so mutating inside the
+   dl_prefix walk would be a use-after-free — same pattern as
+   store_revmap_expire.)  NOTE: deleting rows frees ROW storage only; the
+   interned local/remote/status strings are NOT reclaimed (the interner is
+   append-only and has no unintern API). */
+typedef struct {
+    uint32_t (*rows)[6];
+    size_t    n, cap;
+    int       err;
+} LogExpireCtx;
+
+static int log_expire_cb(const uint32_t *cols, uint8_t arity, void *user) {
+    LogExpireCtx *c = (LogExpireCtx *)user;
+    (void)arity;
+    if (c->n == c->cap) {
+        size_t nc = c->cap ? c->cap * 2 : 16;
+        uint32_t (*na)[6] = realloc(c->rows, nc * sizeof *na);
+        if (!na) { c->err = 1; return 1; }
+        c->rows = na;
+        c->cap = nc;
+    }
+    memcpy(c->rows[c->n], cols, sizeof(uint32_t) * 6);
+    c->n++;
+    return 0;
+}
+
+int store_log_expire(Store *s, uint32_t now) {
+    LogExpireCtx c;
+    long n;
+    size_t i;
+
+    if (!s || !s->db) return VISAGE_EPARAM;
+
+    memset(&c, 0, sizeof c);
+    n = dl_prefix(s->db, REL_LOG, NULL, 0, log_expire_cb, &c);
+    if (n < 0 || c.err) {
+        free(c.rows);
+        return c.err ? VISAGE_ENOMEM : VISAGE_ESTORE;
+    }
+
+    for (i = 0; i < c.n; i++) {
+        /* Signed age: a backward clock step (ts slightly in the future)
+           must not read as a huge unsigned age and wipe the audit history. */
+        long age = (long)now - (long)c.rows[i][1];
+        if (age >= 0 && (uint32_t)age >= LOG_RETENTION_SEC)
+            (void)dl_delete_fact(s->db, REL_LOG, c.rows[i], AR_LOG);
+    }
+    free(c.rows);
+    return VISAGE_OK;
+}
+
 long store_log_count(Store *s) {
     CountCtx cc = {0};
     if (!s || !s->db) return -1;

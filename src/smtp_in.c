@@ -449,9 +449,15 @@ static void conn_flush(Conn *c) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             c->closed = true;
+            /* Drop the pending output: a dead peer (EPIPE/ECONNRESET) leaves
+               POLLHUP set forever, so poll() reports the fd writable and the
+               main loop would retry this send until the reaper sees
+               out_off >= out_len.  Clearing both lets it be reaped (mirrors
+               the TLS branch above). */
+            c->out_len = c->out_off = 0;
             return;
         }
-        if (n == 0) { c->closed = true; return; }
+        if (n == 0) { c->closed = true; c->out_len = c->out_off = 0; return; }
         c->out_off += (size_t)n;
     }
     c->out_len = c->out_off = 0;
@@ -1225,6 +1231,8 @@ static void deliver_message(Server *srv, Conn *c, time_t now) {
         size_t hl = strlen(auth_hdr);
         char *nm = malloc(hl + msglen + 1);
         if (nm) {
+            char *old = c->data;   /* == msg: msg came from c->data at entry
+                                      and is not reassigned until below */
             memcpy(nm, auth_hdr, hl);
             memcpy(nm + hl, msg, msglen);
             nm[hl + msglen] = '\0';
@@ -1232,6 +1240,8 @@ static void deliver_message(Server *srv, Conn *c, time_t now) {
             msglen = hl + msglen;
             c->data = msg;   /* forwarding uses c->data */
             c->data_len = msglen;
+            free(old);   /* conn_reset frees only the (new) c->data; without
+                            this the original body leaks per message */
         }
     }
 
@@ -2226,10 +2236,12 @@ static void server_poll(Server *srv) {
            when nothing is due (full walk, filtered). */
         queue_redrive(srv);
 
-        /* Hourly sweep: expire stale reply-token reverse-map rows and GC old
-           spool bodies. */
+        /* Hourly sweep: expire stale reply-token reverse-map rows, prune the
+           delivery/reject log past its retention window, and GC old spool
+           bodies. */
         if (now >= srv->next_revmap_sweep) {
             (void)store_revmap_expire(srv->store, (uint32_t)now);
+            (void)store_log_expire(srv->store, (uint32_t)now);
             srv->next_revmap_sweep = now + 3600;
         }
         if (now >= srv->next_spool_sweep) {
@@ -2438,6 +2450,10 @@ int smtp_in_main(const Config *c, const Store *s) {
     /* Expire stale reverse-map rows now so a long-dormant process never keeps
        leaked reply tokens alive. */
     (void)store_revmap_expire((Store *)s, (uint32_t)time(NULL));
+    /* Prune the delivery/reject log past its retention window at startup too
+       (an hourly cadence otherwise leaves a month of backlog unpruned until
+       the first sweep fires). */
+    (void)store_log_expire((Store *)s, (uint32_t)time(NULL));
     /* GC old spool bodies at startup (also fixes the inbound <msgid>.eml
        leak: those copies are never queue-referenced). */
     spool_gc(&srv);
