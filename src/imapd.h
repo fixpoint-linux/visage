@@ -140,7 +140,8 @@ typedef struct Mbox {
 typedef enum {
     SK_ALL, SK_ANSWERED, SK_DELETED, SK_DRAFT, SK_FLAGGED, SK_NEW, SK_OLD,
     SK_RECENT, SK_SEEN, SK_UNSEEN, SK_SEQ, SK_UID, SK_FROM, SK_TO, SK_SUBJECT,
-    SK_HEADER, SK_BODY, SK_TEXT, SK_NOT, SK_OR, SK_AND,
+    SK_CC, SK_BCC, SK_HEADER, SK_BODY, SK_TEXT, SK_NOT, SK_OR, SK_AND,
+    SK_LARGER, SK_SMALLER, SK_KEYWORD, SK_UNKEYWORD, SK_MODSEQ,
     SK_SINCE, SK_BEFORE, SK_ON, SK_SENTSINCE, SK_SENTBEFORE, SK_SENTON
 } SearchKind;
 
@@ -148,7 +149,9 @@ typedef struct SearchKey {
     SearchKind kind;
     char      *set;   /* SK_SEQ / SK_UID: seq-set spec (owned) */
     char      *hdr;   /* SK_HEADER: header name (owned) */
-    char      *str;   /* FROM/TO/SUBJECT/HEADER/BODY/TEXT needle (owned) */
+    char      *str;   /* FROM/TO/CC/BCC/SUBJECT/HEADER/BODY/TEXT needle,
+                         SK_KEYWORD/UNKEYWORD keyword (owned) */
+    unsigned long long num;  /* LARGER/SMALLER/MODSEQ threshold */
     time_t     date;  /* SK_SINCE/ON/BEFORE/SENT*: midnight-UTC of the date */
     struct SearchKey *a, *b;  /* NOT(a) / OR(a,b) / AND(a,b) */
 } SearchKey;

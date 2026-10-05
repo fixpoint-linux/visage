@@ -549,6 +549,10 @@ static int imapd_search_parse_depth(const char **p, SearchKey **out,
         k = sk_new(SK_FROM);
     } else if (ascii_ieq_str(tok, "TO")) {
         k = sk_new(SK_TO);
+    } else if (ascii_ieq_str(tok, "CC")) {
+        k = sk_new(SK_CC);
+    } else if (ascii_ieq_str(tok, "BCC")) {
+        k = sk_new(SK_BCC);
     } else if (ascii_ieq_str(tok, "SUBJECT")) {
         k = sk_new(SK_SUBJECT);
     } else if (ascii_ieq_str(tok, "BODY")) {
@@ -557,6 +561,16 @@ static int imapd_search_parse_depth(const char **p, SearchKey **out,
         k = sk_new(SK_TEXT);
     } else if (ascii_ieq_str(tok, "HEADER")) {
         k = sk_new(SK_HEADER);
+    } else if (ascii_ieq_str(tok, "LARGER")) {
+        k = sk_new(SK_LARGER);
+    } else if (ascii_ieq_str(tok, "SMALLER")) {
+        k = sk_new(SK_SMALLER);
+    } else if (ascii_ieq_str(tok, "KEYWORD")) {
+        k = sk_new(SK_KEYWORD);
+    } else if (ascii_ieq_str(tok, "UNKEYWORD")) {
+        k = sk_new(SK_UNKEYWORD);
+    } else if (ascii_ieq_str(tok, "MODSEQ")) {
+        k = sk_new(SK_MODSEQ);
     } else if (ascii_ieq_str(tok, "SINCE")) {
         k = sk_new(SK_SINCE);
     } else if (ascii_ieq_str(tok, "BEFORE")) {
@@ -596,9 +610,13 @@ static int imapd_search_parse_depth(const char **p, SearchKey **out,
     }
     case SK_FROM:
     case SK_TO:
+    case SK_CC:
+    case SK_BCC:
     case SK_SUBJECT:
     case SK_BODY:
-    case SK_TEXT: {
+    case SK_TEXT:
+    case SK_KEYWORD:
+    case SK_UNKEYWORD: {
         char *str = NULL;
         size_t slen;
         r = imapd_next_astring(p, &str, &slen);
@@ -609,6 +627,32 @@ static int imapd_search_parse_depth(const char **p, SearchKey **out,
             return -1;
         }
         k->str = str;
+        break;
+    }
+    case SK_LARGER:
+    case SK_SMALLER:
+    case SK_MODSEQ: {
+        /* A bare number (no quoting in practice); reject anything else rather
+           than silently matching the whole mailbox. */
+        char *ns = NULL;
+        char *end = NULL;
+        size_t nl;
+        r = imapd_next_astring(p, &ns, &nl);
+        if (r != 1 || !ns || ns[0] == '\0') {
+            free(ns);
+            imapd_search_free(k);
+            free(tok);
+            return -1;
+        }
+        errno = 0;
+        k->num = strtoull(ns, &end, 10);
+        if (errno != 0 || !end || *end != '\0') {
+            free(ns);
+            imapd_search_free(k);
+            free(tok);
+            return -1;
+        }
+        free(ns);
         break;
     }
     case SK_HEADER: {
@@ -751,7 +795,8 @@ bool imapd_search_needs_body(const SearchKey *k) {
 static bool imapd_search_needs_hdr(const SearchKey *k) {
     if (!k) return false;
     switch (k->kind) {
-    case SK_FROM: case SK_TO: case SK_SUBJECT: case SK_HEADER:
+    case SK_FROM: case SK_TO: case SK_CC: case SK_BCC: case SK_SUBJECT:
+    case SK_HEADER:
         return true;
     case SK_BODY: case SK_TEXT:
         return true;   /* full body: caller will use the whole message */
@@ -775,7 +820,8 @@ static bool imapd_search_only_msgid(const SearchKey *k) {
     switch (k->kind) {
     case SK_HEADER:
         return k->hdr && ascii_ieq_str(k->hdr, "Message-ID");
-    case SK_FROM: case SK_TO: case SK_SUBJECT: case SK_BODY: case SK_TEXT:
+    case SK_FROM: case SK_TO: case SK_CC: case SK_BCC: case SK_SUBJECT:
+    case SK_BODY: case SK_TEXT:
         return false;
     case SK_NOT:
         return imapd_search_only_msgid(k->a);
@@ -801,6 +847,40 @@ static size_t msg_hdr_end(const char *msg, size_t len) {
     return len;
 }
 
+/* Header a string key reads (SK_HEADER carries its own name). */
+static const char *search_hdr_name(const SearchKey *k) {
+    switch (k->kind) {
+    case SK_FROM:    return "From";
+    case SK_TO:      return "To";
+    case SK_CC:      return "Cc";
+    case SK_BCC:     return "Bcc";
+    case SK_SUBJECT: return "Subject";
+    default:         return k->hdr;
+    }
+}
+
+/* KEYWORD/UNKEYWORD: match a system flag name (with or without the leading
+   backslash) or one of the preserved unknown maildir flag letters.  Maildir
+   carries single-letter keywords only, so a "$Forwarded"-style name can never
+   match here. */
+static bool search_keyword_match(const Imail *m, const char *kw) {
+    static const struct { uint8_t bit; const char *nm; } tab[] = {
+        { IMAIL_ANSWERED, "Answered" },
+        { IMAIL_FLAGGED,  "Flagged"  },
+        { IMAIL_TRASHED,  "Deleted"  },
+        { IMAIL_SEEN,     "Seen"     },
+        { IMAIL_DRAFT,    "Draft"    },
+    };
+    size_t i;
+    if (!m || !kw || kw[0] == '\0') return false;
+    if (kw[0] == '\\') kw++;
+    for (i = 0; i < 5; i++)
+        if (ascii_ieq_str(kw, tab[i].nm)) return (m->flags & tab[i].bit) != 0;
+    for (i = 0; m->unk[i]; i++)
+        if (kw[0] == m->unk[i] && kw[1] == '\0') return true;
+    return false;
+}
+
 bool imapd_search_match(const SearchKey *k, const ImailDoc *d,
                         uint32_t uidnext, size_t nmsgs) {
     char hdr[4096];
@@ -819,8 +899,15 @@ bool imapd_search_match(const SearchKey *k, const ImailDoc *d,
     case SK_SEQ:      return imapd_seqset_has(k->set, (uint32_t)d->seq,
                                               (uint32_t)nmsgs);
     case SK_UID:      return imapd_seqset_has(k->set, d->m->uid, uidnext);
+    case SK_LARGER:   return d->m->size > k->num;
+    case SK_SMALLER:  return d->m->size < k->num;
+    case SK_KEYWORD:  return search_keyword_match(d->m, k->str);
+    case SK_UNKEYWORD: return !search_keyword_match(d->m, k->str);
+    case SK_MODSEQ:   return d->m->modseq >= k->num;
     case SK_FROM:
     case SK_TO:
+    case SK_CC:
+    case SK_BCC:
     case SK_SUBJECT:
     case SK_HEADER:
         /* Message-ID is served from the persisted per-message index, so no
@@ -829,10 +916,7 @@ bool imapd_search_match(const SearchKey *k, const ImailDoc *d,
             d->m && d->m->mid)
             return ci_strstr(d->m->mid, strlen(d->m->mid), k->str) != NULL;
         if (!d->msg) return false;
-        if (mail_header_get(d->msg, d->msglen,
-                            k->hdr ? k->hdr :
-                            (k->kind == SK_FROM ? "From" :
-                             k->kind == SK_TO ? "To" : "Subject"),
+        if (mail_header_get(d->msg, d->msglen, search_hdr_name(k),
                             hdr, sizeof hdr) != 0)
             return false;
         return ci_strstr(hdr, strlen(hdr), k->str) != NULL;

@@ -405,6 +405,81 @@ static void search_test(void) {
                "search 3-key AND keeps all keys");
         imapd_search_free(k);
 
+        /* CC/BCC/LARGER/SMALLER/KEYWORD/UNKEYWORD/MODSEQ: the keys FairEmail's
+           search dialog emits (recipient terms are enabled by default, and a
+           size filter adds LARGER).  Their absence made the whole SEARCH
+           program invalid, which the client reports as an unsupported search. */
+        {
+            static const char *const cb[2] = {
+                "From: a@x\r\nTo: me@x\r\nCc: carol@x\r\n\r\nbody\r\n",
+                "From: a@x\r\nTo: me@x\r\nBcc: dave@x\r\n\r\nbody\r\n",
+            };
+            ImailDoc dd;
+
+            dd.seq = 1;
+            p = "CC carol";
+            EXPECT(imapd_search_parse_program(&p, &k) == 1, "search parse CC");
+            dd.m = &m[0]; dd.msg = cb[0]; dd.msglen = strlen(cb[0]);
+            EXPECT(imapd_search_match(k, &dd, uidnext, 4), "search CC match");
+            dd.msg = cb[1]; dd.msglen = strlen(cb[1]);
+            EXPECT(!imapd_search_match(k, &dd, uidnext, 4), "search CC miss");
+            imapd_search_free(k);
+
+            p = "BCC dave";
+            EXPECT(imapd_search_parse_program(&p, &k) == 1, "search parse BCC");
+            EXPECT(imapd_search_match(k, &dd, uidnext, 4), "search BCC match");
+            imapd_search_free(k);
+
+            /* the shape FairEmail sends: OR over sender+recipients */
+            p = "OR FROM a@x CC carol";
+            EXPECT(imapd_search_parse_program(&p, &k) == 1,
+                   "search parse OR FROM CC");
+            EXPECT(imapd_search_match(k, &dd, uidnext, 4), "search OR FROM CC");
+            imapd_search_free(k);
+        }
+
+        p = "LARGER 5";
+        EXPECT(imapd_search_parse_program(&p, &k) == 1, "search parse LARGER");
+        EXPECT(MATCH(0, k) && !MATCH(1, k), "search LARGER");
+        imapd_search_free(k);
+
+        p = "SMALLER 5";
+        EXPECT(imapd_search_parse_program(&p, &k) == 1, "search parse SMALLER");
+        EXPECT(!MATCH(0, k) && MATCH(1, k), "search SMALLER");
+        imapd_search_free(k);
+
+        p = "LARGER ten";
+        EXPECT(imapd_search_parse_program(&p, &k) == -1,
+               "search rejects non-numeric LARGER");
+        imapd_search_free(k);
+
+        m[0].flags = IMAIL_SEEN | IMAIL_FLAGGED;
+        m[0].unk[0] = 'P';
+        m[0].unk[1] = '\0';
+        p = "KEYWORD \\Seen";
+        EXPECT(imapd_search_parse_program(&p, &k) == 1, "search parse KEYWORD");
+        EXPECT(MATCH(0, k) && !MATCH(1, k), "search KEYWORD system flag");
+        imapd_search_free(k);
+
+        p = "KEYWORD P";
+        EXPECT(imapd_search_parse_program(&p, &k) == 1,
+               "search parse KEYWORD letter");
+        EXPECT(MATCH(0, k) && !MATCH(1, k), "search KEYWORD unknown letter");
+        imapd_search_free(k);
+
+        p = "UNKEYWORD P";
+        EXPECT(imapd_search_parse_program(&p, &k) == 1,
+               "search parse UNKEYWORD");
+        EXPECT(!MATCH(0, k) && MATCH(1, k), "search UNKEYWORD");
+        imapd_search_free(k);
+
+        m[0].modseq = 100;
+        m[1].modseq = 7;
+        p = "MODSEQ 50";
+        EXPECT(imapd_search_parse_program(&p, &k) == 1, "search parse MODSEQ");
+        EXPECT(MATCH(0, k) && !MATCH(1, k), "search MODSEQ >= value");
+        imapd_search_free(k);
+
 #undef MATCH
     }
     for (i = 0; i < 4; i++) {
