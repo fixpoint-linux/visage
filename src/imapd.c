@@ -158,6 +158,7 @@ static void conn_destroy(Conn *c) {
         free(c->user);
         if (c->mb_open) imapd_mbox_close(&c->mb);
         imapd_fetch_free(c);
+        imapd_searchgen_free(c);
         free(c->cmd);
     }
     free(c->in);
@@ -303,6 +304,8 @@ static void server_poll(ImapdServer *srv) {
                 pfds[3 + i].events = POLLOUT;   /* POP3 stream owns the conn */
             } else if (c->fg) {
                 pfds[3 + i].events = POLLOUT;   /* fetch owns the conn */
+            } else if (c->sg) {
+                pfds[3 + i].events = POLLOUT;   /* search/sort owns the conn */
             } else {
                 /* backpressure: stop reading while the reply backlog is high */
                 pfds[3 + i].events =
@@ -350,6 +353,16 @@ static void server_poll(ImapdServer *srv) {
                        reporting POLLOUT forever and the loop spins at 100%
                        CPU without ever sending. */
                     conn_flush(c);
+                }
+                continue;
+            }
+            if (c->sg) {
+                if (rev & POLLOUT) {
+                    imapd_search_pump(srv, c);
+                    conn_flush(c);
+                    /* a multi-slice scan can run for minutes: keep the
+                       idle-timeout clock from reaping an active search */
+                    c->last_act = now;
                 }
                 continue;
             }

@@ -107,16 +107,6 @@ static char *imapd_msgid_of_buf(const char *msg, size_t len) {
     return strdup(buf);
 }
 
-static char *imapd_msgid_of_file(const char *path) {
-    char *msg = NULL, *mid = NULL;
-    size_t ml = 0;
-    if (read_file(path, &msg, &ml) == 0) {
-        mid = imapd_msgid_of_buf(msg, ml);
-        free(msg);
-    }
-    return mid;
-}
-
 /* Recursively remove a directory tree (bounded: directories only, and the
    walk never follows symlinks).  Returns 0, or -1 on error. */
 static int rmrf(const char *path) {
@@ -155,6 +145,526 @@ static bool ascii_ieq_str(const char *a, const char *b) {
     }
     return *a == *b;
 }
+
+/* ------------------------------------------------------------------ */
+/* Header cache (S2)                                                   */
+/* ------------------------------------------------------------------ */
+
+/* Byte offset just past the header block (incl. the blank separator line).
+   The bounded header read moved here from imapd_imap.c so the maildir layer
+   owns header extraction. */
+static size_t mail_hdr_end(const char *msg, size_t len) {
+    size_t i;
+    for (i = 0; i + 4 <= len; i++)
+        if (msg[i] == '\r' && msg[i+1] == '\n' && msg[i+2] == '\r' &&
+            msg[i+3] == '\n')
+            return i + 4;
+    for (i = 0; i + 2 <= len; i++)
+        if (msg[i] == '\n' && msg[i+1] == '\n')
+            return i + 2;
+    return len;
+}
+
+int imapd_read_hdr(const char *path, char **out, size_t *outlen) {
+    int fd;
+    char *buf;
+    size_t got = 0;
+    if (!path || !out || !outlen) return -1;
+    *out = NULL;
+    *outlen = 0;
+    buf = malloc(IMAPD_HDR_CAP + 1);
+    if (!buf) return -1;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) { free(buf); return -1; }
+    while (got < IMAPD_HDR_CAP) {
+        char chunk[8192];
+        size_t need = sizeof chunk;
+        ssize_t r;
+        if (IMAPD_HDR_CAP - got < need) need = IMAPD_HDR_CAP - got;
+        r = read(fd, chunk, need);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (r == 0) break;
+        memcpy(buf + got, chunk, (size_t)r);
+        got += (size_t)r;
+        if (mail_hdr_end(buf, got) < got) break;   /* header block complete */
+    }
+    close(fd);
+    got = mail_hdr_end(buf, got);
+    buf[got] = '\0';
+    *out = buf;
+    *outlen = got;
+    return 0;
+}
+
+/* The six indexed fields, in packing order. */
+static const char *const MAIL_HDR_FIELDS[IH_NFIELDS] = {
+    "From", "To", "Cc", "Bcc", "Subject", "Date"
+};
+
+/* Cached values are truncated at this many bytes so a pathological header
+   cannot blow up the per-conn view or the per-mailbox sidecar (they feed
+   SEARCH substrings and SORT keys, not display data). */
+#define MAIL_HDR_FLD_MAX IMAPD_MAX_LINE
+
+/* Append one field value to the packed block being built and record its
+   offset.  Returns 0, or -1 on allocation failure (the block is freed). */
+static int mail_hdr_pack(char **hdr, size_t *off, size_t *cap,
+                         size_t fields_off[IH_NFIELDS], int fld,
+                         const char *s) {
+    char *nb;
+    size_t sl = strlen(s), need = *off + sl + 1;
+    if (need > *cap) {
+        size_t nc = *cap ? *cap : 256;
+        while (nc < need) nc *= 2;
+        nb = realloc(*hdr, nc);
+        if (!nb) return -1;
+        *hdr = nb;
+        *cap = nc;
+    }
+    memcpy(*hdr + *off, s, sl + 1);
+    fields_off[fld] = *off;
+    *off += sl + 1;
+    return 0;
+}
+
+/* Build the packed block (From\0To\0Cc\0Bcc\0Subj\0Date\0, "" when absent)
+   from a header block.  Returns 0 with blk_out/blen_out/fields_out set
+   (blk owned by caller), or -1 on allocation failure. */
+static int mail_hdr_build(const char *hdrblk, size_t hl,
+                          char **blk_out, size_t *blen_out,
+                          size_t fields_off[IH_NFIELDS]) {
+    char *blk = NULL;
+    char tmp[MAIL_HDR_FLD_MAX + 1];
+    size_t off = 0, cap = 0;
+    int i;
+    *blk_out = NULL;
+    *blen_out = 0;
+    for (i = 0; i < IH_NFIELDS; i++) {
+        if (mail_header_get(hdrblk, hl, MAIL_HDR_FIELDS[i], tmp,
+                            sizeof tmp) != 0 || tmp[0] == '\0') {
+            tmp[0] = '\0';
+        }
+        if (mail_hdr_pack(&blk, &off, &cap, fields_off, i, tmp) != 0) {
+            free(blk);
+            return -1;
+        }
+    }
+    *blk_out = blk;
+    *blen_out = off;
+    return 0;
+}
+
+/* Install a packed block into m (takes ownership of blk). */
+static void mail_hdr_install(Imail *m, char *blk, size_t blen,
+                             const size_t fields_off[IH_NFIELDS]) {
+    size_t i;
+    if (m->hdr) free(m->hdr);
+    m->hdr = blk;
+    m->hdr_len = blen;
+    for (i = 0; i < IH_NFIELDS; i++)
+        m->fields_off[i] = fields_off[i];
+    m->hdr_loaded = true;
+}
+
+/* Extract + install in one step (the lazy ensure path).  Returns 0/-1. */
+static int mail_hdr_extract(Imail *m, const char *hdrblk, size_t hl) {
+    char *blk = NULL;
+    size_t blen = 0;
+    size_t fields_off[IH_NFIELDS];
+    if (mail_hdr_build(hdrblk, hl, &blk, &blen, fields_off) != 0) return -1;
+    mail_hdr_install(m, blk, blen, fields_off);
+    return 0;
+}
+
+/* Map a header name to its IH_* index (-1 when not an indexed field). */
+int imapd_mail_hdr_fld(const char *name) {
+    int i;
+    if (!name) return -1;
+    for (i = 0; i < IH_NFIELDS; i++)
+        if (ascii_ieq_str(name, MAIL_HDR_FIELDS[i])) return i;
+    return -1;
+}
+
+const char *imapd_mail_hdr_field(const Imail *m, int fld) {
+    if (!m || !m->hdr || fld < 0 || fld >= IH_NFIELDS) return NULL;
+    return m->hdr + m->fields_off[fld];
+}
+
+/* Per-message allowance charged against the caller's pump budget so even a
+   fully warm-cache pass stays non-blocking on huge mailboxes (mirrors
+   IMAPD_SEARCH_MSGCOST in imapd_imap.c; keep the two in sync). */
+#define MAIL_HDR_MSGCOST 512u
+
+int imapd_mail_ensure_hdrs(Mbox *mb, Imail *m, size_t *budget) {
+    struct stat st;
+    char *hdrblk = NULL;
+    size_t hl = 0;
+    int rc;
+
+    if (m->hdr_valid) return 1;
+    /* The stat guard is cheap correctness work, not budget work: always done,
+       even when the budget is exhausted (it decides nothing by itself). */
+    if (stat(m->path, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
+    if (m->hdr_loaded && m->hdr_fsize == (size_t)st.st_size &&
+        m->hdr_mtime == (time_t)st.st_mtime &&
+        m->hdr_ctime == (int64_t)st.st_ctime) {
+        /* cached (sidecar or earlier extraction) and still fresh */
+        if (budget) {
+            if (*budget < MAIL_HDR_MSGCOST) return 0;
+            *budget -= MAIL_HDR_MSGCOST;
+        }
+        m->hdr_valid = true;
+        return 1;
+    }
+    /* Budget gate BEFORE the read (a read never starts that cannot be paid
+       for; the next pump slice retries this message). */
+    if (budget && *budget < MAIL_HDR_MSGCOST) return 0;
+    if (imapd_read_hdr(m->path, &hdrblk, &hl) != 0) return -1;
+    if (budget) {
+        /* Never let the budget wrap: hl is bounded only by IMAPD_HDR_CAP, so
+           a header block larger than the remaining budget would underflow
+           size_t and hand the pump loop a huge "budget" — collapsing the
+           whole remaining mailbox into ONE unbounded slice.  Clamp to 0:
+           the slice ends right after this message. */
+        size_t cost = MAIL_HDR_MSGCOST + hl;
+        if (*budget < cost) *budget = 0;
+        else *budget -= cost;
+    }
+    rc = mail_hdr_extract(m, hdrblk, hl);
+    free(hdrblk);
+    if (rc != 0) return -1;
+    m->hdr_fsize = (size_t)st.st_size;
+    m->hdr_mtime = (time_t)st.st_mtime;
+    m->hdr_ctime = (int64_t)st.st_ctime;
+    m->hdr_valid = true;
+    /* persist at close (the sidecar rewrite includes every loaded block) */
+    if (mb) mb->hdrs_dirty = true;
+    return 1;
+}
+
+/* --- per-mailbox sidecar "imapd-hdrs" --- */
+
+static int hdrs_path(const Mbox *mb, char *out, size_t outsz) {
+    int n = snprintf(out, outsz, "%s/%s", mb->dir, IMAPD_HDRS_FILE);
+    if (n < 0 || (size_t)n >= outsz) return -1;
+    return 0;
+}
+
+/* Byte-append helper for building a row/escape buffer (grows geometrically,
+   keeps a trailing NUL).  Returns 0, or -1 on allocation failure. */
+static int hdrs_buf_append(char **buf, size_t *len, size_t *cap,
+                           const char *src, size_t n) {
+    char *nb;
+    size_t need, nc;
+    if (n == 0) return 0;
+    need = *len + n;
+    if (need + 1 > *cap) {
+        nc = *cap ? *cap : 128;
+        while (nc < need + 1) nc *= 2;
+        nb = realloc(*buf, nc);
+        if (!nb) return -1;
+        *buf = nb;
+        *cap = nc;
+    }
+    memcpy(*buf + *len, src, n);
+    *len = need;
+    (*buf)[*len] = '\0';
+    return 0;
+}
+
+/* Append the escape sequence for byte c (TAB/NEWLINE/CR/BACKSLASH become
+   \t \n \r \\, everything else is copied verbatim).  Returns 0/-1. */
+static int hdrs_escape_char(char **out, size_t *outlen, size_t *outcap,
+                            char c) {
+    const char *rep;
+    char one[2] = { c, '\0' };
+    switch (c) {
+    case '\t': rep = "\\t"; break;
+    case '\n': rep = "\\n"; break;
+    case '\r': rep = "\\r"; break;
+    case '\\': rep = "\\\\"; break;
+    default:   rep = one; break;
+    }
+    return hdrs_buf_append(out, outlen, outcap, rep, strlen(rep));
+}
+
+/* One sidecar row for m (cache must be loaded): "uid\tfrom\tto\tcc\tbcc\t
+   subj\tdate\t<size>\t<mtime>" (no trailing newline), TAB-escaped.  Returns
+   a malloc'd NUL-terminated string, or NULL on error. */
+static char *mail_hdrs_row(const Imail *m) {
+    char *row = NULL;
+    size_t len = 0, cap = 0;
+    char uidbuf[48];
+    int i;
+    snprintf(uidbuf, sizeof uidbuf, "%u", m->uid);
+    if (hdrs_buf_append(&row, &len, &cap, uidbuf, strlen(uidbuf)) != 0)
+        return NULL;
+    for (i = 0; i < IH_NFIELDS; i++) {
+        const char *v = imapd_mail_hdr_field(m, i);
+        const char *q;
+        if (!v) { free(row); return NULL; }
+        /* raw TAB as the field separator (only VALUES are escaped) */
+        if (hdrs_buf_append(&row, &len, &cap, "\t", 1) != 0) {
+            free(row);
+            return NULL;
+        }
+        for (q = v; *q; q++)
+            if (hdrs_escape_char(&row, &len, &cap, *q) != 0) {
+                free(row);
+                return NULL;
+            }
+    }
+    snprintf(uidbuf, sizeof uidbuf, "\t%zu\t%lld\t%lld",
+             m->hdr_fsize, (long long)m->hdr_mtime, (long long)m->hdr_ctime);
+    if (hdrs_buf_append(&row, &len, &cap, uidbuf, strlen(uidbuf)) != 0) {
+        free(row);
+        return NULL;
+    }
+    return row;
+}
+
+/* In-place unescape of one field (inverse of hdrs_escape_char). */
+static void hdrs_unescape(char *s) {
+    char *w = s;
+    const char *r = s;
+    while (*r) {
+        if (*r == '\\' && r[1]) {
+            r++;
+            switch (*r) {
+            case 't': *w++ = '\t'; break;
+            case 'n': *w++ = '\n'; break;
+            case 'r': *w++ = '\r'; break;
+            case '\\': *w++ = '\\'; break;
+            default:  *w++ = *r; break;
+            }
+            r++;
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = '\0';
+}
+
+/* One parsed sidecar row (uid + the six cached values + the stat guard
+   captured at extraction). */
+typedef struct HdrRow {
+    char    *f[IH_NFIELDS];   /* owned, unescaped values ("" when absent) */
+    uint32_t uid;
+    size_t   fsize;           /* st_size guard captured at extraction */
+    int64_t  mtime;           /* st_mtime guard captured at extraction */
+    int64_t  ctime;           /* st_ctime guard captured at extraction */
+} HdrRow;
+
+static void hdrrow_free(HdrRow *r) {
+    int i;
+    for (i = 0; i < IH_NFIELDS; i++) free(r->f[i]);
+    memset(r, 0, sizeof *r);
+}
+
+static void hdrrows_free(HdrRow *v, size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++) hdrrow_free(&v[i]);
+    free(v);
+}
+
+/* Parse the sidecar into a by-uid vector (duplicate uid: FIRST row wins).
+   Missing file -> an empty (valid) vector.  Stops at the first malformed
+   line, keeping prior rows (mirrors uidlist_load); the file is rewritten at
+   close anyway.  Returns 0, or -1 on allocation failure. */
+static int mail_hdrs_load(const Mbox *mb, uint32_t *uidvalidity,
+                          HdrRow **rows_out, size_t *nrows_out) {
+    char path[4200];
+    char *buf = NULL, *p;
+    size_t buflen = 0;
+    HdrRow *v = NULL;
+    size_t n = 0, cap = 0;
+    uint32_t uv = 0;
+    *uidvalidity = 0;
+    *rows_out = NULL;
+    *nrows_out = 0;
+    if (hdrs_path(mb, path, sizeof path) != 0) return -1;
+    if (read_file(path, &buf, &buflen) != 0) return 0;   /* missing: empty */
+    p = buf;
+    {
+        /* header line: "<uidvalidity>" */
+        unsigned long long a = 0;
+        char *nl = strchr(p, '\n');
+        if (nl) {
+            if (sscanf(p, "%llu", &a) == 1 && a <= UINT32_MAX) uv = (uint32_t)a;
+            p = nl + 1;
+        } else {
+            p = buf + buflen;   /* malformed header: no rows */
+        }
+    }
+    while (*p) {
+        char *nl = strchr(p, '\n');
+        size_t ll = nl ? (size_t)(nl - p) : strlen(p);
+        char *line, *tab, *uid_end;
+        uint32_t uid;
+        int i;
+        if (ll == 0) { if (nl) { p = nl + 1; continue; } break; }
+        line = malloc(ll + 1);
+        if (!line) break;
+        memcpy(line, p, ll);
+        line[ll] = '\0';
+        uid_end = NULL;
+        uid = 0;
+        /* uid field (digits), then exactly IH_NFIELDS TAB-separated fields */
+        tab = strchr(line, '\t');
+        if (!tab) { free(line); break; }
+        uid_end = tab;
+        {
+            char *q = line;
+            if (*q == '\0') { free(line); break; }
+            for (; *q; q++) {
+                if (*q < '0' || *q > '9') break;
+                if (uid > (UINT32_MAX - (uint32_t)(*q - '0')) / 10u) {
+                    uid = UINT32_MAX + 1u;   /* overflow marker */
+                    break;
+                }
+                uid = uid * 10u + (uint32_t)(*q - '0');
+            }
+            if (q != uid_end || uid == 0) { free(line); break; }
+        }
+        {
+            /* split the remaining IH_NFIELDS+2 fields on TAB: six values,
+               then the size and mtime guard columns */
+            char *q = uid_end + 1;
+            bool ok = true;
+            int ncols = IH_NFIELDS + 3;
+            char *cols[12];
+            for (i = 0; i < ncols; i++) {
+                char *t = strchr(q, '\t');
+                if (i == ncols - 1) {
+                    if (t) { ok = false; break; }   /* extra column */
+                    cols[i] = q;
+                } else {
+                    if (!t) { ok = false; break; }
+                    *t = '\0';
+                    cols[i] = q;
+                    q = t + 1;
+                }
+            }
+            if (!ok) { free(line); break; }
+            if (n == cap) {
+                size_t nc = cap ? cap * 2 : 32;
+                HdrRow *nv = realloc(v, nc * sizeof *nv);
+                if (!nv) { free(line); break; }
+                v = nv;
+                cap = nc;
+            }
+            for (i = 0; i < IH_NFIELDS; i++) {
+                hdrs_unescape(cols[i]);
+                v[n].f[i] = strdup(cols[i]);
+                if (!v[n].f[i]) {
+                    int j;
+                    for (j = 0; j < i; j++) free(v[n].f[j]);
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) {
+                unsigned long long sz = 0;
+                long long mt = 0, ct = 0;
+                if (sscanf(cols[IH_NFIELDS], "%llu", &sz) == 1)
+                    v[n].fsize = (size_t)sz;
+                else ok = false;
+                if (ok && sscanf(cols[IH_NFIELDS + 1], "%lld", &mt) == 1)
+                    v[n].mtime = (int64_t)mt;
+                else ok = false;
+                if (ok && sscanf(cols[IH_NFIELDS + 2], "%lld", &ct) == 1)
+                    v[n].ctime = ct;
+                else ok = false;
+            }
+            if (!ok) { free(line); break; }
+            v[n].uid = uid;
+            n++;
+        }
+        free(line);
+        if (!nl) break;
+        p = nl + 1;
+    }
+    free(buf);
+    *uidvalidity = uv;
+    *rows_out = v;
+    *nrows_out = n;
+    return 0;
+}
+
+/* Save the per-mailbox header cache: header line "<uidvalidity>", then one
+   TAB-escaped row per LOADED message cache (uids absent from the view are
+   dropped, mirroring the uidlist prune).  Written via tmp+rename so the new
+   file appears atomically.  Returns 0, or -1. */
+static int mail_hdrs_save(Mbox *mb) {
+    char path[4200], tmp[4200 + 16];
+    FILE *f;
+    size_t i;
+    int rc = -1;
+    if (hdrs_path(mb, path, sizeof path) != 0) return -1;
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    f = fopen(tmp, "wb");
+    if (!f) return -1;
+    if (fprintf(f, "%u\n", mb->uidvalidity) < 0) goto out;
+    for (i = 0; i < mb->nmsgs; i++) {
+        Imail *m = &mb->msgs[i];
+        char *row;
+        if (!m->hdr_loaded) continue;   /* never needed: not our row to write */
+        /* Write the loaded block AS-IS.  Calling ensure_hdrs here would
+           stat() EVERY hydrated row inline on the poll loop at close
+           (15-30s on an NFS-scale FS for a 31.5k mailbox -> a LOGOUT
+           freeze).  Rows hydrated from the sidecar but never touched are
+           unchanged from what the sidecar already holds, so the rewrite
+           is a no-op for them; rows the pump extracted/validated are
+           already hdr_valid.  The (size,mtime,ctime) guard is re-checked
+           by ensure_hdrs at USE time, so persisting a stale row cannot
+           serve a stale value. */
+        row = mail_hdrs_row(m);
+        if (!row) goto out;
+        if (fwrite(row, 1, strlen(row), f) != strlen(row) ||
+            fputc('\n', f) == EOF) {
+            free(row);
+            goto out;
+        }
+        free(row);
+    }
+    if (fflush(f) != 0 || fclose(f) != 0) { f = NULL; goto out; }
+    f = NULL;
+    if (rename(tmp, path) != 0) goto out;
+    rc = 0;
+out:
+    if (f) (void)fclose(f);
+    if (rc != 0) (void)unlink(tmp);
+    return rc;
+}
+
+/* Hydrate m's header cache from a sidecar row: pack the six values into
+   ONE malloc'd block, install it, and adopt the row's stat guard.  The
+   freshness of the guard is checked by imapd_mail_ensure_hdrs at use time.
+   Returns 0, or -1 on allocation failure (m->hdr stays NULL). */
+static int mail_hdrs_hydrate(Imail *m, const HdrRow *r) {
+    char *blk = NULL;
+    size_t off = 0, cap = 0;
+    size_t fields_off[IH_NFIELDS];
+    int i;
+    for (i = 0; i < IH_NFIELDS; i++)
+        if (mail_hdr_pack(&blk, &off, &cap, fields_off, i, r->f[i]) != 0) {
+            free(blk);
+            return -1;
+        }
+    if (m->hdr) free(m->hdr);
+    m->hdr = blk;
+    m->hdr_len = off;
+    memcpy(m->fields_off, fields_off, sizeof fields_off);
+    m->hdr_fsize = r->fsize;
+    m->hdr_mtime = (time_t)r->mtime;
+    m->hdr_ctime = r->ctime;
+    m->hdr_loaded = true;
+    return 0;
+}
+
 
 /* ------------------------------------------------------------------ */
 /* Maildir flag suffix codec                                           */
@@ -686,10 +1196,17 @@ fail:
 void imapd_mbox_close(Mbox *mb) {
     size_t i;
     if (!mb) return;
+    /* Persist the header cache BEFORE freeing the view: the save walks the
+       per-message blocks.  Dirty = this session extracted anything the
+       sidecar does not hold (new files at scan, or lazy extraction). */
+    if (mb->hdrs_dirty)
+        (void)mail_hdrs_save(mb);
+    mb->hdrs_dirty = false;
     for (i = 0; i < mb->nmsgs; i++) {
         free(mb->msgs[i].base);
         free(mb->msgs[i].path);
         free(mb->msgs[i].mid);
+        free(mb->msgs[i].hdr);
     }
     free(mb->msgs);
     mb->msgs = NULL;
@@ -705,7 +1222,8 @@ void imapd_mbox_close(Mbox *mb) {
 }
 
 /* Append one scanned file to the view (takes ownership of base/path; dups
-   mid). */
+   mid).  The header cache starts unhydrated; mbox_scan installs sidecar
+   rows after the sort (it needs the final uid order). */
 static int scan_add(Mbox *mb, uint32_t uid, uint8_t flags, const char *unk,
                     bool recent, const struct stat *st, uint64_t modseq,
                     char *base, char *path, const char *mid) {
@@ -729,6 +1247,13 @@ static int scan_add(Mbox *mb, uint32_t uid, uint8_t flags, const char *unk,
     m->base = base;
     m->path = path;
     m->mid = (mid && mid[0]) ? strdup(mid) : NULL;
+    m->hdr = NULL;
+    m->hdr_len = 0;
+    memset(m->fields_off, 0, sizeof m->fields_off);
+    m->hdr_fsize = 0;
+    m->hdr_mtime = 0;
+    m->hdr_loaded = false;
+    m->hdr_valid = false;
     return 0;
 }
 
@@ -738,14 +1263,20 @@ static int imail_uid_cmp(const void *pa, const void *pb) {
     return a->uid == b->uid ? 0 : 1;
 }
 
-/* Scan one of new//cur/; assigns UIDs from the uidlist map or uidnext. */
+/* Scan one of new//cur/; assigns UIDs from the uidlist map or uidnext.
+   New files get their Message-ID AND cached header fields extracted here
+   (the single natural mutation point: uid assignment happens at scan time,
+   not at ingest), and *hdrs_dirty_out is set so the close-time save persists
+   them. */
 static int scan_subdir(Mbox *mb, const char *sub, bool is_new,
                        UidEnt **map, size_t *nmap, size_t *map_cap,
                        uint32_t *uidnext, bool *changed,
-                       const BaseHash *bh) {
+                       const BaseHash *bh, bool *hdrs_dirty_out) {
     char sub_dir[4096 + 8];
     DIR *d;
     struct dirent *e;
+    char *new_hdrblk = NULL;
+    size_t new_hdrblk_len = 0;
     if (snprintf(sub_dir, sizeof sub_dir, "%s/%s", mb->dir, sub)
             >= (int)sizeof sub_dir) return -1;
     d = opendir(sub_dir);
@@ -790,6 +1321,8 @@ static int scan_subdir(Mbox *mb, const char *sub, bool is_new,
             }
         }
         if (uid == 0) {
+            char *hdrblk = NULL;
+            size_t hl = 0;
             uid = (*uidnext)++;
             modseq = (*uidnext);   /* new message: modseq >= any prior */
             *changed = true;
@@ -807,16 +1340,39 @@ static int scan_subdir(Mbox *mb, const char *sub, bool is_new,
                 (*map)[*nmap].base[bl] = '\0';
                 (*map)[*nmap].uid = uid;
                 (*map)[*nmap].modseq = modseq;
-                /* extract the Message-ID now so it persists in the uidlist
-                   and future searches never have to read the file */
-                (*map)[*nmap].mid = imapd_msgid_of_file(path);
+                /* extract the Message-ID AND the cached header fields now
+                   (ONE bounded header read for both) so they persist in the
+                   sidecars and future searches never re-read the file */
+                if (imapd_read_hdr(path, &hdrblk, &hl) == 0) {
+                    (*map)[*nmap].mid =
+                        imapd_msgid_of_buf(hdrblk, hl);
+                    if (!(*map)[*nmap].mid && hl >= IMAPD_HDR_CAP) {
+                        /* Degenerate: >256KB of headers with no blank-line
+                           end, so the capped block hid the Message-ID —
+                           fall back to a full read (scan-time only, once
+                           per new message). */
+                        char *full = NULL;
+                        size_t fl = 0;
+                        if (read_file(path, &full, &fl) == 0) {
+                            (*map)[*nmap].mid = imapd_msgid_of_buf(full, fl);
+                            free(full);
+                        }
+                    }
+                    /* hand the block to the view entry scan_add appends
+                       below; the stat guard is the one just taken */
+                    new_hdrblk = hdrblk;   /* borrowed until after scan_add */
+                    new_hdrblk_len = hl;
+                } else {
+                    (*map)[*nmap].mid = NULL;
+                }
                 mid = (*map)[*nmap].mid;
                 (*nmap)++;
+                *hdrs_dirty_out = true;
             }
         }
         base = malloc(bl + 1);
         fpath = malloc(strlen(path) + 1);
-        if (!base || !fpath) { free(base); free(fpath); continue; }
+        if (!base || !fpath) { free(base); free(fpath); free(new_hdrblk); continue; }
         memcpy(base, e->d_name, bl);
         base[bl] = '\0';
         strcpy(fpath, path);
@@ -824,7 +1380,18 @@ static int scan_subdir(Mbox *mb, const char *sub, bool is_new,
                      mid) != 0) {
             free(base);
             free(fpath);
+            free(new_hdrblk);
+        } else if (new_hdrblk) {
+            /* install the scan-time extraction into the just-appended view
+               entry: it is valid for the file exactly as scanned */
+            Imail *m = &mb->msgs[mb->nmsgs - 1];
+            if (mail_hdr_extract(m, new_hdrblk, new_hdrblk_len) == 0) {
+                m->hdr_fsize = (size_t)st.st_size;
+                m->hdr_mtime = st.st_mtime;
+                m->hdr_valid = true;
+            }
         }
+        if (new_hdrblk) { free(new_hdrblk); new_hdrblk = NULL; }
     }
     closedir(d);
     return 0;
@@ -838,6 +1405,10 @@ static int mbox_scan(Mbox *mb, const ImapdConfig *cfg, const char *user,
     uint32_t uidnext = 1;
     bool changed = false;
     bool map_owned = false;
+    bool hdrs_dirty = false;
+    HdrRow *hrows = NULL;
+    size_t nhrows = 0;
+    uint32_t huv = 0;
     int rc = -1;
 
     memset(mb, 0, sizeof *mb);
@@ -860,12 +1431,12 @@ static int mbox_scan(Mbox *mb, const ImapdConfig *cfg, const char *user,
                 goto out;
             }
         if (scan_subdir(mb, "new", true, &map, &nmap, &map_cap, &uidnext,
-                        &changed, &bht) != 0) {
+                        &changed, &bht, &hdrs_dirty) != 0) {
             bh_free(&bht);
             goto out;
         }
         if (scan_subdir(mb, "cur", false, &map, &nmap, &map_cap, &uidnext,
-                        &changed, &bht) != 0) {
+                        &changed, &bht, &hdrs_dirty) != 0) {
             bh_free(&bht);
             goto out;
         }
@@ -874,6 +1445,28 @@ static int mbox_scan(Mbox *mb, const ImapdConfig *cfg, const char *user,
 
     if (mb->nmsgs > 1)
         qsort(mb->msgs, mb->nmsgs, sizeof *mb->msgs, imail_uid_cmp);
+
+    /* Hydrate the header cache from the sidecar (rows whose uid is absent
+       from the view, or whose uidvalidity differs, are simply not offered).
+       scan_add already installed blocks for brand-new files; those were
+       extracted from the file itself, so a sidecar row can only be older. */
+    if (mail_hdrs_load(mb, &huv, &hrows, &nhrows) == 0 && huv != 0 &&
+        huv == uidvalidity) {
+        size_t ri = 0, mi = 0;   /* both walk uid-ascending order */
+        while (ri < nhrows && mi < mb->nmsgs) {
+            Imail *m = &mb->msgs[mi];
+            if (m->hdr_loaded) { mi++; continue; }
+            if (hrows[ri].uid < m->uid) { ri++; continue; }
+            if (hrows[ri].uid > m->uid) { mi++; continue; }
+            if (mail_hdrs_hydrate(m, &hrows[ri]) != 0) { rc = -1; goto out; }
+            ri++;
+            mi++;
+        }
+    }
+    hdrrows_free(hrows, nhrows);
+    hrows = NULL;
+    nhrows = 0;
+    mb->hdrs_dirty = hdrs_dirty;
 
     /* Prune uidlist entries whose file vanished (O(n) via a base hash). */
     {
@@ -938,6 +1531,7 @@ static int mbox_scan(Mbox *mb, const ImapdConfig *cfg, const char *user,
     }
     rc = 0;
 out:
+    hdrrows_free(hrows, nhrows);
     if (rc != 0) {
         if (map_owned) uidlist_free(map, nmap);
         imapd_mbox_close(mb);
@@ -1057,6 +1651,7 @@ int imapd_mbox_expunge(Mbox *mb, uint32_t uid) {
         free(mb->msgs[i].base);
         free(mb->msgs[i].path);
         free(mb->msgs[i].mid);
+        free(mb->msgs[i].hdr);
         memmove(&mb->msgs[i], &mb->msgs[i + 1],
                 (mb->nmsgs - i - 1) * sizeof *mb->msgs);
         mb->nmsgs--;
@@ -1212,6 +1807,7 @@ int imapd_mbox_file(const ImapdConfig *cfg, const char *user, Mbox *mb,
             free(mb->msgs[i].base);
             free(mb->msgs[i].path);
             free(mb->msgs[i].mid);
+            free(mb->msgs[i].hdr);
             memmove(&mb->msgs[i], &mb->msgs[i + 1],
                     (mb->nmsgs - i - 1) * sizeof *mb->msgs);
             mb->nmsgs--;

@@ -63,6 +63,10 @@
 #define IMAPD_PASSWD_FILE  "imapd.passwd"       /* under <root>, 0600 */
 #define IMAPD_SUBS_FILE    "imapd-subscriptions" /* under <user> */
 #define IMAPD_UIDLIST_FILE "imapd-uidlist"       /* under <mailboxdir> */
+/* Cached header values sidecar (one "uid<TAB>from<TAB>to<TAB>cc<TAB>bcc<TAB>
+   subj<TAB>date" row per message, TAB-escaped); rebuilt lazily from the
+   message files whenever missing/stale, so correctness never depends on it. */
+#define IMAPD_HDRS_FILE    "imapd-hdrs"          /* under <mailboxdir> */
 
 /* ------------------------------------------------------------------ */
 /* Configuration (CLI flags + env, no Dhall on purpose: keeps imapd    */
@@ -98,6 +102,12 @@ typedef struct ImapdConfig {
 #define IMAIL_TRASHED  0x10u  /* T (deleted) */
 #define IMAIL_RECENT   0x20u  /* session-only */
 
+/* Index of a cached header field inside Imail.hdr (packing order). */
+enum {
+    IH_FROM = 0, IH_TO, IH_CC, IH_BCC, IH_SUBJ, IH_DATE,
+    IH_NFIELDS
+};
+
 typedef struct Imail {
     uint32_t uid;
     uint8_t  flags;             /* IMAIL_* bitmask (known flags) */
@@ -109,6 +119,21 @@ typedef struct Imail {
     char    *base;              /* owned: unique base name (no ":2,")    */
     char    *path;              /* owned: current full path              */
     char    *mid;               /* owned: Message-ID (for fast SEARCH)   */
+    /* S2 header cache: ONE packed block (a single malloc holding the
+       From/To/Cc/Bcc/Subject/Date values back to back, "" when absent),
+       lazily extracted via imapd_mail_ensure_hdrs and persisted in the
+       per-mailbox imapd-hdrs sidecar so header SEARCH/SORT need no file
+       I/O.  (fsize, mtime) are the file stat captured at extraction; a
+       flag rename preserves both, so STORE never invalidates the block. */
+    char    *hdr;               /* owned: packed From\0To\0Cc\0Bcc\0Subj\0Date\0 */
+    size_t   hdr_len;           /* bytes in hdr (incl. the NULs)          */
+    size_t   fields_off[IH_NFIELDS];  /* offset of each field in hdr     */
+    size_t   hdr_fsize;         /* st_size at extraction (guard)         */
+    int64_t  hdr_mtime;         /* st_mtime at extraction (guard)         */
+    int64_t  hdr_ctime;         /* st_ctime at extraction (guard: catches
+                                   same-size+same-mtime rewrites)         */
+    bool     hdr_loaded;        /* hdr/fields_off hold a cached block     */
+    bool     hdr_valid;         /* loaded AND matches the file right now  */
 } Imail;
 
 /* A single uidlist entry (uid -> base name + CONDSTORE modseq). */
@@ -131,6 +156,10 @@ typedef struct Mbox {
     UidEnt  *uidmap;
     size_t   nuidmap, uidmap_cap;
     bool     uidlist_dirty;
+    /* S2 header cache: dirty when this session extracted headers the
+       imapd-hdrs sidecar does not hold yet (new files, or lazy extraction);
+       saved tmp+rename at close.  See imap_maildir.c. */
+    bool     hdrs_dirty;
 } Mbox;
 
 /* ------------------------------------------------------------------ */
@@ -206,6 +235,7 @@ typedef struct ImapdServer {
 } ImapdServer;
 
 typedef struct FetchGen FetchGen;   /* opaque: imapd_imap.c */
+typedef struct SearchGen SearchGen; /* opaque: imapd_imap.c */
 typedef struct Pop3Gen  Pop3Gen;    /* opaque: pop3d.c */
 typedef struct ImapdTls ImapdTls;   /* opaque: imapd_tls.c (mbedTLS) */
 
@@ -261,6 +291,7 @@ typedef struct Conn {
     char  *cmd;                /* assembled command (literals quote-wrapped) */
     size_t cmd_len, cmd_cap;
     FetchGen *fg;              /* active streaming FETCH (owned) */
+    SearchGen *sg;             /* active streaming SEARCH/SORT (owned)   */
     ImapdTls *tls;             /* STARTTLS state (NULL = plaintext conn)  */
     /* pop3-only (kind == CONN_POP3) */
     int    pst;                /* PO_AUTH / PO_TRANS */
@@ -404,6 +435,36 @@ void imapd_mbox_close(Mbox *mb);
 /* Find a message by uid (NULL when absent). */
 Imail *imapd_mbox_find(Mbox *mb, uint32_t uid);
 
+/* Header cache (S2): read only the header block of a message file (up to the
+   blank line, or IMAPD_HDR_CAP for a pathological header), NUL-terminated.
+   Stops reading the moment the header block is complete, so extraction never
+   reads whole large messages.  Heap-allocates *out (always non-NULL on
+   success, possibly empty); *outlen excludes the NUL.  Returns 0, or -1. */
+int imapd_read_hdr(const char *path, char **out, size_t *outlen);
+
+/* Map a header name to its cached-field index IH_* (-1 when the header is
+   not one of the six indexed fields). */
+int imapd_mail_hdr_fld(const char *name);
+
+/* Cached value of one indexed header field of m (IH_FROM..IH_DATE).  The
+   returned pointer stays valid while the Mbox view is unchanged (it points
+   into m->hdr); "" means "header absent".  NULL only when the field was never
+   loaded (see imapd_mail_ensure_hdrs). */
+const char *imapd_mail_hdr_field(const Imail *m, int fld);
+
+/* Make sure m's header cache is loaded AND up to date for the file as it
+   exists NOW (per-message lazy work; bytes read are charged against *budget,
+   which is how the non-blocking SEARCH/SORT pump stays bounded).  On first
+   need (or after a size/mtime change — a flags rename preserves both, so
+   STORE never invalidates) this performs ONE bounded header read
+   (imapd_read_hdr) and re-extracts; the result is cached in the view and
+   persisted in the imapd-hdrs sidecar at mailbox close (mb->hdrs_dirty).
+   Returns 1 when the cache is ready (possibly after a fresh extraction),
+   0 when the work would exceed *budget (nothing was read; call again on the
+   next pump slice), or -1 on a hard error (unreadable file: header searches
+   match nothing). */
+int imapd_mail_ensure_hdrs(Mbox *mb, Imail *m, size_t *budget);
+
 /* Rewrite one message's flags (rename keeps the base name and unknown
    letters; the file moves into cur/).  Returns 0, or -1. */
 int imapd_mbox_store(Mbox *mb, uint32_t uid, uint8_t flags);
@@ -474,6 +535,13 @@ void imapd_pop3_readable(ImapdServer *srv, Conn *c, time_t now);
 
 /* Generate more of an active streaming FETCH into c->out (POLLOUT drain). */
 void imapd_fetch_pump(ImapdServer *srv, Conn *c);
+
+/* Generate the next work-budget slice of an active streaming SEARCH/SORT
+   (poll-loop call; drains c->out first). */
+void imapd_search_pump(ImapdServer *srv, Conn *c);
+
+/* Free a streaming SEARCH/SORT generator (NULL-safe). */
+void imapd_searchgen_free(Conn *c);
 
 /* RFC 2177 IDLE: re-scan the selected mailbox and emit unsolicited
    EXISTS/RECENT updates if its message set changed.  No-op unless the

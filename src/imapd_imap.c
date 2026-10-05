@@ -171,45 +171,48 @@ static int read_file(const char *path, char **out, size_t *outlen) {
     return 0;
 }
 
-/* Read only the header block (up to the blank line, or IMAPD_HDR_CAP for a
-   pathological header), NUL-terminated.  Reads in small chunks and stops the
-   moment the header is complete, so a SEARCH that only inspects headers does
-   not read whole large messages — on a 30k-message mailbox reading 256KB (or
-   the full file) per message turned a Message-ID search into ~50s and made
-   clients time out. */
-static size_t msg_hdr_end(const char *msg, size_t len);   /* fwd */
-static int read_hdr(const char *path, char **out, size_t *outlen) {
+/* The bounded header read moved to the maildir layer (imapd_read_hdr,
+   src/imap_maildir.c) so the header cache owns extraction; FETCH keeps
+   using it via the public name. */
+
+/* Read at most `max` bytes of path into a NUL-terminated malloc buffer
+   (the SearchGen body path bounds a single message read by the remaining
+   pump budget so one slice cannot blow the inter-yield bound by a 32MB
+   message).  Returns 0 like read_file, -1 on error. */
+static int read_file_prefix(const char *path, size_t max, char **out,
+                            size_t *outlen) {
+    struct stat st;
     int fd;
     char *buf;
-    size_t got = 0;
+    size_t off = 0, want;
     if (!path || !out || !outlen) return -1;
     *out = NULL;
     *outlen = 0;
-    buf = malloc(IMAPD_HDR_CAP + 1);
-    if (!buf) return -1;
     fd = open(path, O_RDONLY);
-    if (fd < 0) { free(buf); return -1; }
-    while (got < IMAPD_HDR_CAP) {
-        char chunk[8192];
-        size_t need = sizeof chunk;
-        ssize_t r;
-        if (IMAPD_HDR_CAP - got < need) need = IMAPD_HDR_CAP - got;
-        r = read(fd, chunk, need);
+    if (fd < 0) return -1;
+    if (fstat(fd, &st) != 0 || st.st_size < 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return -1;
+    }
+    want = (size_t)st.st_size;
+    if (want > max) want = max;
+    buf = malloc(want + 1);
+    if (!buf) { close(fd); return -1; }
+    while (off < want) {
+        ssize_t r = read(fd, buf + off, want - off);
         if (r < 0) {
             if (errno == EINTR) continue;
-            break;
+            free(buf);
+            close(fd);
+            return -1;
         }
         if (r == 0) break;
-        memcpy(buf + got, chunk, (size_t)r);
-        got += (size_t)r;
-        if (msg_hdr_end(buf, got) < got) break;   /* header block complete */
+        off += (size_t)r;
     }
     close(fd);
-    buf[got] = '\0';
-    got = msg_hdr_end(buf, got);
-    buf[got] = '\0';
+    buf[off] = '\0';
     *out = buf;
-    *outlen = got;
+    *outlen = off;
     return 0;
 }
 
@@ -817,6 +820,33 @@ static bool imapd_search_needs_hdr(const SearchKey *k) {
     }
 }
 
+/* True if EVERY content key is served by the header cache: FROM/TO/CC/BCC/
+   SUBJECT (and a Message-ID HEADER, which the uidlist index already serves).
+   Such a program needs no message file I/O at all — the per-mailbox header
+   cache answers every key. */
+static bool imapd_search_hdr_cacheable(const SearchKey *k) {
+    if (!k) return true;
+    switch (k->kind) {
+    case SK_FROM: case SK_TO: case SK_CC: case SK_BCC: case SK_SUBJECT:
+        return true;
+    case SK_HEADER:
+        return k->hdr && (ascii_ieq_str(k->hdr, "Message-ID") ||
+                          ascii_ieq_str(k->hdr, "Date"));
+    case SK_BODY: case SK_TEXT:
+        return false;
+    case SK_NOT:
+        return imapd_search_hdr_cacheable(k->a);
+    case SK_OR:
+        return imapd_search_hdr_cacheable(k->a) &&
+               imapd_search_hdr_cacheable(k->b);
+    case SK_AND:
+        return imapd_search_hdr_cacheable(k->a) &&
+               imapd_search_hdr_cacheable(k->b);
+    default:
+        return true;   /* metadata/date keys need no message content */
+    }
+}
+
 /* True if every content-bearing key is a Message-ID HEADER search.  These
    are served from the persisted per-message index, so the search needs to
    read no message file at all (reading 30k files per search is what made
@@ -921,6 +951,19 @@ bool imapd_search_match(const SearchKey *k, const ImailDoc *d,
         if (k->hdr && ascii_ieq_str(k->hdr, "Message-ID") &&
             d->m && d->m->mid)
             return ci_strstr(d->m->mid, strlen(d->m->mid), k->str) != NULL;
+        /* Header cache (S2): when the caller ensured the per-message cache
+           (hdr_valid) the indexed fields answer from memory with no file
+           I/O.  hdr_valid=false (cache not loadable, or a caller that did
+           not ensure) falls through to the d->msg header read. */
+        if (d->m && d->m->hdr_valid) {
+            int fld = imapd_mail_hdr_fld(search_hdr_name(k));
+            const char *hv = (fld >= 0)
+                ? imapd_mail_hdr_field(d->m, fld) : NULL;
+            if (fld >= 0 && hv)
+                return ci_strstr(hv, strlen(hv), k->str) != NULL;
+            /* not an indexed field (or a missing block): only the file
+               read can answer */
+        }
         if (!d->msg) return false;
         if (mail_header_get(d->msg, d->msglen, search_hdr_name(k),
                             hdr, sizeof hdr) != 0)
@@ -2018,78 +2061,12 @@ static void do_store(ImapdServer *srv, Conn *c, const char *tag,
     free(set);
 }
 
-static void do_search(ImapdServer *srv, Conn *c, const char *tag,
-                      const char *rest, bool uid) {
-    const char *p = rest;
-    (void)srv;
-    SearchKey *prog = NULL;
-    char *out = NULL;
-    size_t outlen = 0, outcap = 0;
-    size_t i;
-    bool needs;
-    bool needhdr;
-    int r;
-    if (c->ist != IST_SELECTED) {
-        conn_replyf(c, "%s BAD SEARCH not allowed now\r\n", tag);
-        return;
-    }
-    while (*p == ' ') p++;
-    if (ascii_strncasecmp(p, "CHARSET ", 8) == 0) {
-        char *cs = NULL;
-        size_t csl;
-        p += 8;
-        if (imapd_next_astring(&p, &cs, &csl) != 1 ||
-            (!ascii_ieq_str(cs, "UTF-8") && !ascii_ieq_str(cs, "US-ASCII"))) {
-            conn_replyf(c, "%s NO [BADCHARSET (US-ASCII UTF-8)] "
-                           "Charset not supported\r\n", tag);
-            free(cs);
-            return;
-        }
-        free(cs);
-    }
-    r = imapd_search_parse_program(&p, &prog);
-    if (r != 1) {
-        conn_replyf(c, "%s BAD invalid search program\r\n", tag);
-        imapd_search_free(prog);
-        return;
-    }
-    needs = imapd_search_needs_body(prog);
-    needhdr = imapd_search_needs_hdr(prog);
-    if (imapd_search_only_msgid(prog)) { needs = false; needhdr = false; }
-    (void)buf_append(&out, &outlen, &outcap, "* SEARCH", 8);
-    for (i = 0; i < c->mb.nmsgs; i++) {
-        Imail *m = &c->mb.msgs[i];
-        char *msg = NULL;
-        size_t ml = 0;
-        ImailDoc doc;
-        if (needs) {
-            if (read_file(m->path, &msg, &ml) != 0) { msg = NULL; ml = 0; }
-        } else if (needhdr) {
-            if (read_hdr(m->path, &msg, &ml) != 0) { msg = NULL; ml = 0; }
-        }
-        doc.m = m;
-        doc.seq = i + 1;
-        doc.msg = msg;
-        doc.msglen = ml;
-        if (imapd_search_match(prog, &doc, c->mb.uidnext, c->mb.nmsgs)) {
-            char num[16];
-            snprintf(num, sizeof num, " %u",
-                     uid ? m->uid : (uint32_t)(i + 1));
-            (void)buf_append(&out, &outlen, &outcap, num, strlen(num));
-        }
-        free(msg);
-    }
-    (void)buf_append(&out, &outlen, &outcap, "\r\n", 2);
-    conn_reply(c, out);
-    free(out);
-    imapd_search_free(prog);
-    conn_replyf(c, "%s OK %sSEARCH completed\r\n", tag, uid ? "UID " : "");
-}
+
 
 /* SORT (RFC 5256): SORT (criteria) (charset) search-criteria.
-   Returns "* SORT seq...".  Only the ARRIVAL/INTERNALDATE, DATE and SIZE
-   criteria are sorted meaningfully; FROM/TO/CC/SUBJECT fall back to a
-   stable ORDER-BY-INTERNALDATE for determinism. */
+   Returns "* SORT seq...".  ARRIVAL/INTERNALDATE/DATE/SIZE sort on the
+   integer key; FROM/TO/CC/SUBJECT sort on the cached header value (ties
+   break on internal date). */
 typedef struct SortEnt {
     size_t idx;        /* index into c->mb.msgs */
     uint64_t key;      /* sort key: internal_date or size */
@@ -2111,20 +2088,319 @@ static int sort_cmp_str(const void *a, const void *b) {
     return 0;
 }
 
+/* SORT string criteria -> cached header field (IH_*).  The order matches
+   the by_str criteria in do_sort. */
+static const char *const SORT_FIELD_NAMES[] = {
+    "From", "To", "Cc", "Subject"
+};
+static const int SORT_FIELD_IDS[] = {
+    IH_FROM, IH_TO, IH_CC, IH_SUBJ
+};
+
+/* g->sortf stores an IH_* id, not a SORT_FIELD_NAMES index — the fallback
+   sort-key read must index THIS table (IH_NAMES) or SUBJECT (IH_SUBJ=4)
+   reads past SORT_FIELD_NAMES (4 entries) and (by adjacent-pointer luck)
+   silently sorts by From — the v1 bug resurrected on the fallback path. */
+static const char *const IH_NAMES[IH_NFIELDS] = {
+    "From", "To", "Cc", "Bcc", "Subject", "Date"
+};
+
+
+/* ------------------------------------------------------------------ */
+/* Streaming SEARCH/SORT generator                                     */
+/* ------------------------------------------------------------------ */
+
+/* Unlike FETCH (whose output fills the socket and therefore self-throttles
+   on c->out), a SEARCH emits one small line: a writable socket never
+   applies backpressure, so the pump must instead bound its own work per
+   call.  IMAPD_SEARCH_BUDGET is the byte budget of one pump call: bytes
+   read from message files, plus a small per-message allowance for metadata
+   keys so a budget is also consumed on header-less searches.  At the
+   measured ~40 MB/s scan rate this keeps one pump call in the ~50-100 ms
+   range while poll() still blocks between slices, so other connections
+   keep being serviced during a full 2.4 GB TEXT scan. */
+#define IMAPD_SEARCH_BUDGET  (3u * 1024u * 1024u)   /* bytes per slice */
+#define IMAPD_SEARCH_MSGCOST 512u                   /* per-message allowance */
+
+enum { SG_SCAN = 0, SG_DONE = 1 };
+
+struct SearchGen {
+    char     tag[IMAPD_MAX_TAG + 1];
+    bool     uid;      /* UID SEARCH / UID SORT */
+    bool     is_sort;  /* SORT (criteria) instead of SEARCH */
+    int      phase;    /* SG_* */
+    /* parsed program (owned) + content-loading mode */
+    SearchKey *prog;
+    bool     needs;    /* any key needs the full body */
+    bool     needhdr;  /* any key reads headers */
+    /* SORT state */
+    SortEnt *arr;      /* owned (str fields owned per entry) */
+    size_t   n, cap;
+    int      sortf;    /* SORT by a string header: IH_* index, -1 = none */
+    int      reverse;
+    /* content-loading mode: hdr_only = every content key is served by the
+       header cache (no file I/O at all); needhdr = some key needs an
+       unindexed HEADER name (bounded read_hdr fallback) */
+    bool     hdr_only;
+    /* shared scan state */
+    size_t   i;        /* next index into c->mb.msgs */
+    char    *out;      /* accumulated response line (owned) */
+    size_t   outlen, outcap;
+};
+
+static void searchgen_reset(SearchGen *g) {
+    size_t i;
+    imapd_search_free(g->prog);
+    g->prog = NULL;
+    if (g->arr)
+        for (i = 0; i < g->n; i++) free(g->arr[i].str);
+    free(g->arr);
+    g->arr = NULL;
+    g->n = g->cap = 0;
+    free(g->out);
+    g->out = NULL;
+    g->outlen = g->outcap = 0;
+}
+
+void imapd_searchgen_free(Conn *c) {
+    SearchGen *g = c->sg;
+    if (!g) return;
+    searchgen_reset(g);
+    free(g);
+    c->sg = NULL;
+}
+
+/* Append " <num>" for SORT entry i (in final output order). */
+static int sg_put_sort_num(SearchGen *g, Conn *c, size_t i) {
+    char num[16];
+    uint32_t v = g->uid ? c->mb.msgs[g->arr[i].idx].uid
+                        : (uint32_t)(g->arr[i].idx + 1);
+    snprintf(num, sizeof num, " %u", v);
+    return buf_append(&g->out, &g->outlen, &g->outcap, num, strlen(num));
+}
+
+/* Emit the accumulated response line + the tagged OK.  Sets phase DONE.
+   (The one-line output fits c->out; conn_reply keeps the IMAPD_MAX_OUT
+   backpressure so a slow client cannot pin memory.) */
+static void sg_finish(Conn *c, SearchGen *g) {
+    (void)buf_append(&g->out, &g->outlen, &g->outcap, "\r\n", 2);
+    conn_reply(c, g->out);
+    conn_replyf(c, "%s OK %s%s completed\r\n", g->tag,
+                g->uid ? "UID " : "", g->is_sort ? "SORT" : "SEARCH");
+    g->phase = SG_DONE;
+}
+
+static void do_search(ImapdServer *srv, Conn *c, const char *tag,
+                      const char *rest, bool uid) {
+    const char *p = rest;
+    SearchKey *prog = NULL;
+    SearchGen *g;
+    (void)srv;
+    if (c->ist != IST_SELECTED) {
+        conn_replyf(c, "%s BAD SEARCH not allowed now\r\n", tag);
+        return;
+    }
+    if (c->sg) {
+        conn_replyf(c, "%s BAD SEARCH already in progress\r\n", tag);
+        return;
+    }
+    while (*p == ' ') p++;
+    if (ascii_strncasecmp(p, "CHARSET ", 8) == 0) {
+        char *cs = NULL;
+        size_t csl;
+        p += 8;
+        if (imapd_next_astring(&p, &cs, &csl) != 1 ||
+            (!ascii_ieq_str(cs, "UTF-8") && !ascii_ieq_str(cs, "US-ASCII"))) {
+            conn_replyf(c, "%s NO [BADCHARSET (US-ASCII UTF-8)] "
+                           "Charset not supported\r\n", tag);
+            free(cs);
+            return;
+        }
+        free(cs);
+    }
+    if (imapd_search_parse_program(&p, &prog) != 1) {
+        conn_replyf(c, "%s BAD invalid search program\r\n", tag);
+        imapd_search_free(prog);
+        return;
+    }
+    g = calloc(1, sizeof *g);
+    if (!g) {
+        imapd_search_free(prog);
+        conn_replyf(c, "%s NO SEARCH out of memory\r\n", tag);
+        return;
+    }
+    snprintf(g->tag, sizeof g->tag, "%s", tag);
+    g->uid = uid;
+    g->prog = prog;
+    g->needs = imapd_search_needs_body(prog);
+    g->needhdr = imapd_search_needs_hdr(prog);
+    if (imapd_search_only_msgid(prog)) { g->needs = false; g->needhdr = false; }
+    /* cache-only program: no message file is ever opened */
+    g->hdr_only = !g->needs && imapd_search_hdr_cacheable(prog);
+    (void)buf_append(&g->out, &g->outlen, &g->outcap, "* SEARCH", 8);
+    c->sg = g;
+    imapd_search_pump(srv, c);
+}
+
+/* One work-budget slice of the scan.  Returns with phase == SG_DONE (the
+   response has been queued and the generator is spent) or with the budget
+   exhausted and the cursor left for the next POLLOUT round. */
+void imapd_search_pump(ImapdServer *srv, Conn *c) {
+    SearchGen *g = c->sg;
+    size_t budget = IMAPD_SEARCH_BUDGET;
+    (void)srv;
+    if (!g || g->phase == SG_DONE) return;
+    while (g->i < c->mb.nmsgs && !c->closed) {
+        Imail *m = &c->mb.msgs[g->i];
+        char *msg = NULL;
+        size_t ml = 0;
+        ImailDoc doc;
+        bool hdr_cached = false;
+        if (budget < IMAPD_SEARCH_MSGCOST) return;   /* slice over: resume later */
+        budget -= IMAPD_SEARCH_MSGCOST;
+        if (g->needs) {
+            /* Read up to the remaining budget, not the whole file: the
+               budget is the inter-yield bound, and one message can be up
+               to max_msg=32MB (~800ms at the measured 40MB/s — 10x the
+               intended ~75ms slice) if read whole.  The truncated tail can
+               at worst turn a match into a miss for a needle past the
+               prefix, same as an IO error; full read_file stays correct on
+               the small-message common case. */
+            if (read_file_prefix(m->path, budget, &msg, &ml) != 0) {
+                msg = NULL; ml = 0;
+            }
+        } else if (g->hdr_only) {
+            /* Program touches only cached header keys (FROM/TO/CC/BCC/
+               SUBJECT) — no file I/O at all: imapd_search_match reads the
+               cached values directly.  ensure_hdrs performs the one-time
+               bounded extraction, charged to this slice's budget. */
+            int r = imapd_mail_ensure_hdrs(&c->mb, m, &budget);
+            if (r == 0) return;   /* budget exhausted: resume this message */
+            hdr_cached = (r == 1);
+        } else if (g->needhdr) {
+            /* Some key needs an unindexed header (HEADER <name>) or the
+               cache failed for this message: bounded header read.
+               imapd_read_hdr stops at the first blank line or at
+               IMAPD_HDR_CAP (256KB); a message with an even larger header
+               block would miss headers past the cap — a degenerate input
+               the old whole-file read handled, so fall back once. */
+            if (imapd_read_hdr(m->path, &msg, &ml) == 0) {
+                if (ml >= IMAPD_HDR_CAP) {
+                    char *full = NULL;
+                    size_t fl = 0;
+                    if (read_file(m->path, &full, &fl) == 0) {
+                        free(msg);
+                        msg = full;
+                        ml = fl;
+                    }
+                }
+            } else {
+                msg = NULL; ml = 0;
+            }
+        }
+        if (ml > budget) {
+            /* charge the bytes we actually scanned */
+            budget = 0;
+        } else {
+            budget -= ml;
+        }
+        doc.m = m;
+        doc.seq = g->i + 1;
+        doc.msg = msg;
+        doc.msglen = ml;
+        if (g->is_sort) {
+            if (imapd_search_match(g->prog, &doc, c->mb.uidnext,
+                                   c->mb.nmsgs)) {
+                SortEnt *ne;
+                if (g->n == g->cap) {
+                    size_t nc = g->cap ? g->cap * 2 : 64;
+                    SortEnt *na = realloc(g->arr, nc * sizeof *na);
+                    if (!na) {
+                        free(msg);
+                        conn_replyf(c, "%s NO %sSORT out of memory\r\n",
+                                    g->tag, g->uid ? "UID " : "");
+                        g->phase = SG_DONE;
+                        imapd_searchgen_free(c);
+                        return;
+                    }
+                    g->arr = na;
+                    g->cap = nc;
+                }
+                ne = &g->arr[g->n];
+                ne->idx = g->i;
+                ne->key = (uint64_t)m->internal_date;
+                ne->str = NULL;
+                if (g->sortf >= 0) {
+                    const char *sv = NULL;
+                    if (hdr_cached) {
+                        sv = imapd_mail_hdr_field(m, g->sortf);
+                    } else if (msg) {
+                        char hdr[4096];
+                        if (mail_header_get(msg, ml, IH_NAMES[g->sortf],
+                                            hdr, sizeof hdr) == 0)
+                            sv = hdr;
+                    }
+                    /* stable key: absent header sorts as "" (ties break on
+                       the secondary internal-date key) */
+                    ne->str = strdup(sv ? sv : "");
+                    if (!ne->str) {
+                        free(msg);
+                        conn_replyf(c, "%s NO %sSORT out of memory\r\n",
+                                    g->tag, g->uid ? "UID " : "");
+                        g->phase = SG_DONE;
+                        imapd_searchgen_free(c);
+                        return;
+                    }
+                }
+                g->n++;
+            }
+        } else if (imapd_search_match(g->prog, &doc, c->mb.uidnext,
+                                     c->mb.nmsgs)) {
+            char num[16];
+            snprintf(num, sizeof num, " %u",
+                     g->uid ? m->uid : (uint32_t)(g->i + 1));
+            (void)buf_append(&g->out, &g->outlen, &g->outcap, num,
+                             strlen(num));
+        }
+        free(msg);
+        g->i++;
+    }
+    /* scan finished: sort (31k-entry qsort is ~ms: fine inline in this
+       slice) and emit the single response line */
+    if (g->is_sort) {
+        size_t i;
+        qsort(g->arr, g->n, sizeof *g->arr,
+              g->sortf >= 0 ? sort_cmp_str : sort_cmp_int);
+        for (i = 0; i < g->n; i++) {
+            size_t k = g->reverse ? g->n - 1 - i : i;
+            if (sg_put_sort_num(g, c, k) != 0) {
+                conn_replyf(c, "%s NO %sSORT out of memory\r\n",
+                            g->tag, g->uid ? "UID " : "");
+                g->phase = SG_DONE;
+                imapd_searchgen_free(c);
+                return;
+            }
+        }
+    }
+    sg_finish(c, g);
+    imapd_searchgen_free(c);   /* conn_destroy expects c->sg NULL after DONE */
+}
+
 static void do_sort(ImapdServer *srv, Conn *c, const char *tag,
                     const char *rest, bool uid) {
     const char *p = rest;
     SearchKey *prog = NULL;
-    SortEnt *arr = NULL;
-    size_t n = 0, cap = 0, i;
+    SearchGen *g;
     char *cs = NULL;
     size_t csl;
-    int by_str = 0, reverse = 0;
-    char *out = NULL;
-    size_t outlen = 0, outcap = 0;
+    int sortf = -1, reverse = 0;
     (void)srv;
     if (c->ist != IST_SELECTED) {
         conn_replyf(c, "%s BAD SORT not allowed now\r\n", tag);
+        return;
+    }
+    if (c->sg) {
+        conn_replyf(c, "%s BAD SORT already in progress\r\n", tag);
         return;
     }
     /* criteria list "(ARRIVAL DATE ...)" */
@@ -2137,23 +2413,30 @@ static void do_sort(ImapdServer *srv, Conn *c, const char *tag,
     for (;;) {
         char *tok = NULL;
         size_t tl;
+        int si;
         while (*p == ' ') p++;
         if (*p == ')' || *p == '\0') { if (*p==')') p++; break; }
         if (imapd_next_astring(&p, &tok, &tl) != 1) {
             free(tok);
             conn_replyf(c, "%s BAD SORT invalid criteria\r\n", tag);
-            goto out;
+            return;
         }
         if (ascii_ieq_str(tok, "REVERSE")) reverse = 1;
         else if (ascii_ieq_str(tok, "ARRIVAL") || ascii_ieq_str(tok, "INTERNALDATE"))
-            by_str = 0;
+            sortf = -1;
         else if (ascii_ieq_str(tok, "DATE"))
-            by_str = 0;
-        else if (ascii_ieq_str(tok, "FROM") || ascii_ieq_str(tok, "TO") ||
-                 ascii_ieq_str(tok, "CC") || ascii_ieq_str(tok, "SUBJECT"))
-            by_str = 1;
+            sortf = -1;
         else if (ascii_ieq_str(tok, "SIZE"))
-            by_str = 0;
+            sortf = -1;
+        else {
+            /* FROM/TO/CC/SUBJECT: pick the RIGHT field (v1 hardcoded "From"
+               for all four, so SORT (SUBJECT) actually sorted by From). */
+            for (si = 0; si < 4; si++)
+                if (ascii_ieq_str(tok, SORT_FIELD_NAMES[si])) {
+                    sortf = SORT_FIELD_IDS[si];
+                    break;
+                }
+        }
         free(tok);
     }
     /* charset */
@@ -2163,96 +2446,35 @@ static void do_sort(ImapdServer *srv, Conn *c, const char *tag,
         conn_replyf(c, "%s NO [BADCHARSET (US-ASCII UTF-8)] "
                        "Charset not supported\r\n", tag);
         free(cs);
-        goto out;
+        return;
     }
     free(cs);
     /* search program */
     if (imapd_search_parse_program(&p, &prog) != 1) {
         conn_replyf(c, "%s BAD invalid search program\r\n", tag);
-        goto out;
+        imapd_search_free(prog);
+        return;
     }
-    {
-        bool needs = imapd_search_needs_body(prog);
-        bool needhdr = imapd_search_needs_hdr(prog);
-        for (i = 0; i < c->mb.nmsgs; i++) {
-            Imail *m = &c->mb.msgs[i];
-            char *msg = NULL;
-            size_t ml = 0;
-            ImailDoc doc;
-            SortEnt *ne;
-            if (needs) {
-                if (read_file(m->path, &msg, &ml) != 0) { msg = NULL; ml = 0; }
-            } else if (needhdr) {
-                if (read_hdr(m->path, &msg, &ml) != 0) { msg = NULL; ml = 0; }
-            }
-            doc.m = m; doc.seq = i + 1; doc.msg = msg; doc.msglen = ml;
-            if (!imapd_search_match(prog, &doc, c->mb.uidnext, c->mb.nmsgs)) {
-                free(msg);
-                continue;
-            }
-            if (n == cap) {
-                size_t nc = cap ? cap * 2 : 64;
-                SortEnt *na = realloc(arr, nc * sizeof *na);
-                if (!na) { free(msg); goto oom; }
-                arr = na; cap = nc;
-            }
-            ne = &arr[n];
-            ne->idx = i;
-            ne->key = (uint64_t)m->internal_date;
-            ne->str = NULL;
-            if (by_str) {
-                char hdr[4096];
-                const char *hn = "From";
-                if (msg) {   /* full body or header-only read */
-                    /* extract the sort header if we have the content */
-                    if (mail_header_get(msg, ml, hn, hdr, sizeof hdr) == 0)
-                        ne->str = strdup(hdr);
-                }
-            }
-            free(msg);
-            n++;
-        }
+    g = calloc(1, sizeof *g);
+    if (!g) {
+        imapd_search_free(prog);
+        conn_replyf(c, "%s NO SORT out of memory\r\n", tag);
+        return;
     }
-    if (by_str)
-        qsort(arr, n, sizeof *arr, sort_cmp_str);
-    else
-        qsort(arr, n, sizeof *arr, sort_cmp_int);
-    (void)buf_append(&out, &outlen, &outcap, "* SORT", 6);
-    if (reverse)
-        for (i = n; i > 0; i--) {
-            char num[16];
-            snprintf(num, sizeof num, " %u",
-                     uid ? c->mb.msgs[arr[i-1].idx].uid
-                         : (uint32_t)(arr[i-1].idx + 1));
-            (void)buf_append(&out, &outlen, &outcap, num, strlen(num));
-        }
-    else
-        for (i = 0; i < n; i++) {
-            char num[16];
-            snprintf(num, sizeof num, " %u",
-                     uid ? c->mb.msgs[arr[i].idx].uid
-                         : (uint32_t)(arr[i].idx + 1));
-            (void)buf_append(&out, &outlen, &outcap, num, strlen(num));
-        }
-    (void)buf_append(&out, &outlen, &outcap, "\r\n", 2);
-    conn_reply(c, out);
-    free(out);
-    for (i = 0; i < n; i++) free(arr[i].str);
-    free(arr);
-    imapd_search_free(prog);
-    conn_replyf(c, "%s OK %sSORT completed\r\n", tag, uid ? "UID " : "");
-    return;
-oom:
-    for (i = 0; i < n; i++) free(arr[i].str);
-    free(arr);
-    imapd_search_free(prog);
-    conn_replyf(c, "%s NO SORT out of memory\r\n", tag);
-    return;
-out:
-    imapd_search_free(prog);
-    for (i = 0; i < n; i++) free(arr[i].str);
-    free(arr);
-    free(out);
+    snprintf(g->tag, sizeof g->tag, "%s", tag);
+    g->uid = uid;
+    g->is_sort = true;
+    g->sortf = sortf;
+    g->reverse = reverse;
+    g->prog = prog;
+    g->needs = imapd_search_needs_body(prog);
+    g->needhdr = imapd_search_needs_hdr(prog);
+    /* A by-string SORT reads its key from the cache; the program keys must
+       be cacheable too (no BODY/TEXT, no unindexed HEADER). */
+    g->hdr_only = !g->needs && imapd_search_hdr_cacheable(prog);
+    (void)buf_append(&g->out, &g->outlen, &g->outcap, "* SORT", 6);
+    c->sg = g;
+    imapd_search_pump(srv, c);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3304,6 +3526,7 @@ static void imap_process(ImapdServer *srv, Conn *c, time_t now) {
         size_t i;
         if (c->closed) return;
         if (c->fg) return;   /* a streaming FETCH owns the connection */
+        if (c->sg) return;   /* a streaming SEARCH/SORT owns the connection */
         if (c->tls && !imapd_tls_established(c)) return;   /* handshaking */
         if (c->mode == IC_LIT) {
             size_t take;
