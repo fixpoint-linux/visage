@@ -169,17 +169,22 @@ static int relaxed_body_sha256(const char *body, size_t len,
         j = ls;
         while (j < i && is_wsp(body[j])) j++;
         if (j < i) {                 /* non-empty line: earlier CRLFs are not trailing */
-            bool pending = false, seen = false;
+            bool pending = false;
             char *w;
             if (bh_crlf(&b, b.owed) != 0) goto fail;
             if (bh_reserve(&b, i - ls) != 0) goto fail;
             b.owed = 1;
             w = b.s.p + b.s.len;
+            /* A WSP run collapses to one SP wherever it occurs -- including at
+               the START of the line (RFC 6376 3.4.4 reduces "all sequences of
+               WSP within a line"; the leading run is one such sequence and is
+               NOT stripped).  Only a trailing run vanishes, and its SP is never
+               emitted because no later non-WSP byte flushes `pending`. */
             for (j = ls; j < i; j++) {
                 char c = body[j];
-                if (is_wsp(c)) { if (seen) pending = true; continue; }
+                if (is_wsp(c)) { pending = true; continue; }
                 if (pending) { *w++ = ' '; pending = false; }
-                *w++ = c; seen = true;
+                *w++ = c;
             }
             b.s.len = (size_t)(w - b.s.p);
         } else {

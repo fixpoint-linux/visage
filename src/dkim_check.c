@@ -65,6 +65,46 @@ int main(void) {
                   "relaxed body bh golden = 2jUSOH9NhtVGCQWNr9BrIAPreKQjO6Sn7XIkfJVOzv8=");
         }
     }
+    /* leading-WSP body line golden (RFC 6376 3.4.5 Example 1): the body
+       " C \r\nD \t E\r\n\r\n\r\n" canonicalizes to " C\r\nD E\r\n" -- a
+       leading WSP run collapses to a SINGLE SP, it is NOT stripped.  A signer
+       that dropped leading WSP produced a wrong bh on any message with an
+       indented body line (e.g. a folded continuation inside a MIME part), so
+       every such message failed DKIM at the receiver while the signer's own
+       verify -- which shared the bug -- reported a clean round-trip. */
+    {
+        char bh[64];
+        const char *body = " C \r\nD \t E\r\n\r\n\r\n";
+        if (dkim_relaxed_body_b64(body, strlen(body), bh) != 0) {
+            printf("FAIL  relaxed_body_b64 returned error\n"); failures++;
+        } else {
+            check(strcmp(bh, "unak6JHq0wL+Q1HP7dW1tjBx9FLA6DffoZ0qrLwbbpo=") == 0,
+                  "relaxed body leading-WSP bh (RFC 6376 3.4.5 ex.1) = unak6JHq0wL+Q1HP7dW1tjBx9FLA6DffoZ0qrLwbbpo=");
+        }
+    }
+    /* streaming path: a body larger than RELAXED_BODY_FLUSH exercises the
+       staged-fold branch, which the small-body goldens never reach. */
+    {
+        const size_t nline = 3000;
+        const char *line = " \tHello  World\t\r\n";
+        size_t llen = strlen(line);
+        char *body = malloc(nline * llen + 5);
+        char bh[64];
+        size_t k = 0;
+        for (size_t i = 0; i < nline; i++) { memcpy(body + k, line, llen); k += llen; }
+        memcpy(body + k, "End\r\n", 5); k += 5;
+        if (dkim_relaxed_body_b64(body, k, bh) != 0) {
+            printf("FAIL  relaxed_body_b64 (fold path) returned error\n"); failures++;
+        } else {
+            /* golden: sha256 of (" Hello World\r\n" x3000) + "End\r\n",
+               computed independently (python hashlib) from the RFC 6376
+               relaxed rule; the folded canonical body is 42005 bytes. */
+            check(strcmp(bh, "zsohxwhOkehxuQyuaIQ8M1JqlVfT8m2uz/ndU8Ieioo=") == 0,
+                  "relaxed body > 32768 fold-path bh = zsohxwhOkehxuQyuaIQ8M1JqlVfT8m2uz/ndU8Ieioo=");
+        }
+        free(body);
+    }
+
     /* empty-body hash golden (RFC 6376: empty body -> single CRLF) */
     {
         char bh[64];
