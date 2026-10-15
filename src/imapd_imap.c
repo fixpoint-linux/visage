@@ -32,6 +32,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <arpa/inet.h>
 
 /* Debug tracing: enabled by IMAPD_DEBUG=1.  Logs every IMAP command and
    every connection close to stderr (systemd journal), so a client's exact
@@ -53,6 +54,65 @@ static void imapd_dbg(const char *fmt, ...) {
     va_end(ap);
     fputc('\n', stderr);
     fflush(stderr);
+}
+
+/* Split a decoded SASL PLAIN payload (RFC 4616: authzid NUL authcid NUL
+   passwd) into its three fields.  `buf[len]` must be NUL — the caller
+   terminates the decoded buffer — so each field is readable as a C string
+   once its start is located.  Returns 0, or -1 if the payload is malformed.
+   Exported so the split is testable: the fields feed credential comparison
+   directly, and a wrong offset here authenticates with the wrong string. */
+int imapd_sasl_plain_split(unsigned char *buf, size_t len,
+                           const char **authzid, const char **authcid,
+                           const char **pass) {
+    size_t zl, al;
+    *authzid = (const char *)buf;
+    zl = strlen(*authzid);
+    if (zl + 1 >= len)
+        return -1;                       /* no authcid NUL in the payload   */
+    *authcid = (const char *)buf + zl + 1;
+    al = strlen(*authcid);
+    if (zl + 1 + al + 1 > len)
+        return -1;                       /* no passwd field at all          */
+    /* Each separator NUL is consumed exactly once.  Counting the first one
+       twice - as `i += strlen(authcid) + 1` did from an `i` that already
+       held strlen(authzid) - pointed `pass` at the separator instead of the
+       password, so every AUTHENTICATE PLAIN compared an empty password. */
+    *pass = (const char *)buf + zl + 1 + al + 1;
+    return 0;
+}
+
+/* Session tracing (always on, unlike the IMAPD_DEBUG command trace above).
+   The peer address is the point: it is the only record of where a session
+   came from, and the only evidence of a failed login.  Only the user name
+   is ever passed in - never the password. */
+void imapd_log_peer(const Conn *c, const char *event, const char *user,
+                    const char *detail) {
+    char ip[INET6_ADDRSTRLEN];
+    ip[0] = '\0';
+    if (c->peer_ip_len == 4)
+        (void)inet_ntop(AF_INET, c->peer_ip, ip, sizeof ip);
+    else if (c->peer_ip_len == 16)
+        (void)inet_ntop(AF_INET6, c->peer_ip, ip, sizeof ip);
+    if (ip[0] == '\0')
+        snprintf(ip, sizeof ip, "unknown");
+    fprintf(stderr, "imapd %s sess=%u proto=%s peer=%s user=%s%s%s\n", event,
+            (unsigned)c->id, c->kind == CONN_POP3 ? "pop3" : "imap", ip,
+            (user && user[0]) ? user : "-",
+            detail ? " " : "", detail ? detail : "");
+    fflush(stderr);
+}
+
+/* Copy client-supplied text into a log field: printable only, truncated.
+   The ID command (RFC 2971) carries attacker-influencable bytes - a newline
+   there would forge a whole journal line - so it is never logged raw. */
+static void log_field(char *dst, size_t dsz, const char *src, size_t slen) {
+    size_t o = 0;
+    for (size_t i = 0; i < slen && o + 1 < dsz; i++) {
+        unsigned char ch = (unsigned char)src[i];
+        dst[o++] = (ch < 0x20 || ch == 0x7f) ? '.' : (char)ch;
+    }
+    dst[o] = '\0';
 }
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -1143,10 +1203,13 @@ static const char *cap_of(ImapdServer *srv, Conn *c) {
 /* ------------------------------------------------------------------ */
 
 static void auth_apply(ImapdServer *srv, Conn *c, const char *tag,
-                       const char *user, const char *pass) {
+                       const char *user, const char *pass, const char *mech) {
     time_t now = time(NULL);
+    char det[16];
+    snprintf(det, sizeof det, "mech=%s", mech);
     /* Brute-force gate: refuse before even checking the credential. */
     if (imapd_auth_blocked(srv, c->peer_ip, c->peer_ip_len, now)) {
+        imapd_log_peer(c, "auth-blocked", user, det);
         conn_replyf(c, "%s NO [AUTHENTICATIONFAILED] Too many failed "
                        "attempts; try again later\r\n", tag);
         return;
@@ -1157,10 +1220,12 @@ static void auth_apply(ImapdServer *srv, Conn *c, const char *tag,
         c->user = strdup(user);
         if (!c->user) { conn_replyf(c, "%s NO out of memory\r\n", tag); return; }
         c->ist = IST_AUTH;
+        imapd_log_peer(c, "auth-ok", c->user, det);
         conn_replyf(c, "%s OK [CAPABILITY %s] authentication completed\r\n",
                     tag, cap_of(srv, c));
     } else {
         imapd_auth_fail(srv, c->peer_ip, c->peer_ip_len, now);
+        imapd_log_peer(c, "auth-fail", user, det);
         conn_replyf(c, "%s NO [AUTHENTICATIONFAILED] "
                        "Authentication failed\r\n", tag);
     }
@@ -1175,6 +1240,7 @@ static void auth_plain_b64(ImapdServer *srv, Conn *c, const char *tag,
     char *z = NULL;
     if (blen == 1 && b64[0] == '=') { b64 = ""; blen = 0; }   /* empty resp */
     if (imapd_b64_decode(b64, blen, msg, sizeof msg, &mlen) != 0) {
+        imapd_log_peer(c, "auth-reject", NULL, "mech=plain reason=bad-base64");
         conn_replyf(c, "%s NO [AUTHENTICATIONFAILED] Invalid SASL response\r\n",
                     tag);
         return;
@@ -1183,32 +1249,26 @@ static void auth_plain_b64(ImapdServer *srv, Conn *c, const char *tag,
        parsing below is bounded.  mlen <= 384 (512/4*3) < 512, so this is
        always in-bounds. */
     msg[mlen] = '\0';
-    authzid = (const char *)msg;
-    {
-        size_t i = strlen(authzid);
-        if (i + 1 >= mlen) {
-            conn_replyf(c, "%s NO [AUTHENTICATIONFAILED] Invalid SASL response\r\n",
-                        tag);
-            return;
-        }
-        authcid = (const char *)msg + i + 1;
-        i += strlen(authcid) + 1;
-        if (i >= mlen) {
-            conn_replyf(c, "%s NO [AUTHENTICATIONFAILED] Invalid SASL response\r\n",
-                        tag);
-            return;
-        }
-        pass = (const char *)msg + i;
+    if (imapd_sasl_plain_split(msg, mlen, &authzid, &authcid, &pass) != 0) {
+        imapd_log_peer(c, "auth-reject", NULL, "mech=plain reason=malformed");
+        conn_replyf(c, "%s NO [AUTHENTICATIONFAILED] Invalid SASL response\r\n",
+                    tag);
+        return;
     }
     /* authzid, when present, must equal the authcid (proxy logins unsupported) */
     if (authzid[0] && strcmp(authzid, authcid) != 0) {
+        /* Logged as auth-reject, not auth-fail: no credential was checked
+           here, so this must not count toward imapd's lockout or the ban
+           jail.  A client that sends a mismatched authzid and then succeeds
+           with LOGIN shows up as exactly this line. */
+        imapd_log_peer(c, "auth-reject", authcid, "mech=plain reason=authzid");
         conn_replyf(c, "%s NO [AUTHENTICATIONFAILED] Authentication failed\r\n",
                     tag);
         return;
     }
     z = strdup(authcid);
     if (!z) { conn_replyf(c, "%s NO out of memory\r\n", tag); return; }
-    auth_apply(srv, c, tag, z, pass);
+    auth_apply(srv, c, tag, z, pass, "plain");
     free(z);
 }
 
@@ -1250,7 +1310,7 @@ static void do_login(ImapdServer *srv, Conn *c, const char *tag,
         free(pass);
         return;
     }
-    auth_apply(srv, c, tag, user, pass);
+    auth_apply(srv, c, tag, user, pass, "login");
     free(user);
     free(pass);
 }
@@ -3803,7 +3863,14 @@ static void dispatch(ImapdServer *srv, Conn *c) {
             conn_replyf(c, "%s OK UNSELECT completed\r\n", tag);
         }
     } else if (ascii_ieq_str(word, "ID")) {
-        /* RFC 2971: we advertise no client-id info; return NIL. */
+        /* RFC 2971: we advertise no client-id info; return NIL.  The client's
+           own id - the only self-identification a mail session ever carries -
+           is logged, because it is what names the application or device
+           behind a failing login. */
+        char safe[160], det[176];
+        log_field(safe, sizeof safe, p ? p : "", p ? strlen(p) : 0);
+        snprintf(det, sizeof det, "id=%s", safe);
+        imapd_log_peer(c, "client-id", NULL, det);
         conn_reply(c, "* ID NIL\r\n");
         conn_replyf(c, "%s OK ID completed\r\n", tag);
     } else if (ascii_ieq_str(word, "GETQUOTA")) {

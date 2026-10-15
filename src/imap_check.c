@@ -225,6 +225,69 @@ static void tokenizer_test(void) {
     }
 }
 
+/* ---- (5a) SASL PLAIN field split (AUTHENTICATE PLAIN) ---- */
+
+/* The decode above is only half the path: the decoded bytes must be split
+   into authzid/authcid/passwd, and those pointers are what get compared
+   against the credential.  Without this, no client could ever authenticate
+   with AUTHENTICATE PLAIN while every unit test still passed. */
+static void sasl_plain_test(void) {
+    unsigned char buf[64];
+    const char *z = NULL, *u = NULL, *p = NULL;
+    size_t n;
+
+    /* "" NUL "user" NUL "pass" - the form every client sends */
+    n = 1 + 4 + 1 + 4;
+    memcpy(buf, "\0user\0pass", n);
+    buf[n] = '\0';
+    EXPECT(imapd_sasl_plain_split(buf, n, &z, &u, &p) == 0 &&
+               strcmp(z, "") == 0 && strcmp(u, "user") == 0 &&
+               strcmp(p, "pass") == 0,
+           "sasl plain split: empty authzid");
+
+    /* non-empty authzid equal to the authcid (allowed: not a proxy login) */
+    n = 4 + 1 + 4 + 1 + 4;
+    memcpy(buf, "user\0user\0pass", n);
+    buf[n] = '\0';
+    EXPECT(imapd_sasl_plain_split(buf, n, &z, &u, &p) == 0 &&
+               strcmp(z, "user") == 0 && strcmp(u, "user") == 0 &&
+               strcmp(p, "pass") == 0,
+           "sasl plain split: authzid present");
+
+    /* NUL is the separator in this grammar (RFC 4616), so a password cannot
+       itself contain one - it would be a second field, not a longer
+       password.  Asserted as a boundary: empty authzid and authcid. */
+    n = 1 + 0 + 1 + 4;
+    memcpy(buf, "\0\0pass", n);
+    buf[n] = '\0';
+    EXPECT(imapd_sasl_plain_split(buf, n, &z, &u, &p) == 0 &&
+               strcmp(z, "") == 0 && strcmp(u, "") == 0 &&
+               strcmp(p, "pass") == 0,
+           "sasl plain split: empty authzid and authcid");
+
+    /* missing passwd field */
+    n = 1 + 4;
+    memcpy(buf, "\0user", n);
+    buf[n] = '\0';
+    EXPECT(imapd_sasl_plain_split(buf, n, &z, &u, &p) == -1,
+           "sasl plain split: no passwd");
+
+    /* bare authzid, no separators at all */
+    n = 4;
+    memcpy(buf, "user", n);
+    buf[n] = '\0';
+    EXPECT(imapd_sasl_plain_split(buf, n, &z, &u, &p) == -1,
+           "sasl plain split: authzid only");
+
+    /* empty passwd is a valid split, not malformed */
+    n = 1 + 4 + 1;
+    memcpy(buf, "\0user\0", n);
+    buf[n] = '\0';
+    EXPECT(imapd_sasl_plain_split(buf, n, &z, &u, &p) == 0 &&
+               strcmp(u, "user") == 0 && strcmp(p, "") == 0,
+           "sasl plain split: empty passwd");
+}
+
 /* ---- (5) base64 decode (AUTH PLAIN) ---- */
 
 static void b64_test(void) {
@@ -989,6 +1052,7 @@ int main(void) {
     tokenizer_test();
     search_test();
     b64_test();
+    sasl_plain_test();
     bf_test();
     wildmat_test();
     tls_test();

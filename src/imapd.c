@@ -137,6 +137,8 @@ static size_t count_peer_conns(const ImapdServer *srv, const unsigned char *ip,
 
 static void conn_destroy(Conn *c) {
     size_t i;
+    if (c->kind != CONN_INGEST)
+        imapd_log_peer(c, "disconnect", c->user, NULL);
     if (c->kind == CONN_IMAP && getenv("IMAPD_DEBUG") &&
         getenv("IMAPD_DEBUG")[0] && getenv("IMAPD_DEBUG")[0] != '0')
         fprintf(stderr, "imapd CLOSE user=%s kind=%d out_len=%zu out_off=%zu\n",
@@ -453,7 +455,12 @@ static void server_accept(ImapdServer *srv, int lfd, int kind, time_t now) {
         c->ist = IST_NOT_AUTH;
         c->pst = PO_AUTH;
         c->last_act = now;
+        c->id = ++srv->next_conn_id;
         (void)peer_ip_of(&sa, salen, c->peer_ip, &c->peer_ip_len);
+        /* The ingest socket is visage on loopback; only IMAP/POP3 sessions
+           are logged (their clients are the ones worth attributing). */
+        if (kind != CONN_INGEST)
+            imapd_log_peer(c, "connect", NULL, NULL);
 
         if (srv->nconns == srv->conn_cap) {
             size_t nc = srv->conn_cap ? srv->conn_cap * 2 : 16;

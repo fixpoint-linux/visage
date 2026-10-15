@@ -232,6 +232,7 @@ typedef struct ImapdServer {
     bool        pop3_loopback;   /* POP3 listener bound to a loopback addr */
     ImapdFail   fails[IMAPD_AUTH_MAX_TRACKED];
     size_t      nfails;
+    uint32_t    next_conn_id;    /* source of Conn.id */
 } ImapdServer;
 
 typedef struct FetchGen FetchGen;   /* opaque: imapd_imap.c */
@@ -256,6 +257,7 @@ enum { IC_LINE = 0, IC_LIT };
 typedef struct Conn {
     int    fd;
     int    kind;               /* CONN_INGEST / CONN_IMAP */
+    uint32_t id;               /* session id: ties journal lines together */
     bool   closed;             /* close once the output buffer drains */
     char  *in;                 /* raw recv buffer (owned) */
     size_t in_len, in_cap;
@@ -510,6 +512,28 @@ void imapd_auth_fail(ImapdServer *srv, const unsigned char *ip, uint8_t len,
 void imapd_auth_clear(ImapdServer *srv, const unsigned char *ip, uint8_t len);
 bool imapd_auth_blocked(ImapdServer *srv, const unsigned char *ip,
                         uint8_t len, time_t now);
+
+/* Session tracing.  imapd otherwise writes nothing per connection, so a
+   session leaves no record of where it came from and a failed login is
+   invisible; this emits one line per event (to stderr, i.e. the journal).
+   The line is:
+       imapd <event> sess=<id> proto=<imap|pop3> peer=<addr> user=<name|->[ <detail>]
+   sess ties every line of one connection together, so a failure can be
+   attributed to the session (and the client) that produced it.  `event` is a
+   short verb - "connect", "auth-ok", "auth-fail", "auth-reject",
+   "auth-blocked", "client-id", "disconnect" - and `user` may be NULL before
+   authentication.  `detail` is free-form and may be NULL.  The password is
+   never passed in, so it cannot be logged here. */
+void imapd_log_peer(const Conn *c, const char *event, const char *user,
+                    const char *detail);
+
+/* Split a decoded SASL PLAIN payload (RFC 4616) into authzid/authcid/passwd.
+   `buf[len]` must be NUL-terminated by the caller.  Returns 0, or -1 when
+   the payload is malformed.  These pointers feed credential comparison, so a
+   wrong offset authenticates with the wrong string (see imap_check.c). */
+int imapd_sasl_plain_split(unsigned char *buf, size_t len,
+                           const char **authzid, const char **authcid,
+                           const char **pass);
 
 /* Add/replace one "user:pass" line in $ROOT/imapd.passwd (creating the root
    dir and chmod 0600).  Used by the `imapd passwd` subcommand. */

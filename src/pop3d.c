@@ -434,6 +434,7 @@ static void cmd_pass(ImapdServer *srv, Conn *c, const char *arg) {
         return;
     }
     if (imapd_auth_blocked(srv, c->peer_ip, c->peer_ip_len, time(NULL))) {
+        imapd_log_peer(c, "auth-blocked", c->pend_user, "mech=pass");
         pop3_err(c, "Too many failed attempts; try again later");
         free(c->pend_user);
         c->pend_user = NULL;
@@ -441,6 +442,7 @@ static void cmd_pass(ImapdServer *srv, Conn *c, const char *arg) {
     }
     if (!imapd_auth_check(srv, c->pend_user, arg)) {
         imapd_auth_fail(srv, c->peer_ip, c->peer_ip_len, time(NULL));
+        imapd_log_peer(c, "auth-fail", c->pend_user, "mech=pass");
         /* RFC 1939: a failed PASS drops the pending USER; the client must
            re-issue USER before PASS again */
         pop3_err(c, "Invalid credentials");
@@ -452,6 +454,7 @@ static void cmd_pass(ImapdServer *srv, Conn *c, const char *arg) {
     free(c->user);
     c->user = strdup(c->pend_user);
     if (!c->user) { pop3_err(c, "Out of memory"); return; }
+    imapd_log_peer(c, "auth-ok", c->user, "mech=pass");
     free(c->pend_user);
     c->pend_user = NULL;
     if (open_inbox(srv, c) != 0) {
