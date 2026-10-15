@@ -390,6 +390,12 @@ bool imapd_search_needs_body(const SearchKey *k);
 /* Resolve user+mailbox name to its directory: "INBOX" (case-insensitive)
    -> <root>/<user>/Inbox; anything else -> <root>/<user>/.<Name>.
    Returns 0, or -1 on an invalid user/name or a truncated path. */
+/* Resolve a delivery recipient's local part to a mailbox: "user" -> that
+   user's INBOX, "user+Folder" -> that folder.  Returns 0, or -1 when the
+   local part or folder name is invalid. */
+int imapd_delivery_target(const char *local, char *user, size_t usersz,
+                          char *folder, size_t foldersz);
+
 int imapd_mbox_dir(const ImapdConfig *cfg, const char *user, const char *name,
                    char *out, size_t outsz);
 

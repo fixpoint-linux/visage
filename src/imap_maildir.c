@@ -904,6 +904,28 @@ int imapd_mbox_name_ok(const char *name) {
 /* Mailbox paths                                                       */
 /* ------------------------------------------------------------------ */
 
+/* Resolve a delivery recipient's local part to a mailbox: "user" delivers to
+   that user's INBOX, "user+Folder" to that folder of that user.  '+' is the
+   delimiter because imapd_user_ok() forbids it, so the split is unambiguous.
+   Returns 0, or -1 when the local part or the folder name is invalid; the
+   caller decides what to do with an invalid target. */
+int imapd_delivery_target(const char *local, char *user, size_t usersz,
+                          char *folder, size_t foldersz) {
+    const char *plus;
+    size_t ulen;
+    if (!local || !local[0]) return -1;
+    plus = strchr(local, '+');
+    ulen = plus ? (size_t)(plus - local) : strlen(local);
+    if (ulen == 0 || ulen >= usersz) return -1;
+    memcpy(user, local, ulen);
+    user[ulen] = '\0';
+    if (!imapd_user_ok(user)) return -1;
+    if (!plus)
+        return (snprintf(folder, foldersz, "INBOX") >= (int)foldersz) ? -1 : 0;
+    if (snprintf(folder, foldersz, "%s", plus + 1) >= (int)foldersz) return -1;
+    return imapd_mbox_name_ok(folder);
+}
+
 int imapd_mbox_dir(const ImapdConfig *cfg, const char *user, const char *name,
                    char *out, size_t outsz) {
     if (!cfg || !cfg->root || !imapd_user_ok(user)) return -1;

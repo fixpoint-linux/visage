@@ -294,9 +294,29 @@ static void ingest_deliver(ImapdServer *srv, Conn *c) {
     for (i = 0; i < c->nrcpts; i++) {
         const char *rcpt = c->rcpts[i];
         char *local = NULL, *domain = NULL;
+        /* Pre-set so the fallback below can test the resolver's output even
+           when it bailed before writing it. */
+        char user[IMAPD_MAX_USER + 1] = "", folder[IMAPD_MAX_MBOX + 1] = "";
         char dir[4096];
         if (mail_addr_parse(rcpt, &local, &domain) != 0) { failed = 1; continue; }
-        if (imapd_mbox_dir(&srv->cfg, local, "INBOX", dir, sizeof dir) != 0 ||
+        if (imapd_delivery_target(local, user, sizeof user, folder,
+                                  sizeof folder) != 0) {
+            if (!imapd_user_ok(user)) {
+                /* The user half itself is unusable: refuse (the relay retries
+                   and the failure stays visible in its queue). */
+                failed = 1;
+                mail_addr_free(local, domain);
+                continue;
+            }
+            /* Usable user, unusable folder.  Only our own config writes these
+               destinations (visage's catch_all or an alias destination), so
+               this is a config typo: deliver to the INBOX rather than lose
+               the mail, and say so. */
+            fprintf(stderr, "imapd ingest: bad folder in '%s', "
+                            "delivering to INBOX\n", local);
+            snprintf(folder, sizeof folder, "INBOX");
+        }
+        if (imapd_mbox_dir(&srv->cfg, user, folder, dir, sizeof dir) != 0 ||
             imapd_mbox_deliver(dir, msg, msglen, 0, NULL) != 0)
             failed = 1;
         mail_addr_free(local, domain);
@@ -403,12 +423,24 @@ static void ingest_command(ImapdServer *srv, Conn *c, char *line) {
             return;
         }
         mail_addr_free(local, domain);
-        /* The RCPT local-part names the maildir user directory. */
+        /* The RCPT local-part names the maildir user directory, optionally
+           with a "+Folder" suffix.  Only the user part decides acceptance: an
+           unusable folder must not refuse the address (that would silently
+           stop accepted mail on a config typo) - the delivery falls back to
+           the INBOX and says so. */
         {
             char *l2 = NULL, *d2 = NULL;
+            char u2[IMAPD_MAX_USER + 1];
+            size_t ul;
             int ok;
             (void)mail_addr_parse(path, &l2, &d2);
-            ok = l2 && imapd_user_ok(l2);
+            ul = l2 ? strcspn(l2, "+") : 0;
+            ok = (l2 != NULL) && ul > 0 && ul <= IMAPD_MAX_USER;
+            if (ok) {
+                memcpy(u2, l2, ul);
+                u2[ul] = '\0';
+                ok = imapd_user_ok(u2);
+            }
             mail_addr_free(l2, d2);
             if (!ok) {
                 conn_reply(c, "550 5.1.1 User unknown\r\n");

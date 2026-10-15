@@ -225,6 +225,55 @@ static void tokenizer_test(void) {
     }
 }
 
+/* ---- (4x) delivery target: recipient local part -> mailbox ---- */
+
+/* The SMTP ingest is what files a delivered message, and visage's config is
+   what writes the recipient ("catch_all", alias destinations).  The folder
+   half of "user+Folder" is therefore ours, and it must not be able to name a
+   path: imapd_mbox_dir() turns any name into "<root>/<user>/.<name>". */
+static void delivery_target_test(void) {
+    char u[64], f[64];
+
+    EXPECT(imapd_delivery_target("null", u, sizeof u, f, sizeof f) == 0 &&
+               strcmp(u, "null") == 0 && strcmp(f, "INBOX") == 0,
+           "delivery target: plain user -> INBOX");
+
+    EXPECT(imapd_delivery_target("null+Spam", u, sizeof u, f, sizeof f) == 0 &&
+               strcmp(u, "null") == 0 && strcmp(f, "Spam") == 0,
+           "delivery target: user+folder");
+
+    EXPECT(imapd_delivery_target("marshall.jaye+Archive", u, sizeof u,
+                                 f, sizeof f) == 0 &&
+               strcmp(u, "marshall.jaye") == 0 && strcmp(f, "Archive") == 0,
+           "delivery target: dotted user+folder");
+
+    EXPECT(imapd_delivery_target("null+", u, sizeof u, f, sizeof f) == -1,
+           "delivery target: empty folder rejected");
+    EXPECT(imapd_delivery_target("+Spam", u, sizeof u, f, sizeof f) == -1,
+           "delivery target: empty user rejected");
+    EXPECT(imapd_delivery_target("nu/ll+Spam", u, sizeof u, f, sizeof f) == -1,
+           "delivery target: slash in user rejected");
+    EXPECT(imapd_delivery_target("null+a/b", u, sizeof u, f, sizeof f) == -1,
+           "delivery target: slash in folder rejected");
+    EXPECT(imapd_delivery_target("null+..x", u, sizeof u, f, sizeof f) == -1,
+           "delivery target: dot-dot in folder rejected");
+    EXPECT(imapd_delivery_target("null+.hidden", u, sizeof u, f, sizeof f) == -1,
+           "delivery target: leading dot in folder rejected");
+    EXPECT(imapd_delivery_target("null+Spam.", u, sizeof u, f, sizeof f) == -1,
+           "delivery target: trailing dot in folder rejected");
+    EXPECT(imapd_delivery_target(".hidden", u, sizeof u, f, sizeof f) == -1,
+           "delivery target: leading dot in user rejected");
+    EXPECT(imapd_delivery_target("", u, sizeof u, f, sizeof f) == -1,
+           "delivery target: empty local part rejected");
+
+    /* the two halves must both fit; a truncated user is a wrong mailbox.
+       "null" needs 5 bytes (4 + NUL), so a 4-byte buffer must be refused. */
+    EXPECT(imapd_delivery_target("null+Spam", u, 4, f, sizeof f) == -1,
+           "delivery target: undersized user buffer rejected");
+    EXPECT(imapd_delivery_target("null+Spam", u, sizeof u, f, 3) == -1,
+           "delivery target: undersized folder buffer rejected");
+}
+
 /* ---- (5a) SASL PLAIN field split (AUTHENTICATE PLAIN) ---- */
 
 /* The decode above is only half the path: the decoded bytes must be split
@@ -1053,6 +1102,7 @@ int main(void) {
     search_test();
     b64_test();
     sasl_plain_test();
+    delivery_target_test();
     bf_test();
     wildmat_test();
     tls_test();

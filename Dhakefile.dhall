@@ -429,17 +429,17 @@ in  { targets = [
             { deps = [ "vendor/mbedtls/build/.stamp", "src/imapd.c", "src/imapd_ingest.c", "src/imapd_imap.c", "src/imapd_tls.c", "src/imap_maildir.c", "src/mail.c", "src/pop3d.c", "src/imapd.h", "src/mail.h", "src/visage.h", "src/mbedtls_visage_config.h" ]
             , phony = False
             , recipe = [ < Shell = "cc -std=c11 -O2 -g -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -I vendor/dhall-c/src -I vendor/datalog-dafsa/src -I vendor/datalog-dafsa/vendor -I vendor/mbedtls/include -I src -DMBEDTLS_CONFIG_FILE='\"mbedtls_visage_config.h\"' -o imapd.com src/imapd.c src/imapd_ingest.c src/imapd_imap.c src/imapd_tls.c src/imap_maildir.c src/mail.c src/pop3d.c vendor/mbedtls/build/aes.o vendor/mbedtls/build/asn1parse.o vendor/mbedtls/build/asn1write.o vendor/mbedtls/build/base64.o vendor/mbedtls/build/bignum.o vendor/mbedtls/build/bignum_core.o vendor/mbedtls/build/bignum_mod.o vendor/mbedtls/build/bignum_mod_raw.o vendor/mbedtls/build/cipher.o vendor/mbedtls/build/cipher_wrap.o vendor/mbedtls/build/constant_time.o vendor/mbedtls/build/ctr_drbg.o vendor/mbedtls/build/ecdh.o vendor/mbedtls/build/ecdsa.o vendor/mbedtls/build/ecp.o vendor/mbedtls/build/ecp_curves.o vendor/mbedtls/build/entropy.o vendor/mbedtls/build/entropy_poll.o vendor/mbedtls/build/error.o vendor/mbedtls/build/gcm.o vendor/mbedtls/build/md.o vendor/mbedtls/build/oid.o vendor/mbedtls/build/pem.o vendor/mbedtls/build/pk.o vendor/mbedtls/build/pk_ecc.o vendor/mbedtls/build/pk_wrap.o vendor/mbedtls/build/pkparse.o vendor/mbedtls/build/platform.o vendor/mbedtls/build/platform_util.o vendor/mbedtls/build/rsa.o vendor/mbedtls/build/rsa_alt_helpers.o vendor/mbedtls/build/sha1.o vendor/mbedtls/build/sha256.o vendor/mbedtls/build/sha512.o vendor/mbedtls/build/ssl_cache.o vendor/mbedtls/build/ssl_ciphersuites.o vendor/mbedtls/build/ssl_client.o vendor/mbedtls/build/ssl_msg.o vendor/mbedtls/build/ssl_tls.o vendor/mbedtls/build/ssl_tls12_client.o vendor/mbedtls/build/ssl_tls12_server.o vendor/mbedtls/build/version.o vendor/mbedtls/build/x509.o vendor/mbedtls/build/x509_crt.o" > ]
-            , hash = "sha256:14e8b2572bd7ebd0a7d794a20a668607b452c453f3d3c75cb5d28418a4e33355"
+            , hash = "sha256:0dac4d53c0dbf7ca588c3abaca0f529afa78ecb68865fe4ec4b0340141570e28"
             , depsHash = [
               { path = "vendor/mbedtls/build/.stamp", hash = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
               { path = "src/imapd.c", hash = "sha256:c965bf6d3841fee83e08b7aa009c7eaa1cf6b9ecad4deda8da9ff4762b54329d" },
-              { path = "src/imapd_ingest.c", hash = "sha256:3c53ab527dd21c5584e4104148fb815073c6440228b4248e64b566de6afac54b" },
+              { path = "src/imapd_ingest.c", hash = "sha256:8ddfd44e5d51dbbfcbb4cc3a46f3e1490eacafac106d3e2e1e808263e1d873d1" },
               { path = "src/imapd_imap.c", hash = "sha256:c7dc088c5f7738ee49d73cbaab7ea82eea6cb6d50e3c122485c1a314ccaa3ed5" },
               { path = "src/imapd_tls.c", hash = "sha256:6aec06148455062793aa8b519612e908368c4402ac897590e96d745ad28e884d" },
-              { path = "src/imap_maildir.c", hash = "sha256:b1786112da60dd1c86d4565834de18f15b671ecc155a0467a8ec0d6babea044d" },
+              { path = "src/imap_maildir.c", hash = "sha256:7f9737b0997b42d4c4b91b6dcca7006077554ef31ac907b162195407aebcbefe" },
               { path = "src/mail.c", hash = "sha256:6445ee1f6174e1823ef363f8992762f1a3c8a86b4f5d6cc7beefb9c0d9a1cbfd" },
               { path = "src/pop3d.c", hash = "sha256:5619e4dc847a275a47ef46cebe7cd71f5fa4d61b81157e026fbb70ce1c8fb59e" },
-              { path = "src/imapd.h", hash = "sha256:59c96779501c784960c51d6b67b6558f5089d447c2e6f5994143351d53b55df8" },
+              { path = "src/imapd.h", hash = "sha256:d71757fdcf51418e5978636457f39e7d9801126a2cf88352726fc61c9c0984a7" },
               { path = "src/mail.h", hash = "sha256:6c8082d6731214465c6ec73d63b058deccf5d9c9ce43ddd2f09707846622f003" },
               { path = "src/visage.h", hash = "sha256:0a694c5970020f93c63d58134d1c36a5c1914fd04b57c01d0946f47970628e7c" },
               { path = "src/mbedtls_visage_config.h", hash = "sha256:0f5fd8be87271dbbe414d9e0951b25b7cce9d075ad6f32af77172e307c5c60d0" }
@@ -452,15 +452,15 @@ in  { targets = [
             { deps = [ "vendor/mbedtls/build/.stamp", "src/imap_maildir.c", "src/imapd_imap.c", "src/imapd_tls.c", "src/mail.c", "src/imap_check.c", "src/imapd.h", "src/mail.h", "src/visage.h", "src/mbedtls_visage_config.h" ]
             , phony = False
             , recipe = [ < Shell = "cc -std=c11 -O2 -g -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -I vendor/dhall-c/src -I vendor/datalog-dafsa/src -I vendor/datalog-dafsa/vendor -I vendor/mbedtls/include -I src -DMBEDTLS_CONFIG_FILE='\"mbedtls_visage_config.h\"' -o imap_check.com src/imap_maildir.c src/imapd_imap.c src/imapd_tls.c src/mail.c src/imap_check.c vendor/mbedtls/build/aes.o vendor/mbedtls/build/asn1parse.o vendor/mbedtls/build/asn1write.o vendor/mbedtls/build/base64.o vendor/mbedtls/build/bignum.o vendor/mbedtls/build/bignum_core.o vendor/mbedtls/build/bignum_mod.o vendor/mbedtls/build/bignum_mod_raw.o vendor/mbedtls/build/cipher.o vendor/mbedtls/build/cipher_wrap.o vendor/mbedtls/build/constant_time.o vendor/mbedtls/build/ctr_drbg.o vendor/mbedtls/build/ecdh.o vendor/mbedtls/build/ecdsa.o vendor/mbedtls/build/ecp.o vendor/mbedtls/build/ecp_curves.o vendor/mbedtls/build/entropy.o vendor/mbedtls/build/entropy_poll.o vendor/mbedtls/build/error.o vendor/mbedtls/build/gcm.o vendor/mbedtls/build/md.o vendor/mbedtls/build/oid.o vendor/mbedtls/build/pem.o vendor/mbedtls/build/pk.o vendor/mbedtls/build/pk_ecc.o vendor/mbedtls/build/pk_wrap.o vendor/mbedtls/build/pkparse.o vendor/mbedtls/build/platform.o vendor/mbedtls/build/platform_util.o vendor/mbedtls/build/rsa.o vendor/mbedtls/build/rsa_alt_helpers.o vendor/mbedtls/build/sha1.o vendor/mbedtls/build/sha256.o vendor/mbedtls/build/sha512.o vendor/mbedtls/build/ssl_cache.o vendor/mbedtls/build/ssl_ciphersuites.o vendor/mbedtls/build/ssl_client.o vendor/mbedtls/build/ssl_msg.o vendor/mbedtls/build/ssl_tls.o vendor/mbedtls/build/ssl_tls12_client.o vendor/mbedtls/build/ssl_tls12_server.o vendor/mbedtls/build/version.o vendor/mbedtls/build/x509.o vendor/mbedtls/build/x509_crt.o" > ]
-            , hash = "sha256:4a33000011512d322b0927e00b48a7ee67d135ee0310e70764434715ce584694"
+            , hash = "sha256:a4076dbc7be591122f1bc8f526ce63a0a44df88a889b1e923f874715fa5edbb7"
             , depsHash = [
               { path = "vendor/mbedtls/build/.stamp", hash = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
-              { path = "src/imap_maildir.c", hash = "sha256:b1786112da60dd1c86d4565834de18f15b671ecc155a0467a8ec0d6babea044d" },
+              { path = "src/imap_maildir.c", hash = "sha256:7f9737b0997b42d4c4b91b6dcca7006077554ef31ac907b162195407aebcbefe" },
               { path = "src/imapd_imap.c", hash = "sha256:c7dc088c5f7738ee49d73cbaab7ea82eea6cb6d50e3c122485c1a314ccaa3ed5" },
               { path = "src/imapd_tls.c", hash = "sha256:6aec06148455062793aa8b519612e908368c4402ac897590e96d745ad28e884d" },
               { path = "src/mail.c", hash = "sha256:6445ee1f6174e1823ef363f8992762f1a3c8a86b4f5d6cc7beefb9c0d9a1cbfd" },
-              { path = "src/imap_check.c", hash = "sha256:138f611de8123095d3b8f8ba28dfdfdf67da879cebea3f171f9643b2bd3bd26f" },
-              { path = "src/imapd.h", hash = "sha256:59c96779501c784960c51d6b67b6558f5089d447c2e6f5994143351d53b55df8" },
+              { path = "src/imap_check.c", hash = "sha256:6e3a34ff21e1fda3af3a35a22ab47e3ecb5a3f258007a5cbfbf2442b98e95d8d" },
+              { path = "src/imapd.h", hash = "sha256:d71757fdcf51418e5978636457f39e7d9801126a2cf88352726fc61c9c0984a7" },
               { path = "src/mail.h", hash = "sha256:6c8082d6731214465c6ec73d63b058deccf5d9c9ce43ddd2f09707846622f003" },
               { path = "src/visage.h", hash = "sha256:0a694c5970020f93c63d58134d1c36a5c1914fd04b57c01d0946f47970628e7c" },
               { path = "src/mbedtls_visage_config.h", hash = "sha256:0f5fd8be87271dbbe414d9e0951b25b7cce9d075ad6f32af77172e307c5c60d0" }
@@ -476,12 +476,12 @@ in  { targets = [
             , hash = "sha256:a7914ce2c0f07f99226bb64799694d2c36f3bfe699a50f4ec1132cbb03f5c397"
             , depsHash = [
               { path = "vendor/mbedtls/build/.stamp", hash = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
-              { path = "src/imap_maildir.c", hash = "sha256:b1786112da60dd1c86d4565834de18f15b671ecc155a0467a8ec0d6babea044d" },
+              { path = "src/imap_maildir.c", hash = "sha256:7f9737b0997b42d4c4b91b6dcca7006077554ef31ac907b162195407aebcbefe" },
               { path = "src/imapd_imap.c", hash = "sha256:c7dc088c5f7738ee49d73cbaab7ea82eea6cb6d50e3c122485c1a314ccaa3ed5" },
               { path = "src/imapd_tls.c", hash = "sha256:6aec06148455062793aa8b519612e908368c4402ac897590e96d745ad28e884d" },
               { path = "src/mail.c", hash = "sha256:6445ee1f6174e1823ef363f8992762f1a3c8a86b4f5d6cc7beefb9c0d9a1cbfd" },
               { path = "src/imap_fuzz.c", hash = "sha256:9e544291e4b48ac6e06a3ca87ef827ca5307457105d206676bcd0854f4015b86" },
-              { path = "src/imapd.h", hash = "sha256:59c96779501c784960c51d6b67b6558f5089d447c2e6f5994143351d53b55df8" },
+              { path = "src/imapd.h", hash = "sha256:d71757fdcf51418e5978636457f39e7d9801126a2cf88352726fc61c9c0984a7" },
               { path = "src/mail.h", hash = "sha256:6c8082d6731214465c6ec73d63b058deccf5d9c9ce43ddd2f09707846622f003" },
               { path = "src/visage.h", hash = "sha256:0a694c5970020f93c63d58134d1c36a5c1914fd04b57c01d0946f47970628e7c" },
               { path = "src/mbedtls_visage_config.h", hash = "sha256:0f5fd8be87271dbbe414d9e0951b25b7cce9d075ad6f32af77172e307c5c60d0" }
@@ -628,7 +628,7 @@ in  { targets = [
               { path = "config_check.com", hash = "sha256:470d156aefad297c80b54c7b11f11011553a1f3c2c10343dcee03bc7e5de0a24" },
               { path = "tests/smtptest.com", hash = "sha256:e57732933cc4d06851a9d421b26799ace057c845a79b3cab6f54e59e4bc56413" },
               { path = "tests/relay_fake.com", hash = "sha256:14288258249eb4f6a7bf410fdc141969297be1fefa88cf4b79563ebc0068d593" },
-              { path = "imapd.com", hash = "sha256:14e8b2572bd7ebd0a7d794a20a668607b452c453f3d3c75cb5d28418a4e33355" },
+              { path = "imapd.com", hash = "sha256:0dac4d53c0dbf7ca588c3abaca0f529afa78ecb68865fe4ec4b0340141570e28" },
               { path = "tests/imapd_tls.sh", hash = "sha256:275e153485d8a8388711796ef453993977d97e3b02a2697b0a4c5e701eea80c8" },
               { path = "tests/pop3d_tls.sh", hash = "sha256:d0d122ffe667381c4e9e109710d0980c454ce4a03a9cea78d5d0eae10fa521d7" },
               { path = "tests/smtp_starttls.sh", hash = "sha256:71662c00e62dd8614bddbc0d7eff4790ff2e031d61fc2579480e4fff4e4646f8" }
@@ -728,8 +728,8 @@ in  { targets = [
               { path = "http_check.com", hash = "sha256:06c616726dcb75519cfa035dbbcecb564b0575af8cf50bc5a405c9e2400e4164" },
               { path = "dkim_check.com", hash = "sha256:1cf1accdd1e86cdb414657463cc0d0d3bac4893ae445147aa86a4eb9f75e9b1c" },
               { path = "auth_check.com", hash = "sha256:857893fc25419a634f34492086162723cd72f158b641d2f846d7af281ba0583a" },
-              { path = "imapd.com", hash = "sha256:14e8b2572bd7ebd0a7d794a20a668607b452c453f3d3c75cb5d28418a4e33355" },
-              { path = "imap_check.com", hash = "sha256:4a33000011512d322b0927e00b48a7ee67d135ee0310e70764434715ce584694" },
+              { path = "imapd.com", hash = "sha256:0dac4d53c0dbf7ca588c3abaca0f529afa78ecb68865fe4ec4b0340141570e28" },
+              { path = "imap_check.com", hash = "sha256:a4076dbc7be591122f1bc8f526ce63a0a44df88a889b1e923f874715fa5edbb7" },
               { path = "imap_fuzz.com", hash = "sha256:a7914ce2c0f07f99226bb64799694d2c36f3bfe699a50f4ec1132cbb03f5c397" },
               { path = "tests/tls_selfcheck.com", hash = "sha256:1ad59c6a1cf60e81b652e20b142e841b606646f10541986aba053317276c747b" },
               { path = "tests/verify_selfcheck.com", hash = "sha256:9304160980203a02c1376cc5c6726c03cdd0394f89e7cf90dc717265129f5bff" },
