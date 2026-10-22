@@ -2542,3 +2542,274 @@ int imapd_mime_part(const char *msg, size_t len, const int *path, int npath,
     *hdr_end = he;
     return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/* MIME part iterator (appended for jmapd; see imapd.h)                */
+/*                                                                    */
+/* The BODYSTRUCTURE code above renders an IMAP string and drops the  */
+/* metadata; this walk reports each part as bytes + metadata.  It     */
+/* reuses the same header/parameter primitives (bs_hdr, bs_ct_parse,  */
+/* mime_hdr_end) and the same delimiter-scanning rule as              */
+/* bs_multipart/mime_kth_part, so a part-id resolved here lands on    */
+/* the same bytes IMAP's BODY[<section>] serves.                      */
+/* ------------------------------------------------------------------ */
+
+/* Lowercase a copy (ASCII only): the CTE and disposition tokens are
+   case-insensitive on the wire, and a JMAP client compares them verbatim. */
+static void mime_lower(char *dst, size_t dstsz, const char *src) {
+    size_t i;
+    for (i = 0; i + 1 < dstsz && src[i]; i++) {
+        char c = src[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        dst[i] = c;
+    }
+    dst[i] = '\0';
+}
+
+static int mime_hex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Copy a value, percent-decoding it (RFC 2231 extended parameters are
+   charset'lang'percent-encoded).  Bytes are NOT transcoded: the charset is
+   reported alongside and the caller decides. */
+static int mime_pct_copy(const char *s, size_t n, char *out, size_t outsz) {
+    size_t i = 0, o = 0;
+    while (i < n && o + 1 < outsz) {
+        if (s[i] == '%' && i + 2 < n && mime_hex(s[i + 1]) >= 0 &&
+            mime_hex(s[i + 2]) >= 0) {
+            int hi = mime_hex(s[i + 1]), lo = mime_hex(s[i + 2]);
+            out[o++] = (char)((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out[o++] = s[i++];
+    }
+    out[o] = '\0';
+    return 0;
+}
+
+/* Look one parameter up in a header value ("type/sub; name=v; ...").  A
+   `name*` (RFC 2231 extended) parameter is percent-decoded and used only when
+   the plain form is absent.  Returns 0 when found, -1 when not. */
+static int mime_param_get(const char *val, const char *want, char *out,
+                          size_t outsz) {
+    const char *p = val;
+    int found_ext = -1;
+    char extbuf[128];
+    out[0] = '\0';
+    extbuf[0] = '\0';
+    while ((p = strchr(p, ';')) != NULL) {
+        char name[64];
+        const char *eq, *vs, *ve;
+        size_t nl, vlen;
+        bool ext;
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        eq = strchr(p, '=');
+        if (!eq) break;
+        nl = (size_t)(eq - p);
+        while (nl && (p[nl - 1] == ' ' || p[nl - 1] == '\t')) nl--;
+        if (nl == 0 || nl >= sizeof name) { p = eq; continue; }
+        memcpy(name, p, nl);
+        name[nl] = '\0';
+        ext = (name[nl - 1] == '*');
+        if (ext) name[nl - 1] = '\0';
+        vs = eq + 1;
+        while (*vs == ' ' || *vs == '\t') vs++;
+        if (*vs == '"') {
+            vs++;
+            ve = strchr(vs, '"');
+            if (!ve) ve = vs + strlen(vs);
+        } else {
+            ve = vs;
+            while (*ve && *ve != ';' && *ve != ' ' && *ve != '\t') ve++;
+        }
+        vlen = (size_t)(ve - vs);
+        if (ascii_ieq_str(name, want)) {
+            if (ext) {
+                const char *q = vs, *t, *last = NULL;
+                for (t = vs; t < ve; t++)
+                    if (*t == '\'') last = t;
+                if (last) q = last + 1;
+                mime_pct_copy(q, (size_t)(ve - q), extbuf, sizeof extbuf);
+                found_ext = 0;
+            } else {
+                if (vlen >= outsz) vlen = outsz - 1;
+                memcpy(out, vs, vlen);
+                out[vlen] = '\0';
+                return 0;
+            }
+        }
+        p = eq;
+    }
+    if (found_ext == 0) {
+        snprintf(out, outsz, "%s", extbuf);
+        return 0;
+    }
+    return -1;
+}
+
+typedef struct MimeWalk {
+    const char  *msg;
+    size_t       len;
+    ImailPartFn  fn;
+    void        *ctx;
+    bool         stop;
+} MimeWalk;
+
+/* Report one part and, when it is a multipart container with a usable
+   boundary, recurse into its children.  `path`/`npath` name THIS part. */
+static void mime_walk(MimeWalk *w, size_t start, size_t end, int depth,
+                      const int *path, int npath) {
+    ImailPart p;
+    char ct[1024], boundary[512];
+    char val[512];
+    size_t hdr_end, i;
+
+    if (w->stop || start > end || end > w->len) return;
+    memset(&p, 0, sizeof p);
+    hdr_end = mime_hdr_end(w->msg + start, end - start) + start;
+
+    /* ---- part id ---- */
+    p.id[0] = '\0';
+    {
+        size_t o = 0;
+        for (i = 0; i < (size_t)npath; i++) {
+            int n = snprintf(p.id + o, sizeof p.id - o, "%s%d", i ? "." : "",
+                             path[i]);
+            if (n < 0 || (size_t)n >= sizeof p.id - o) { p.id[o] = '\0'; break; }
+            o += (size_t)n;
+        }
+    }
+
+    /* ---- Content-Type: type/subtype, charset, name ---- */
+    if (bs_hdr(w->msg + start, hdr_end - start, "Content-Type", ct, sizeof ct)
+            != 0)
+        strcpy(ct, "text/plain");
+    {
+        char type[64], sub[64];
+        bs_ct_parse(ct, type, sizeof type, sub, sizeof sub, boundary,
+                    sizeof boundary);
+        mime_lower(p.type, sizeof p.type, type[0] ? type : "text");
+        mime_lower(p.subtype, sizeof p.subtype, sub[0] ? sub : "plain");
+        p.multipart = (strcmp(p.type, "multipart") == 0);
+    }
+    if (mime_param_get(ct, "charset", val, sizeof val) == 0)
+        snprintf(p.charset, sizeof p.charset, "%.*s",
+                 (int)sizeof p.charset - 1, val);
+
+    /* ---- Content-Transfer-Encoding ---- */
+    if (bs_hdr(w->msg + start, hdr_end - start, "Content-Transfer-Encoding",
+               val, sizeof val) == 0) {
+        char *sp = val;
+        size_t n;
+        while (*sp == ' ' || *sp == '\t') sp++;
+        n = strcspn(sp, " \t;");
+        sp[n] = '\0';
+        mime_lower(p.cte, sizeof p.cte, sp);
+    } else {
+        strcpy(p.cte, "7bit");
+    }
+
+    /* ---- Content-Disposition + filename ---- */
+    if (bs_hdr(w->msg + start, hdr_end - start, "Content-Disposition", val,
+               sizeof val) == 0) {
+        char d[64];
+        size_t n = strcspn(val, "; \t");
+        if (n >= sizeof d) n = sizeof d - 1;
+        memcpy(d, val, n);
+        d[n] = '\0';
+        mime_lower(p.disp, sizeof p.disp, d);
+        if (mime_param_get(val, "filename", p.filename,
+                           sizeof p.filename) != 0)
+            p.filename[0] = '\0';
+    }
+    if (p.filename[0] == '\0' &&
+        mime_param_get(ct, "name", p.filename, sizeof p.filename) != 0)
+        p.filename[0] = '\0';
+
+    p.start = start;
+    p.end = end;
+    p.hdr_end = hdr_end;
+    p.depth = depth;
+
+    if (w->fn(w->ctx, &p) != 0) {
+        w->stop = true;
+        return;
+    }
+    if (!p.multipart || depth + 1 >= IMAPD_MAX_PART_DEPTH) return;
+    if (!boundary[0]) return;              /* no boundary: truncate here */
+    if (npath >= IMAPD_MAX_PART_DEPTH) return;
+
+    /* ---- children: same delimiter rule as bs_multipart ---- */
+    {
+        char delim[1024];
+        size_t dlen, blen = strlen(boundary), pos = hdr_end;
+        int child[IMAPD_MAX_PART_DEPTH + 1];
+        int k = 0;
+        if (npath) memcpy(child, path, sizeof(int) * (size_t)npath);
+        snprintf(delim, sizeof delim, "--%s", boundary);
+        dlen = strlen(delim);
+        while (!w->stop && pos + dlen <= end) {
+            size_t d = end, j, e = end;
+            for (j = pos; j + dlen <= end; j++)
+                if (w->msg[j] == '-' && w->msg[j + 1] == '-' &&
+                    memcmp(w->msg + j + 2, boundary, blen) == 0) { d = j; break; }
+            if (d == end) break;
+            if (d + dlen + 2 <= end && w->msg[d + dlen] == '-' &&
+                w->msg[d + dlen + 1] == '-')
+                break;                     /* closing delimiter */
+            pos = d + dlen;
+            if (pos + 1 < end && w->msg[pos] == '\r' && w->msg[pos + 1] == '\n')
+                pos += 2;
+            else if (pos < end && (w->msg[pos] == '\n' || w->msg[pos] == '\r'))
+                pos++;
+            for (j = pos; j + dlen <= end; j++)
+                if (w->msg[j] == '-' && w->msg[j + 1] == '-' &&
+                    memcmp(w->msg + j + 2, boundary, blen) == 0) { e = j; break; }
+            while (e > pos && (w->msg[e - 1] == '\n' || w->msg[e - 1] == '\r'))
+                e--;
+            if (e > pos) {
+                child[npath] = k + 1;
+                mime_walk(w, pos, e, depth + 1, child, npath + 1);
+                k++;
+            }
+            pos = e;
+        }
+    }
+}
+
+int imapd_mime_iterate(const char *msg, size_t len, ImailPartFn fn, void *ctx) {
+    MimeWalk w;
+    if (!msg || !fn) return -1;
+    w.msg = msg;
+    w.len = len;
+    w.fn = fn;
+    w.ctx = ctx;
+    w.stop = false;
+    mime_walk(&w, 0, len, 0, NULL, 0);
+    return 0;
+}
+
+/* Two thin wrappers over the static parsers above, appended so jmapd's
+   FILE-based part resolver (src/jmap_mime.c: a blob download must not read a
+   30 MiB message into memory just to find one part) parses a Content-Type
+   value with the SAME code the in-memory walker uses.  A second copy of this
+   parsing is how "the part Email/get described" and "the bytes the download
+   served" drift apart. */
+int imapd_mime_ct_parse(const char *val, char *type, size_t tsz, char *sub,
+                        size_t ssz, char *boundary, size_t bsz) {
+    if (!val) return -1;
+    bs_ct_parse(val, type, tsz, sub, ssz, boundary, bsz);
+    return 0;
+}
+
+int imapd_mime_param(const char *val, const char *name, char *out, size_t outsz) {
+    if (!val || !name || !out || outsz == 0) return -1;
+    return mime_param_get(val, name, out, outsz);
+}

@@ -643,8 +643,6 @@ bool imapd_addr_loopback(const char *addr);
 void imapd_imap_tls_reset(ImapdServer *srv, Conn *c);
 void imapd_ingest_tls_reset(ImapdServer *srv, Conn *c);
 
-#endif /* VISAGE_IMAPD_H */
-
 /* Build the RFC 3501 BODYSTRUCTURE string for a full message. Heap-allocates
    *out (NUL-terminated); *outlen excludes the NUL. */
 int imapd_bodystructure(const char *msg, size_t len, char **out, size_t *outlen);
@@ -654,3 +652,61 @@ int imapd_bodystructure(const char *msg, size_t len, char **out, size_t *outlen)
    success, -1 if the path does not resolve. */
 int imapd_mime_part(const char *msg, size_t len, const int *path, int npath,
                     size_t *start, size_t *end, size_t *hdr_end);
+
+/* ------------------------------------------------------------------ */
+/* MIME part iterator (appended for jmapd: bodyStructure/bodyValues/  */
+/* blob download).  The BODYSTRUCTURE walker above renders an IMAP    */
+/* string and discards the metadata; this one hands each part to a    */
+/* callback as bytes+metadata, so a JMAP server can build the same    */
+/* tree, resolve a part's body for decoding, and stream one part's    */
+/* decoded bytes without re-deriving the structure itself.            */
+/* ------------------------------------------------------------------ */
+
+/* Nesting cap: a part-id path is "1.2.3" — 16 levels is far past anything a
+   mail client composes and bounds both the recursion and the id buffer. */
+#define IMAPD_MAX_PART_DEPTH 16
+#define IMAPD_MAX_PART_ID    64
+
+/* One part of a message.  `id` is the RFC 8621 partId path ("1", "1.2", ...);
+   the top-level part (the whole message) has id "".  [start,end) is the part
+   INCLUDING its header block, and hdr_end is the end of that block within
+   [start,end), so the body bytes are [hdr_end,end) — exactly what a CTE
+   decoder is handed.  Strings are lowercased where the wire form is
+   case-insensitive (cte, disposition) and left verbatim where it is not
+   (charset, filename). */
+typedef struct ImailPart {
+    char   id[IMAPD_MAX_PART_ID];
+    char   type[48];
+    char   subtype[48];
+    char   charset[48];
+    char   cte[32];        /* Content-Transfer-Encoding, "7bit" when absent */
+    char   disp[32];       /* Content-Disposition type, "" when absent */
+    char   filename[128];  /* disposition filename= or Content-Type name= */
+    size_t start, end;     /* part bytes [start,end) in the message */
+    size_t hdr_end;        /* header/body boundary inside [start,end) */
+    int    depth;          /* 0 for the top-level part */
+    bool   multipart;      /* container: the walk descends into its children */
+} ImailPart;
+
+/* Callback for imapd_mime_iterate: return 0 to continue, nonzero to stop the
+   walk. */
+typedef int (*ImailPartFn)(void *ctx, const ImailPart *p);
+
+/* Walk the MIME tree of msg[0..len) in document order (a container is
+   reported before its children, so a caller can rebuild the nesting from
+   `depth` alone).  A multipart node whose boundary parameter is missing or
+   whose delimiters cannot be found is reported as a container with no
+   children: the tree TRUNCATES at the fault rather than guessing, and the
+   walk never recurses past IMAPD_MAX_PART_DEPTH.  message/rfc822 parts are
+   leaves (their nested message is not walked).  Returns 0 (including when the
+   callback stopped the walk), or -1 on invalid arguments. */
+int imapd_mime_iterate(const char *msg, size_t len, ImailPartFn fn, void *ctx);
+
+/* Content-Type parsing wrappers (append-only): the walker's own parser, so
+   jmapd's file-based part resolver cannot disagree with it. */
+int imapd_mime_ct_parse(const char *val, char *type, size_t tsz, char *sub,
+                        size_t ssz, char *boundary, size_t bsz);
+int imapd_mime_param(const char *val, const char *name, char *out,
+                     size_t outsz);
+
+#endif /* VISAGE_IMAPD_H */

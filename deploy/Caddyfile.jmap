@@ -1,0 +1,61 @@
+# Caddy snippet for jmapd (the visage JMAP server).
+#
+# Use as the whole Caddyfile when jmap.jaye.ch is the only site on this Caddy,
+# or paste the site block into the existing Caddyfile (Caddy has no `include`,
+# but a second site block is additive).
+#
+# WHAT THIS BUYS: TLS on :443 with a public certificate, and jmapd left on
+# loopback serving plaintext HTTP — the only configuration in which jmapd will
+# serve plaintext at all.  It refuses a non-loopback bind without --cert/--key,
+# because JMAP carries the password in an Authorization header.
+#
+# TWO CONSEQUENCES, before you deploy it this way:
+#
+#  1. jmapd sees every client as 127.0.0.1.  Its per-IP brute-force lockout
+#     (5 failed attempts / 60 s -> 300 s locked out) therefore becomes ONE
+#     shared bucket for all clients: five bad passwords from anyone lock
+#     everybody out for five minutes.  jmapd reads no X-Forwarded-For and has
+#     no trusted-proxy setting, so a proxy in front of it cannot fix that from
+#     the outside.  On a single-user box this is a non-issue; on a shared one
+#     terminate TLS in jmapd instead (see the alternative below).
+#  2. the JMAP credential still crosses this host's loopback in clear text.
+#     That is fine when Caddy and jmapd are on the same machine, and not fine
+#     when Caddy is on another host.
+
+jmap.jaye.ch {
+	encode zstd gzip
+
+	reverse_proxy 127.0.0.1:8788 {
+		# jmapd is a single-process poll() daemon.  A slow or half-open client
+		# must not pin a backend connection indefinitely.
+		transport http {
+			dial_timeout 5s
+			response_header_timeout 60s
+		}
+	}
+
+	# jmapd answers /.well-known/jmap, /api, /download/... and 501s the two
+	# endpoints it advertises but does not implement (upload, EventSource) —
+	# so nothing here needs rewriting or path juggling.
+	log {
+		output file /var/log/caddy/jmap.jaye.ch.log
+	}
+}
+
+# ---------------------------------------------------------------------------
+# ALTERNATIVE: let jmapd terminate TLS itself (no Caddy in front).
+#
+# jmapd reuses imapd's mbedTLS server wrappers, so the imapd certificate pair
+# works unchanged:
+#
+#   ExecStart=/opt/jmapd/jmapd.com --root /opt/imapd/var/mail \
+#       --addr 0.0.0.0 --port 8788 \
+#       --cert /etc/imapd/tls/fullchain.pem --key /etc/imapd/tls/key.pem \
+#       --identity jaye@mail.jaye.ch --outbox-host 127.0.0.1 --outbox-port 465
+#
+# A cert without its key, or a pair mbedTLS cannot parse, fails closed at
+# startup (exit 1) rather than falling back to plaintext.  With jmapd owning
+# :8788 on the public interface, delete the site block above — or keep Caddy as
+# a TCP (layer4) proxy, which needs the caddy-l4 plugin and lets jmapd keep the
+# TLS session end to end.
+# ---------------------------------------------------------------------------

@@ -1,0 +1,114 @@
+# jmapd.service — the JMAP server for the visage mail stack (src/jmapd*.c).
+#
+# Install:
+#   install -d -m 0755 /opt/jmapd
+#   install -m 0755 jmapd.com            /opt/jmapd/jmapd.com
+#   install -d -m 0755 /etc/jmapd
+#   install -m 0600 deploy/jmapd-outbox.env.example /etc/jmapd/outbox.env  # then edit
+#   install -m 0644 deploy/jmapd.service /etc/systemd/system/jmapd.service
+#   systemctl daemon-reload && systemctl enable --now jmapd
+#
+# It runs as the SAME user and against the SAME maildir root as imapd: jmapd is
+# a second protocol front end on one store, not a second store.  Two daemons
+# write one tree, so jmapd caches nothing across requests and re-checks a
+# per-mailbox fingerprint, which is what turns an imapd delivery into a JMAP
+# state change.
+#
+# The submission credential is NOT in this unit.  It lives in
+# /etc/jmapd/outbox.env (0600), which systemd reads as root and hands to the
+# process as environment: a unit file is world-readable, so a password written
+# here would be readable by every account on the box and visible in
+# `systemctl cat`.
+#
+# The password table is implied, not a flag: jmapd reads <root>/imapd.passwd
+# (the file `imapd passwd USER PASS --root <root>` writes).  One line = one
+# account = one JMAP accountId, so a second user is a second passwd line, not a
+# second daemon.
+
+[Unit]
+Description=visage JMAP server (jmapd)
+Documentation=file:///opt/jmapd/docs/jmapd.md
+After=network.target
+# Do not start against a root that is not mounted yet (a delivery host may keep
+# the maildir tree on a separate filesystem).  This is the same file imapd
+# authenticates against, so its absence means "the tree is not there".
+ConditionPathExists=/opt/imapd/var/mail/imapd.passwd
+
+[Service]
+Type=simple
+User=imapd
+Group=imapd
+# --port 8788 is next to visage's admin :8080 and imapd's listeners; --addr
+# 127.0.0.1 because TLS is terminated by Caddy in front of it (deploy/Caddyfile.jmap).
+# Serving plaintext on a NON-loopback address is refused by jmapd at startup
+# unless --cert/--key are given, because JMAP carries the password in an
+# Authorization header.
+ExecStart=/opt/jmapd/jmapd.com \
+    --root /opt/imapd/var/mail \
+    --addr 127.0.0.1 \
+    --port 8788 \
+    --identity jaye@mail.jaye.ch \
+    --outbox-host 127.0.0.1 \
+    --outbox-port 465
+EnvironmentFile=/etc/jmapd/outbox.env
+# (no '-' prefix on purpose: a jmapd that cannot authenticate to the outbox
+# would accept submissions and then fail every one of them at the relay, so a
+# missing credential file fails the start instead of the mail.)
+
+Restart=on-failure
+RestartSec=2s
+# A submission in flight may be inside an SMTP transaction with the outbox when
+# the stop arrives; jmapd drains its queue and joins the worker, so allow a
+# little more than the SMTP timeouts it inherits from smtp_out.c.
+TimeoutStopSec=20s
+
+# Memory budget on a 1.9 GiB box: a fraction of what imapd may use, because
+# jmapd is a personal-mail front end, not a delivery path.  These are operator
+# budget values, NOT a derivation from jmapd's worst case — 512 connections
+# (JMAPD_MAX_CONNS) times a 4 MiB request cap (JMAPD_DEFAULT_MAX_REQ) is ~2 GiB
+# in theory, so the cap is what stops an unbounded growth: past MemoryMax the
+# kernel kills the unit and Restart=on-failure brings it back.
+MemoryHigh=256M
+MemoryMax=384M
+
+# --- hardening: same discipline as imapd's unit ---------------------------
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+# The ONLY writable path: the maildir root it shares with imapd (mailboxes,
+# uidlist sidecars, the jmapd-state/jmapd-submitted sidecars).  Everything else
+# on the filesystem is read-only to this unit.
+ReadWritePaths=/opt/imapd/var/mail
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+# A loopback HTTP/SMTP client needs nothing outside @system-service (socket,
+# getrandom, futex, poll, read/write).  If a future mbedTLS or resolver change
+# needs one more syscall, the log names it — drop this line rather than
+# loosening the allowlist.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# journal output: the daemon's startup banner and per-request log lines go to
+# stderr/stdout and are tagged with the unit name (journalctl -u jmapd).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jmapd
+
+[Install]
+WantedBy=multi-user.target

@@ -317,6 +317,37 @@ T.append(target("imap_fuzz.com",
                 MBFLAGS)],
     out="imap_fuzz.com"))
 
+# --- jmapd.com (companion JMAP server; HTTPS-from-first-byte via mbedTLS) ---
+# No imapd_imap.c: jmapd reuses the maildir store (imap_maildir.c), the TLS
+# layer (imapd_tls.c), the passwd table + lockout (imap_maildir.c), the JSON
+# writer (json.c) and the pure HTTP primitives (http_parse.c) — not the IMAP
+# state machine.  No dhall/datalog either: the same link budget as imapd.
+# jmapd's submission path (M4) links src/smtp_out.c — the same outbound client
+# outbox.com uses — plus its embedded CA bundle for the starttls-verify mode.
+# It does NOT link config.c/store.c: the relay Config is built by memset, the
+# outbox_deliver.c precedent, so jmapd still pulls in neither Dhall nor datalog.
+JMAPD_SRCS = ["src/jmapd.c","src/jmapd_http.c","src/jmap_json.c",
+              "src/jmap_core.c","src/jmap_mail.c","src/jmap_query.c",
+              "src/jmap_mime.c","src/jmap_set.c","src/jmap_state.c",
+              "src/jmapd_submit.c","src/smtp_out.c","src/data/cacert_pem.c",
+              "src/imap_maildir.c",
+              "src/imapd_tls.c","src/mail.c","src/json.c","src/http_parse.c"]
+JMAPD_HDRS = ["src/jmapd.h","src/jmap_json.h","src/jmap_mime.h","src/imapd.h",
+              "src/mail.h","src/visage.h","src/json.h","src/http_parse.h",
+              "src/smtp.h","src/config.h"]
+T.append(target("jmapd.com",
+    deps=[STAMP] + JMAPD_SRCS + JMAPD_HDRS + [MBEDTLS_CONFIG],
+    recipe=[link_cmd("jmapd.com", JMAPD_SRCS + mbtls_objs, MBFLAGS + " -pthread")],
+    out="jmapd.com"))
+# jmap_check.com: everything except jmapd.c (it has its own main) — the pure
+# JSON/HTTP/id/auth/session/MIME/patch/submission battery.
+JMAP_CHECK_SRCS = [s for s in JMAPD_SRCS if s != "src/jmapd.c"] + ["src/jmap_check.c"]
+T.append(target("jmap_check.com",
+    deps=[STAMP] + JMAP_CHECK_SRCS + JMAPD_HDRS + [MBEDTLS_CONFIG],
+    recipe=[link_cmd("jmap_check.com", JMAP_CHECK_SRCS + mbtls_objs,
+                     MBFLAGS + " -pthread")],
+    out="jmap_check.com"))
+
 # --- outbox.com (standalone SMTP submission + direct-MX delivery daemon) ---
 OUTBOX_SRCS = ["src/outbox_main.c","src/outbox_submit.c","src/outbox_deliver.c",
                "src/outbox_auth.c","src/smtp_out.c","src/mail.c",
@@ -367,9 +398,13 @@ T.append(target("bench",
 T.append(target("e2e",
     deps=["visage.com","config_check.com","tests/smtptest.com","tests/relay_fake.com",
           "imapd.com","tests/imapd_tls.sh","tests/pop3d_tls.sh",
-          "tests/smtp_starttls.sh"],
+          "tests/smtp_starttls.sh","jmapd.com","jmap_check.com",
+          "tests/jmapd_basic.sh","tests/jmapd_read.sh","tests/jmapd_write.sh",
+          "tests/jmapd_submit.sh","tests/jmapd_hub.sh"],
     recipe=["./tests/run.sh", "./tests/imapd_tls.sh", "./tests/pop3d_tls.sh",
-            "./tests/smtp_starttls.sh"],
+            "./tests/smtp_starttls.sh", "./tests/jmapd_basic.sh",
+            "./tests/jmapd_read.sh", "./tests/jmapd_write.sh",
+            "./tests/jmapd_submit.sh", "./tests/jmapd_hub.sh"],
     out=None))
 T.append(target("gen-admin",
     deps=["tools/gen_admin_ui.sh"],

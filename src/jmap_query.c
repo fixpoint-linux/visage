@@ -1,0 +1,425 @@
+/* jmap_query.c — Email/query (RFC 8621 4.4) for jmapd.
+ *
+ * The query runs over the SAME maildir tree imapd serves, one bounded scan
+ * per mailbox (what STATUS does), with the per-mailbox header cache for
+ * from/to/subject.  Nothing is cached across requests: imapd and jmapd share
+ * this tree, so a cached view would be a second source of truth.
+ *
+ * Sorting is by receivedAt only (the one sort option the session document
+ * advertises).  Rather than materialise every match — a 100k-message mailbox
+ * would cost tens of megabytes — the query keeps a bounded heap of the first
+ * (position + limit) entries in sort order and counts the rest: `total` stays
+ * exact and the page is exact, for a window up to JMAPD_QUERY_MAX_WINDOW.
+ * Deeper paging than that is refused rather than answered wrong.
+ *
+ * Filters: inMailbox, text (raw headers+body bytes, like IMAP SEARCH TEXT),
+ * from, to, subject.  A filter this server cannot evaluate is answered with
+ * the RFC-legal unsupportedFilter method error — never silently ignored,
+ * which would return the wrong set.
+ */
+#include "visage.h"
+#include "jmapd.h"
+
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+/* Bounded page window (position + limit). */
+#define JMAPD_QUERY_MAX_WINDOW 8192
+
+typedef struct QueryEntry {
+    int64_t date;
+    char    mbox[IMAPD_MAX_MBOX + 1];
+    char    base[IMAPD_MAX_MBOX + 1];
+} QueryEntry;
+
+typedef struct QueryFilter {
+    bool in_mailbox, text, from, to, subject;
+    char mbox[IMAPD_MAX_MBOX + 1];
+    char text_s[512], from_s[512], to_s[512], subject_s[512];
+} QueryFilter;
+
+/* ASCII case-insensitive substring search. */
+static bool ci_contains(const char *hay, size_t hl, const char *needle) {
+    size_t nl = strlen(needle), i;
+    if (nl == 0) return true;
+    if (nl > hl) return false;
+    for (i = 0; i + nl <= hl; i++) {
+        size_t k;
+        bool ok = true;
+        for (k = 0; k < nl; k++) {
+            unsigned char a = (unsigned char)hay[i + k];
+            unsigned char b = (unsigned char)needle[k];
+            if (a >= 'A' && a <= 'Z') a = (unsigned char)(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = (unsigned char)(b - 'A' + 'a');
+            if (a != b) { ok = false; break; }
+        }
+        if (ok) return true;
+    }
+    return false;
+}
+
+/* ------------------------------------------------------------------ */
+/* Sort order                                                          */
+/* ------------------------------------------------------------------ */
+
+/* Negative when a sorts before b.  The tie-breakers (mailbox, base) make the
+   order TOTAL, which is what keeps position/limit paging stable across
+   requests that see the same mailbox. */
+static int entry_cmp(const QueryEntry *a, const QueryEntry *b, bool desc) {
+    int r;
+    if (a->date != b->date) r = a->date < b->date ? -1 : 1;
+    else if ((r = strcmp(a->mbox, b->mbox)) == 0)
+        r = strcmp(a->base, b->base);
+    return desc ? -r : r;
+}
+
+/* Max-heap over the sort order: the root is the WORST entry kept, so a
+   better entry replaces it and the heap never grows past the window. */
+static void heap_sift_down(QueryEntry *v, size_t n, size_t i, bool desc) {
+    for (;;) {
+        size_t l = 2 * i + 1, r = l + 1, big = i;
+        if (l < n && entry_cmp(&v[l], &v[big], desc) > 0) big = l;
+        if (r < n && entry_cmp(&v[r], &v[big], desc) > 0) big = r;
+        if (big == i) return;
+        {
+            QueryEntry t = v[i];
+            v[i] = v[big];
+            v[big] = t;
+        }
+        i = big;
+    }
+}
+
+static void heap_sift_up(QueryEntry *v, size_t i, bool desc) {
+    while (i > 0) {
+        size_t p = (i - 1) / 2;
+        QueryEntry t;
+        if (entry_cmp(&v[i], &v[p], desc) <= 0) return;
+        t = v[i];
+        v[i] = v[p];
+        v[p] = t;
+        i = p;
+    }
+}
+
+/* Offer one entry to the bounded window. */
+static void heap_offer(QueryEntry *v, size_t *n, size_t cap, const QueryEntry *e,
+                       bool desc) {
+    if (*n < cap) {
+        v[*n] = *e;
+        heap_sift_up(v, *n, desc);
+        (*n)++;
+        return;
+    }
+    if (cap == 0) return;
+    if (entry_cmp(e, &v[0], desc) < 0) {
+        v[0] = *e;
+        heap_sift_down(v, *n, 0, desc);
+    }
+}
+
+/* Drain the heap into best-first order: heapsort against the SAME comparator
+   leaves the best entry at v[0] (the root is the worst kept entry, so each
+   swap moves the worst to the end). */
+static void heap_drain(QueryEntry *v, size_t n, bool desc) {
+    size_t end;
+    for (end = n; end > 1; end--) {
+        QueryEntry t = v[0];
+        v[0] = v[end - 1];
+        v[end - 1] = t;
+        heap_sift_down(v, end - 1, 0, desc);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Filter parsing                                                      */
+/* ------------------------------------------------------------------ */
+
+static int filter_parse(const JmapJsonNode *f, QueryFilter *q) {
+    size_t n, i;
+    memset(q, 0, sizeof *q);
+    if (!f || f->type == JMAP_JSON_NULL) return 0;
+    if (f->type != JMAP_JSON_OBJ) return -1;
+    n = jmap_json_count(f);
+    for (i = 0; i < n; i++) {
+        const JmapJsonNode *m = jmap_json_at(f, i);
+        const char *s;
+        if (!m || !m->key) return -1;
+        if (!strcmp(m->key, "inMailbox")) {
+            if (jmap_json_str(m, &s, NULL) != 0) return -1;
+            if (jmapd_id_mailbox_parse(s, q->mbox, sizeof q->mbox) != 0)
+                return -1;
+            q->in_mailbox = true;
+        } else if (!strcmp(m->key, "text")) {
+            if (jmap_json_str(m, &s, NULL) != 0) return -1;
+            snprintf(q->text_s, sizeof q->text_s, "%s", s);
+            q->text = true;
+        } else if (!strcmp(m->key, "from")) {
+            if (jmap_json_str(m, &s, NULL) != 0) return -1;
+            snprintf(q->from_s, sizeof q->from_s, "%s", s);
+            q->from = true;
+        } else if (!strcmp(m->key, "to")) {
+            if (jmap_json_str(m, &s, NULL) != 0) return -1;
+            snprintf(q->to_s, sizeof q->to_s, "%s", s);
+            q->to = true;
+        } else if (!strcmp(m->key, "subject")) {
+            if (jmap_json_str(m, &s, NULL) != 0) return -1;
+            snprintf(q->subject_s, sizeof q->subject_s, "%s", s);
+            q->subject = true;
+        } else {
+            return -1;   /* a condition this server cannot evaluate */
+        }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Mailbox enumeration (Inbox first, like Mailbox/get)                 */
+/* ------------------------------------------------------------------ */
+
+static int query_mbox_names(JmapdServer *srv, const char *user, char ***out,
+                            size_t *nout) {
+    char **names = NULL;
+    size_t nnames = 0, i, o = 0;
+    if (imapd_mbox_list(&srv->icfg, user, "*", &names, &nnames) != 0) {
+        names = NULL;
+        nnames = 0;
+    }
+    *out = calloc(nnames + 1, sizeof **out);
+    if (!*out) {
+        for (i = 0; i < nnames; i++) free(names[i]);
+        free(names);
+        return -1;
+    }
+    (*out)[o++] = strdup("Inbox");
+    for (i = 0; i < nnames; i++) {
+        if (!strcmp(names[i], "Inbox")) {
+            free(names[i]);
+            continue;
+        }
+        (*out)[o++] = names[i];
+    }
+    free(names);
+    *nout = o;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Email/query                                                         */
+/* ------------------------------------------------------------------ */
+
+/* Search one message's raw bytes (headers + body) for the needle, charging
+   the cost against *budget.  Returns 1 on a match, 0 otherwise, or -1 when
+   the budget is exhausted. */
+static int msg_text_match(JmapdServer *srv, const Imail *m,
+                          const QueryFilter *q, size_t *budget) {
+    char *buf;
+    size_t cap, got = 0;
+    int fd, hit;
+    cap = m->size;
+    if (cap > srv->icfg.max_msg) cap = srv->icfg.max_msg;
+    if (cap > *budget) return -1;
+    buf = malloc(cap + 1);
+    if (!buf) return -1;
+    fd = open(m->path, O_RDONLY);
+    if (fd < 0) { free(buf); return 0; }
+    while (got < cap) {
+        ssize_t r = read(fd, buf + got, cap - got);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (r == 0) break;
+        got += (size_t)r;
+    }
+    close(fd);
+    *budget -= got;
+    hit = ci_contains(buf, got, q->text_s) ? 1 : 0;
+    free(buf);
+    return hit;
+}
+
+int jmapd_method_email_query(JmapdCtx *ctx, const JmapJsonNode *args,
+                             JsonBuilder *out) {
+    JmapdServer *srv = ctx->srv;
+    const char *user = ctx->user;
+    const JmapJsonNode *fnode = jmapd_arg(ctx, args, "filter");
+    const JmapJsonNode *snode = jmapd_arg(ctx, args, "sort");
+    const JmapJsonNode *pnode = jmapd_arg(ctx, args, "position");
+    const JmapJsonNode *lnode = jmapd_arg(ctx, args, "limit");
+    QueryFilter q;
+    bool desc = true;             /* RFC 8621 4.4.2 default: receivedAt desc */
+    uint64_t position = 0, limit = JMAPD_QUERY_DEFAULT_LIMIT;
+    size_t window, total = 0, heap_n = 0, i, k;
+    QueryEntry *heap = NULL;
+    char **names = NULL;
+    size_t nnames = 0;
+    char state[32];
+    JmapdState st;
+    size_t budget = JMAPD_TEXT_SCAN_MAX;
+
+    if (ctx->argerr) { jmapd_jb_method_error(out, ctx->argerr); return 0; }
+    if (filter_parse(fnode, &q) != 0) {
+        jmapd_jb_method_error(out, "unsupportedFilter");
+        return 0;
+    }
+    if (snode && snode->type != JMAP_JSON_NULL) {
+        size_t ns, j;
+        if (snode->type != JMAP_JSON_ARR) {
+            jmapd_jb_method_error(out, "unsupportedSort");
+            return 0;
+        }
+        ns = jmap_json_count(snode);
+        for (j = 0; j < ns; j++) {
+            const JmapJsonNode *c = jmap_json_at(snode, j);
+            const JmapJsonNode *prop, *asc;
+            const char *s;
+            bool a = false;
+            if (!c || c->type != JMAP_JSON_OBJ) {
+                jmapd_jb_method_error(out, "unsupportedSort");
+                return 0;
+            }
+            prop = jmap_json_get(c, "property");
+            if (jmap_json_str(prop, &s, NULL) != 0 ||
+                strcmp(s, "receivedAt") != 0) {
+                /* Only the advertised sort option exists (the maildir store
+                   has no cheap relevance/date-header ordering). */
+                jmapd_jb_method_error(out, "unsupportedSort");
+                return 0;
+            }
+            asc = jmap_json_get(c, "isAscending");
+            if (asc) (void)jmap_json_bool(asc, &a);
+            desc = !a;
+        }
+    }
+    if (pnode && jmap_json_u64(pnode, &position) != 0) position = 0;
+    if (lnode) {
+        if (lnode->type == JMAP_JSON_NULL) limit = JMAPD_QUERY_DEFAULT_LIMIT;
+        else if (jmap_json_u64(lnode, &limit) != 0) limit = 0;
+    }
+    if (limit > JMAPD_MAX_OBJECTS) limit = JMAPD_MAX_OBJECTS;
+    /* The window is what the heap holds: position + limit.  Paging deeper
+       than that is refused rather than answered with a short page. */
+    if (position + limit > JMAPD_QUERY_MAX_WINDOW) {
+        jmapd_jb_method_error(out, "serverFail");
+        return 0;
+    }
+    window = (size_t)(position + limit);
+    jmapd_state_load(srv, user, &st);
+    jmapd_state_sync(srv, user, &st);
+    if (jmapd_state_fmt('e', st.email, state, sizeof state) != 0) return -1;
+
+    if (window > 0) {
+        heap = calloc(window, sizeof *heap);
+        if (!heap) return -1;
+    }
+    if (query_mbox_names(srv, user, &names, &nnames) != 0) {
+        free(heap);
+        return -1;
+    }
+    for (i = 0; i < nnames; i++) {
+        Mbox mb;
+        if (q.in_mailbox && strcmp(q.mbox, names[i]) != 0) continue;
+        if (imapd_mbox_peek(&srv->icfg, user, names[i], &mb) != 0) continue;
+        for (k = 0; k < mb.nmsgs; k++) {
+            Imail *m = &mb.msgs[k];
+            QueryEntry e;
+            bool ok = true;
+            if (q.from || q.to || q.subject) {
+                /* An unreadable message matches no header condition. */
+                if (imapd_mail_ensure_hdrs(&mb, m, NULL) != 1) continue;
+            }
+            if (q.from) {
+                const char *v = imapd_mail_hdr_field(m, IH_FROM);
+                if (!v || !ci_contains(v, strlen(v), q.from_s)) ok = false;
+            }
+            if (ok && q.to) {
+                const char *v = imapd_mail_hdr_field(m, IH_TO);
+                if (!v || !ci_contains(v, strlen(v), q.to_s)) ok = false;
+            }
+            if (ok && q.subject) {
+                const char *v = imapd_mail_hdr_field(m, IH_SUBJ);
+                if (!v || !ci_contains(v, strlen(v), q.subject_s)) ok = false;
+            }
+            if (ok && q.text) {
+                int hit = msg_text_match(srv, m, &q, &budget);
+                if (hit < 0) {
+                    imapd_mbox_close(&mb);
+                    free(heap);
+                    for (k = 0; k < nnames; k++) free(names[k]);
+                    free(names);
+                    /* Honest refusal beats a wrong (partial) result set: the
+                       text filter reads whole messages and one request may not
+                       hold the poll loop for minutes. */
+                    jmapd_jb_method_error(out, "serverFail");
+                    return 0;
+                }
+                if (!hit) ok = false;
+            }
+            if (!ok) continue;
+            total++;
+            if (!m->base || !heap) continue;
+            memset(&e, 0, sizeof e);
+            e.date = (int64_t)m->internal_date;
+            snprintf(e.mbox, sizeof e.mbox, "%s", names[i]);
+            snprintf(e.base, sizeof e.base, "%s", m->base);
+            heap_offer(heap, &heap_n, window, &e, desc);
+        }
+        imapd_mbox_close(&mb);
+    }
+    for (k = 0; k < nnames; k++) free(names[k]);
+    free(names);
+    heap_drain(heap, heap_n, desc);
+
+    jsonb_begin_object(out);
+    jsonb_key(out, "accountId"); jsonb_str(out, user);
+    jsonb_comma(out);
+    jsonb_key(out, "queryState"); jsonb_str(out, state);
+    jsonb_comma(out);
+    /* M2 answers cannotCalculateChanges: the client falls back to a full
+       refresh (plan DECISIONS 4).  Claiming otherwise would be a lie the
+       client acts on. */
+    jsonb_key(out, "canCalculateChanges"); jsonb_bool(out, 0);
+    jsonb_comma(out);
+    jsonb_key(out, "position");
+    jmapd_jb_u64(out, position);
+    jsonb_comma(out);
+    jsonb_key(out, "total");
+    jmapd_jb_u64(out, (uint64_t)total);
+    jsonb_comma(out);
+    jsonb_key(out, "ids");
+    jsonb_begin_array(out);
+    {
+        int first = 1;
+        for (i = 0; i < heap_n; i++) {
+            char id[JMAPD_ID_MAX];
+            if ((uint64_t)i < position) continue;
+            if ((uint64_t)i >= position + limit) break;
+            if (jmapd_id_email(heap[i].base, NULL, id, sizeof id) != 0) continue;
+            /* A base name that also exists in an earlier mailbox of the same
+               result set gets the disambiguated "f" form (plan DECISIONS 3):
+               only an IMAP COPY can produce that collision. */
+            {
+                size_t j;
+                bool dup = false;
+                for (j = 0; j < i; j++)
+                    if (!strcmp(heap[j].base, heap[i].base) &&
+                        strcmp(heap[j].mbox, heap[i].mbox)) {
+                        dup = true;
+                        break;
+                    }
+                if (dup)
+                    (void)jmapd_id_email(heap[i].base, heap[i].mbox, id,
+                                         sizeof id);
+            }
+            if (!first) jsonb_comma(out);
+            first = 0;
+            jsonb_str(out, id);
+        }
+    }
+    jsonb_end_array(out);
+    jsonb_end_object(out);
+    free(heap);
+    return 0;
+}

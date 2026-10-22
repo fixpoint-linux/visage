@@ -84,6 +84,7 @@ CRITICAL). Where it stands:
 | [dhall-c](https://github.com/jmars/dhall-c) | **typechecked** Dhall config, evaluated at startup (vendored submodule) |
 | [datalog-dafsa](https://github.com/jmars/datalog-dafsa) | compact minimal-DAFSA store: prefix-search lookups, WAL/flock + mmap reads (vendored submodule) |
 | SMTP-in-C (`src/smtp_in.c`, `src/smtp_out.c`) | RFC 5321 state machine, receiver + relay |
+| JMAP server (`src/jmapd*.c`) | RFC 8620/8621 subset (`jmapd.com`) over the **same maildir root** as `imapd`; the `mail-hub` client's server — see `docs/jmapd.md` |
 | STARTTLS / STARTTLS-verify (`vendor/mbedtls`) | relay to your mailbox provider, optionally cert-verified |
 | DKIM (`src/dkim.c`) | sign outbound mail from C |
 | durable outbound retry queue | spooled to disk, bounded retries, no lost mail |
@@ -103,12 +104,21 @@ git submodule update --init --recursive   # first checkout: fetch all vendored s
 # build libdatalog.so in the sibling ../datalog-dafsa checkout (see its README)
 ./vendor/dhake/dhake.com                  # default target `all`: visage.com + all *_check tools + tests
 ./vendor/dhake/dhake.com visage.com       # build one binary
+./vendor/dhake/dhake.com jmapd.com        # the JMAP server (+ jmap_check.com for its unit checks)
 ./vendor/dhake/dhake.com e2e              # host integration tests (tests/run.sh)
 ./vendor/dhake/dhake.com bench            # store benchmark + docs/bench-*.svg
 ./vendor/dhake/dhake.com dist/index.html  # the Elm MFE docs site
 ./vendor/dhake/dhake.com --verify         # CI pre-flight: check pinned hashes + up-to-dateness
 ./vendor/dhake/dhake.com --list           # list all targets
 ```
+
+The JMAP server's acceptance test is the **real client**: `tests/jmapd_hub.sh`
+builds `mail-hub` — a Zig + Elm JMAP client, sibling checkout `../email`
+(`MAIL_HUB_DIR` overrides) — and drives that client's own HTTP API at `jmapd`
+end to end: list, fetch bodies, flag, move, send, sync. `docs/jmapd.md` has the
+method list, the id/state scheme, the auth model, the security posture, the v1
+limitations and how to run the gates; `deploy/` holds the systemd unit, the
+submission-credential environment file and the Caddy snippet.
 
 `libdhall.so` is built by this Dhakefile (Zig port in `../dhall-c/zig/src`, pinned as a
 target); `libdatalog.so` comes from the sibling `../datalog-dafsa` checkout. Both are

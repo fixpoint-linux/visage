@@ -102,6 +102,55 @@ Legend: **P** = privacy/security, **R** = reliability, **F** = feature/interop, 
   reverse-alias is stripped from group members while the group syntax is
   preserved.
 
+## JMAP server (`jmapd`)
+
+- ~~**[F] A JMAP (RFC 8620/8621) front end on the same maildir store.**~~
+  **DONE (2026-10-22, milestones M1–M5).** `jmapd.com` is a single-process
+  `poll()` daemon in the imapd shape: same maildir root, same `imapd.passwd`,
+  HTTPS from the first byte (imapd's mbedTLS wrappers, plaintext only on a
+  loopback bind), bounded JSON/HTTP parsers, and no link against the datalog
+  store or Dhall. It answers `Mailbox/get`, `Identity/get`, `Email/query`,
+  `Email/get` (bodies, bodyStructure, attachments, decoded blob download),
+  `Email/set` (keywords, mailboxIds, create/destroy, `ifInState`), `Thread/get`
+  and `EmailSubmission/set` (relayed to the outbox, which owns DKIM/DMARC).
+  Accepted end to end by the real `mail-hub` client (`tests/jmapd_hub.sh`).
+  Docs: `docs/jmapd.md`; deployment: `deploy/` (systemd unit, submission
+  credential env file, Caddy snippet) and the jmapd stanza in
+  `config.example.dhall`. Deferred, each named with its consequence in the docs:
+
+  - **[F] Real `changes` / `queryChanges` diffs.** Today they answer the
+    RFC-legal `cannotCalculateChanges`, so the client full-refreshes (a
+    `Mailbox/get` + `Email/query` + `Email/get` **with bodies**) every 60 s.
+    The per-mailbox fingerprint the state counters already compute is the
+    natural basis for a real diff.
+  - **[F] Push.** No EventSource `StateChange`; `eventSourceUrl` is advertised
+    and `501`s, so the 60 s poll is the whole notification story.
+  - **[F] Blob upload / attachments on compose.** `uploadUrl` is advertised and
+    `501`s; `maxSizeAttachmentsPerEmail` is honestly `0`, and the MIME builder
+    refuses attachments rather than dropping them.
+  - **[F] `Mailbox/set`.** Mailboxes are the maildir folders imapd already
+    uses; JMAP can read them but not create, rename or delete them.
+  - **[F] Submission history.** No `EmailSubmission/get`/`changes`/`query` and
+    no `undoStatus` cancellation; submissions are final when the worker starts,
+    at-most-once, capped at 16 recipients, with a bounded 4096-entry ledger
+    refusing a duplicate send of the same Email.
+  - **[F] Broader `Email/query`.** Only `inMailbox`/`text`/`from`/`to`/`subject`
+    filters and the `receivedAt` sort exist; anything else answers
+    `unsupportedFilter`/`unsupportedSort` rather than returning a wrong set.
+  - **[A] Trusted-proxy support (`X-Forwarded-For`).** Behind Caddy every client
+    looks like `127.0.0.1`, so the per-IP lockout becomes one shared bucket.
+    Fine on a single-user box; a real defect on a shared one.
+  - **[A] A deferred (non-blocking) submission response.** `EmailSubmission/set`
+    waits up to `--submit-wait` (5 s) for the relay's verdict so the answer is
+    authoritative; that is the one place the poll loop can block, and a
+    resumable method loop with a replay log is what would remove it.
+  - **[R] Concurrent uidlist rewrites** by imapd and jmapd can lose the other's
+    freshly registered uids. Uid churn only — JMAP ids never contain a uid — but
+    an IMAP client can see uids move after a JMAP-side change.
+  - **[F] RFC 2047 outside the display fields.** Subject and the display names
+    of from/to/cc/bcc are decoded; attachment filenames, mailbox names and the
+    preview keep their raw bytes.
+
 ## Out of scope / long-term
 
 - **[A] Multi-writer / multi-threaded store.** Deliberately single-threaded

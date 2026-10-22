@@ -57,6 +57,22 @@ in  { hostname = "mx.example.com"
                    , auth = { enabled = True, username = "visage", password = "change-me" }
                    , retries = 3, tls = "starttls-verify"
                    , tls_ca = "", max_attempts = 100 }
+   -- jmapd (the JMAP server, `dhake jmapd.com`) takes NO Dhall: its whole
+   -- configuration is flags and JMAPD_* env, so there is no field to add here.
+   -- Three facts a reader of this file needs, because they tie jmapd to the
+   -- settings above:
+   --   * SAME MAILDIR ROOT AS IMAPD — `--root /opt/imapd/var/mail`, i.e. the
+   --     same tree and the same imapd.passwd this daemon's mail lands in.  It
+   --     is a second protocol front end on one store, never a second store.
+   --   * ONE ACCOUNT PER CREDENTIAL — each line of <root>/imapd.passwd is one
+   --     JMAP accountId (the username) with its own state counters.  There is
+   --     no shared or global account, and no account without a passwd line.
+   --   * SUBMISSION IS RELAYED TO THE OUTBOX — jmapd never signs or resolves
+   --     MX itself; it hands each submission to the outbox on :465 with SMTP
+   --     AUTH (JMAPD_OUTBOX_USER/PASS from /etc/jmapd/outbox.env).  DKIM
+   --     signing and DMARC/DNS policy live THERE, not here, which is why
+   --     jmapd's send path is at-most-once and has no retry queue of its own.
+   -- See deploy/jmapd.service, deploy/Caddyfile.jmap and docs/jmapd.md.
    , storage = { path = "./var/db", spool = "./var/spool", retention_days = 30 }
    , reply = { prefix = "reply", separator = "+" }
    , catch_all = ""
