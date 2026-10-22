@@ -1901,8 +1901,12 @@ static void do_file(ImapdServer *srv, Conn *c, const char *tag,
             }
             for (i = 0; i < nm; i++) {
                 uint32_t duv = 0, duid = 0;
+                /* duid == 0: the destination's uidlist could not register a
+                   row for the new file (a generation race), so there is no
+                   dest uid to report — omit the pair rather than emit a UID
+                   set containing the illegal uid 0. */
                 if (imapd_mbox_file(&srv->cfg, c->user, &c->mb, mv[i].uid,
-                                    name, true, &duv, &duid) == 0) {
+                                    name, true, &duv, &duid) == 0 && duid != 0) {
                     uvv = duv;
                     FILE_PAIR(mv[i].uid, duid);
                 }
@@ -1920,7 +1924,7 @@ static void do_file(ImapdServer *srv, Conn *c, const char *tag,
                 uint32_t duv = 0, duid = 0;
                 if (!imapd_seqset_has(set, v, star)) continue;
                 if (imapd_mbox_file(&srv->cfg, c->user, &c->mb, m->uid,
-                                    name, false, &duv, &duid) == 0) {
+                                    name, false, &duv, &duid) == 0 && duid != 0) {
                     uvv = duv;
                     FILE_PAIR(m->uid, duid);
                 }

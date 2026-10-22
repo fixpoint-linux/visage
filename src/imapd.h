@@ -14,8 +14,9 @@
        <root>/<user>/Inbox/{tmp,new,cur}      (INBOX)
        <root>/<user>/.<Folder>/{tmp,new,cur}  (other folders)
    Flags live in the ":2,DFRST" filename info suffix and UIDs in a sidecar
-   "<mailboxdir>/imapd-uidlist" file.  Single-writer: one daemon owns the
-   tree; external writers are not supported (v1).
+   "<mailboxdir>/imapd-uidlist" file.  imapd and jmapd share one root, so that
+   sidecar is written as a locked read-merge-write (imap_maildir.c); a
+   third-party writer that ignores the lock is not supported.
 
    The pure helpers (flag suffix codec, seq-set, base64 decode, wildcards,
    SEARCH parse/match, tokenizer) are exported here and unit-tested by
@@ -156,11 +157,28 @@ typedef struct Mbox {
     UidEnt  *uidmap;
     size_t   nuidmap, uidmap_cap;
     bool     uidlist_dirty;
+    /* Bases this session deliberately removed from the uidlist (EXPUNGE, or a
+       scan-time prune of a vanished file).  uidlist_save's read-merge-write
+       consults this list so a concurrent daemon's copy of the row cannot
+       resurrect a deleted entry.  Bounded by the rows this session removed. */
+    char   **tomb;
+    size_t   ntomb, tomb_cap;
     /* S2 header cache: dirty when this session extracted headers the
        imapd-hdrs sidecar does not hold yet (new files, or lazy extraction);
        saved tmp+rename at close.  See imap_maildir.c. */
     bool     hdrs_dirty;
 } Mbox;
+
+/* Persist the uidlist sidecar: read-merge-write under an exclusive advisory
+   lock, published with a tmp+rename (see imap_maildir.c for the merge rules).
+   Daemon code reaches it through imapd_mbox_*; it is exported so imap_check
+   can drive the merge and the atomicity contract directly.  When probe_base is
+   non-NULL, *probe_uid receives the uid the merged file actually holds for that
+   base — the uid the caller assigned can differ (re-mint on a uid collision) —
+   or 0 when no row for it survives the merge.  Returns 0, or -1. */
+int imapd_uidlist_save(const Mbox *mb, uint32_t uidvalidity, uint32_t uidnext,
+                       const UidEnt *v, size_t n,
+                       const char *probe_base, uint32_t *probe_uid);
 
 /* ------------------------------------------------------------------ */
 /* SEARCH key tree (pure; tested over synthetic views)                 */

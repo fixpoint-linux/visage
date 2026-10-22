@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
+#include <pthread.h>
 
 static int nchecks = 0;
 static int nfails = 0;
@@ -77,6 +78,50 @@ static void flags_test(void) {
            "flags parse accepts non-canonical order");
 }
 
+#define SC_MAX 64
+
+typedef struct Sidecar {
+    uint32_t uv, uidnext;
+    size_t   n;
+    uint32_t uid[SC_MAX];
+    char     base[SC_MAX][160];
+} Sidecar;
+
+/* Parse "<dir>/imapd-uidlist": header then one (uid, base) per row.  A
+   missing file is an empty sidecar.  Returns -1 on a malformed file. */
+static int sidecar_load(const char *dir, Sidecar *sc) {
+    char path[4200], line[512];
+    FILE *f;
+    memset(sc, 0, sizeof *sc);
+    if (snprintf(path, sizeof path, "%s/%s", dir, IMAPD_UIDLIST_FILE)
+            >= (int)sizeof path)
+        return -1;
+    f = fopen(path, "r");
+    if (!f) return 0;
+    if (!fgets(line, sizeof line, f)) { fclose(f); return -1; }
+    if (sscanf(line, "%u %u", &sc->uv, &sc->uidnext) != 2) {
+        fclose(f);
+        return -1;
+    }
+    while (sc->n < SC_MAX && fgets(line, sizeof line, f)) {
+        unsigned uid = 0;
+        char base[160];
+        if (sscanf(line, "%u %159s", &uid, base) != 2) { fclose(f); return -1; }
+        sc->uid[sc->n] = uid;
+        snprintf(sc->base[sc->n], sizeof sc->base[sc->n], "%s", base);
+        sc->n++;
+    }
+    fclose(f);
+    return 0;
+}
+
+static int sidecar_find(const Sidecar *sc, const char *base) {
+    size_t i;
+    for (i = 0; i < sc->n; i++)
+        if (strcmp(sc->base[i], base) == 0) return (int)i;
+    return -1;
+}
+
 /* ---- (2) uidlist assign / persist / prune ---- */
 
 static void uidlist_test(const char *root) {
@@ -122,18 +167,276 @@ static void uidlist_test(const char *root) {
     /* remove uid 2's file -> pruned on next open */
     {
         char path[4200];
+        char pruned[256];
+        Sidecar sc;
         EXPECT(imapd_mbox_peek(&cfg, "bob", "INBOX", &mb) == 0, "reopen 2");
         snprintf(path, sizeof path, "%s", mb.msgs[1].path);
+        snprintf(pruned, sizeof pruned, "%s", mb.msgs[1].base);
         imapd_mbox_close(&mb);
         EXPECT(unlink(path) == 0, "unlink uid 2 file");
+        EXPECT(imapd_mbox_open(&cfg, "bob", "INBOX", &mb) == 0, "reopen 3");
+        EXPECT(mb.nmsgs == 3 && mb.msgs[0].uid == 1 && mb.msgs[1].uid == 3,
+               "vanished file pruned, other uids stable");
+        EXPECT(mb.uidnext == 5, "uidnext never reuses after open");
+        /* The prune must reach the SIDECAR, not just the view: the scan's
+           immediate save merges with the file it just loaded, so without the
+           prune's tombstone the merge would put the row straight back and the
+           mailbox would carry an orphan forever.  Read the file back. */
+        EXPECT(sidecar_load(dir, &sc) == 0 && sc.n == 3 &&
+                   sidecar_find(&sc, pruned) < 0,
+               "the scan-time prune removes the row from the sidecar file");
+        m = imapd_mbox_find(&mb, 3);
+        EXPECT(m != NULL, "find by uid");
+        imapd_mbox_close(&mb);
     }
-    EXPECT(imapd_mbox_open(&cfg, "bob", "INBOX", &mb) == 0, "reopen 3");
-    EXPECT(mb.nmsgs == 3 && mb.msgs[0].uid == 1 && mb.msgs[1].uid == 3,
-           "vanished file pruned, other uids stable");
-    EXPECT(mb.uidnext == 5, "uidnext never reuses after open");
-    m = imapd_mbox_find(&mb, 3);
-    EXPECT(m != NULL, "find by uid");
-    imapd_mbox_close(&mb);
+}
+
+/* ---- (2b) uidlist sidecar: the multi-daemon merge ----
+   imapd and jmapd share one maildir root and each keeps its own uidlist
+   snapshot, so imapd_uidlist_save must merge with the on-disk file instead
+   overwriting it.  These checks drive the real save path (open -> mutate ->
+   close) and read the sidecar back the way a reader would. */
+
+static size_t slurp(const char *path, char *buf, size_t bufsz) {
+    FILE *f = fopen(path, "rb");
+    size_t n;
+    if (!f) return 0;
+    n = fread(buf, 1, bufsz - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return n;
+}
+
+static int write_text(const char *path, const char *text) {
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    if (fputs(text, f) < 0) { fclose(f); return -1; }
+    return fclose(f);
+}
+
+static void uidlist_merge_test(const char *root) {
+    ImapdConfig cfg;
+    Mbox a, b;
+    char dir[4200], path[4400];
+    char msg[] = "Subject: m\r\n\r\nbody\r\n";
+    char *b1 = NULL, *b2 = NULL, *b3 = NULL;
+    Sidecar sc;
+
+    memset(&cfg, 0, sizeof cfg);
+    cfg.root = root;
+    cfg.hostname = "test";
+    if (imapd_mbox_dir(&cfg, "merge", "INBOX", dir, sizeof dir) != 0) {
+        check_fail("merge: mbox_dir", NULL);
+        return;
+    }
+    snprintf(path, sizeof path, "%s/%s", dir, IMAPD_UIDLIST_FILE);
+
+    /* --- (i) interleaved writers: A's snapshot is stale when it saves --- */
+    EXPECT(imapd_mbox_deliver(dir, msg, strlen(msg), 0, NULL) == 0 &&
+           imapd_mbox_deliver(dir, msg, strlen(msg), 0, NULL) == 0,
+           "merge: deliver two messages");
+    EXPECT(imapd_mbox_open(&cfg, "merge", "INBOX", &a) == 0,
+           "merge: A opens");
+    EXPECT(a.nmsgs == 2 && a.uidnext == 3, "merge: A snapshot holds 2 rows");
+    b1 = a.nmsgs > 0 ? strdup(a.msgs[0].base) : NULL;
+    b2 = a.nmsgs > 1 ? strdup(a.msgs[1].base) : NULL;
+
+    /* a third message lands while A holds its snapshot; B registers it */
+    EXPECT(imapd_mbox_deliver(dir, msg, strlen(msg), 0, NULL) == 0,
+           "merge: deliver a third message");
+    EXPECT(imapd_mbox_peek(&cfg, "merge", "INBOX", &b) == 0,
+           "merge: B opens over A's stale snapshot");
+    EXPECT(b.nmsgs == 3 && b.uidnext == 4, "merge: B snapshot holds 3 rows");
+    b3 = b.nmsgs > 2 ? strdup(b.msgs[2].base) : NULL;
+
+    /* A now saves its stale snapshot (a flag change makes it dirty) */
+    EXPECT(imapd_mbox_store(&a, 1, IMAIL_SEEN) == 0, "merge: A stores a flag");
+    imapd_mbox_close(&a);
+
+    EXPECT(sidecar_load(dir, &sc) == 0 && sc.n == 3,
+           "merge: the stale save keeps both snapshots' rows");
+    EXPECT(b1 && b2 && b3 && sidecar_find(&sc, b1) >= 0 &&
+               sidecar_find(&sc, b2) >= 0 && sidecar_find(&sc, b3) >= 0,
+           "merge: every base still has a row after the stale save");
+    EXPECT(sc.uidnext == 4, "merge: the stale uidnext did not rewind");
+    EXPECT(sc.uv == a.uidvalidity, "merge: same generation keeps uidvalidity");
+    EXPECT(sc.uid[0] != sc.uid[1] && sc.uid[1] != sc.uid[2] &&
+               sc.uid[0] != sc.uid[2],
+           "merge: merged uids are unique");
+    imapd_mbox_close(&b);
+    EXPECT(imapd_mbox_peek(&cfg, "merge", "INBOX", &b) == 0 && b.nmsgs == 3 &&
+               b.uidnext == 4 && b.msgs[0].uid == 1 && b.msgs[1].uid == 2 &&
+               b.msgs[2].uid == 3,
+           "merge: uids stable across the merge");
+    imapd_mbox_close(&b);
+
+    /* --- (ii) a deliberately deleted row is not resurrected --- */
+    {
+        Mbox p;
+        char *pb2 = NULL;
+        EXPECT(imapd_mbox_dir(&cfg, "merge", "Prune", dir, sizeof dir) == 0,
+               "merge: prune mbox_dir");
+        EXPECT(imapd_mbox_deliver(dir, msg, strlen(msg), 0, NULL) == 0 &&
+               imapd_mbox_deliver(dir, msg, strlen(msg), 0, NULL) == 0,
+               "merge: prune delivers two messages");
+        EXPECT(imapd_mbox_open(&cfg, "merge", "Prune", &p) == 0 && p.nmsgs == 2,
+               "merge: prune opens with 2 rows");
+        pb2 = p.nmsgs > 1 ? strdup(p.msgs[1].base) : NULL;
+        EXPECT(pb2 != NULL, "merge: prune captured the doomed base");
+        EXPECT(imapd_mbox_expunge(&p, 2) == 0, "merge: prune expunges uid 2");
+        imapd_mbox_close(&p);   /* the disk file still holds the row */
+        EXPECT(sidecar_load(dir, &sc) == 0 && sc.n == 1 && pb2 &&
+                   sidecar_find(&sc, pb2) < 0,
+               "merge: an expunged row is not resurrected by the merge");
+        free(pb2);
+    }
+
+    /* --- (iii) a failed temp write leaves the old sidecar intact --- */
+    {
+        Mbox q;
+        char tmp_path[4464], before[4096], after[4096];
+        size_t bl, al;
+        EXPECT(imapd_mbox_dir(&cfg, "merge", "Atomic", dir, sizeof dir) == 0,
+               "merge: atomic mbox_dir");
+        EXPECT(imapd_mbox_deliver(dir, msg, strlen(msg), 0, NULL) == 0,
+               "merge: atomic delivers one message");
+        EXPECT(imapd_mbox_open(&cfg, "merge", "Atomic", &q) == 0,
+               "merge: atomic opens");
+        imapd_mbox_close(&q);   /* the scan save wrote the sidecar */
+        snprintf(path, sizeof path, "%s/%s", dir, IMAPD_UIDLIST_FILE);
+        bl = slurp(path, before, sizeof before);
+        EXPECT(bl > 0, "merge: atomic read the sidecar");
+        /* Block the exact temp path imapd_uidlist_save uses (pid + thread id:
+           this check runs in the same thread the save will), so it fails. */
+        snprintf(tmp_path, sizeof tmp_path, "%s.tmp.%ld.%lx", path,
+                 (long)getpid(), (unsigned long)pthread_self());
+        EXPECT(mkdir(tmp_path, 0755) == 0, "merge: block the temp path");
+        EXPECT(imapd_mbox_open(&cfg, "merge", "Atomic", &q) == 0 &&
+                   imapd_mbox_store(&q, 1, IMAIL_FLAGGED) == 0,
+               "merge: atomic opens and stores");
+        imapd_mbox_close(&q);   /* the save must fail, atomically */
+        al = slurp(path, after, sizeof after);
+        EXPECT(al == bl && memcmp(before, after, bl) == 0,
+               "merge: a failed save leaves the old sidecar byte-identical");
+        EXPECT(rmdir(tmp_path) == 0, "merge: unblock the temp path");
+        EXPECT(imapd_mbox_open(&cfg, "merge", "Atomic", &q) == 0 &&
+                   q.nmsgs == 1 && q.msgs[0].uid == 1,
+               "merge: the surviving sidecar still loads its rows");
+        imapd_mbox_close(&q);
+    }
+
+    /* --- (iv) uidvalidity generations: the larger one wins, the loser's
+       rows are dropped --- */
+    {
+        Mbox g;
+        char *gb = NULL;
+        char text[512];
+        uint32_t guv;
+        /* disk generation newer */
+        EXPECT(imapd_mbox_dir(&cfg, "merge", "GenDisk", dir, sizeof dir) == 0,
+               "merge: gen mbox_dir (disk newer)");
+        EXPECT(imapd_mbox_deliver(dir, msg, strlen(msg), 0, NULL) == 0,
+               "merge: gen delivers (disk newer)");
+        EXPECT(imapd_mbox_open(&cfg, "merge", "GenDisk", &g) == 0,
+               "merge: gen opens (disk newer)");
+        guv = g.uidvalidity;
+        gb = g.nmsgs > 0 ? strdup(g.msgs[0].base) : NULL;
+        snprintf(path, sizeof path, "%s/%s", dir, IMAPD_UIDLIST_FILE);
+        snprintf(text, sizeof text, "%u 7\n6 handrow 6\n", guv + 1000);
+        EXPECT(write_text(path, text) == 0, "merge: hand-write a newer sidecar");
+        EXPECT(imapd_mbox_store(&g, 1, IMAIL_SEEN) == 0,
+               "merge: gen stores (disk newer)");
+        imapd_mbox_close(&g);
+        EXPECT(sidecar_load(dir, &sc) == 0 && sc.uv == guv + 1000,
+               "merge: the larger (disk) uidvalidity wins");
+        EXPECT(sc.n == 1 && sidecar_find(&sc, "handrow") >= 0 && gb &&
+                   sidecar_find(&sc, gb) < 0,
+               "merge: the older generation's rows are dropped");
+        EXPECT(sc.uidnext == 7, "merge: disk-generation uidnext kept");
+        free(gb);
+        gb = NULL;
+
+        /* memory generation newer (the crash-truncate re-mint case) */
+        EXPECT(imapd_mbox_dir(&cfg, "merge", "GenMem", dir, sizeof dir) == 0,
+               "merge: gen mbox_dir (memory newer)");
+        EXPECT(imapd_mbox_deliver(dir, msg, strlen(msg), 0, NULL) == 0,
+               "merge: gen delivers (memory newer)");
+        EXPECT(imapd_mbox_open(&cfg, "merge", "GenMem", &g) == 0,
+               "merge: gen opens (memory newer)");
+        guv = g.uidvalidity;
+        gb = g.nmsgs > 0 ? strdup(g.msgs[0].base) : NULL;
+        snprintf(path, sizeof path, "%s/%s", dir, IMAPD_UIDLIST_FILE);
+        snprintf(text, sizeof text, "%u 2\n1 stale 2\n", guv - 1000);
+        EXPECT(write_text(path, text) == 0, "merge: hand-write an older sidecar");
+        EXPECT(imapd_mbox_store(&g, 1, IMAIL_SEEN) == 0,
+               "merge: gen stores (memory newer)");
+        imapd_mbox_close(&g);
+        EXPECT(sidecar_load(dir, &sc) == 0 && sc.uv == guv,
+               "merge: the larger (memory) uidvalidity wins");
+        EXPECT(sc.n == 1 && gb && sidecar_find(&sc, gb) >= 0 &&
+                   sidecar_find(&sc, "stale") < 0,
+               "merge: the dead generation's rows are dropped");
+        free(gb);
+    }
+
+    /* --- (v) the uid a save REPORTS is the one the file holds ---
+       mbox_register hands that uid to APPENDUID/COPYUID, so it must report
+       what the merge persisted, not what the caller assigned: the re-minted
+       uid when another daemon claimed the caller's uid for a different base,
+       and 0 (no APPENDUID) when the caller's row lost a uidvalidity-generation
+       race and is not in the file at all.  Driven through the save's probe
+       because the production window (the file changing between
+       mbox_register's load and its locked save) cannot be staged
+       deterministically. */
+    {
+        Mbox d;
+        UidEnt one;
+        char nb[] = "newbase";
+        uint32_t puid;
+        int at;
+
+        memset(&d, 0, sizeof d);
+        EXPECT(imapd_mbox_dir(&cfg, "merge", "Report", dir, sizeof dir) == 0,
+               "merge: report mbox_dir");
+        EXPECT(imapd_mbox_create(dir) == 0, "merge: report mbox_create");
+        snprintf(d.dir, sizeof d.dir, "%.*s", (int)sizeof d.dir - 1, dir);
+        snprintf(path, sizeof path, "%s/%s", dir, IMAPD_UIDLIST_FILE);
+
+        /* (v-a) the uid the caller picked is already held by another base */
+        EXPECT(write_text(path, "500 5\n3 other 2\n") == 0,
+               "merge: hand-write a sidecar claiming uid 3");
+        memset(&one, 0, sizeof one);
+        one.base = nb;
+        one.uid = 3;
+        one.modseq = 4;
+        puid = 0;
+        EXPECT(imapd_uidlist_save(&d, 500, 5, &one, 1, nb, &puid) == 0 &&
+                   puid != 0 && puid != 3,
+               "merge: a re-minted row reports the new uid, not the claimed 3");
+        at = sidecar_load(dir, &sc) == 0 ? sidecar_find(&sc, nb) : -1;
+        EXPECT(at >= 0 && sc.n == 2 && sc.uid[at] == puid,
+               "merge: the reported uid is the uid in the file");
+
+        /* (v-b) the disk is from a NEWER generation: the caller's rows are
+           dropped, so nothing is persisted for the base and the report is 0 */
+        EXPECT(write_text(path, "9000 5\n3 other 2\n") == 0,
+               "merge: hand-write a newer-generation sidecar");
+        memset(&one, 0, sizeof one);
+        one.base = nb;
+        one.uid = 4;
+        one.modseq = 5;
+        puid = 7;
+        EXPECT(imapd_uidlist_save(&d, 500, 5, &one, 1, nb, &puid) == 0 &&
+                   puid == 0,
+               "merge: a row dropped by the generation race reports uid 0");
+        EXPECT(sidecar_load(dir, &sc) == 0 && sc.uv == 9000 &&
+                   sidecar_find(&sc, nb) < 0,
+               "merge: the dropped row really is absent from the file");
+    }
+
+    free(b1);
+    free(b2);
+    free(b3);
 }
 
 /* ---- (3) seq-set parser ---- */
@@ -683,6 +986,26 @@ static void appenduid_test(const char *root) {
                uid2 == 2 && uv2 == uv1,
            "APPEND registers uidnext, uidvalidity stable");
 
+    /* APPENDUID must name the uid the SIDECAR holds, not a locally assigned
+       one the locked merge could have re-minted or dropped: read the file
+       back and match the row of the message the scan says carries uid1. */
+    {
+        char dir[4096], base[256];
+        Sidecar sc;
+        int at;
+        EXPECT(imapd_mbox_dir(&cfg, "erin", "Sent", dir, sizeof dir) == 0,
+               "APPEND mbox_dir");
+        EXPECT(imapd_mbox_peek(&cfg, "erin", "Sent", &mb) == 0 &&
+                   mb.nmsgs == 2 && mb.msgs[0].uid == uid1,
+               "APPEND reopens the mailbox");
+        snprintf(base, sizeof base, "%s",
+                 mb.nmsgs > 0 ? mb.msgs[0].base : "");
+        imapd_mbox_close(&mb);
+        at = sidecar_load(dir, &sc) == 0 ? sidecar_find(&sc, base) : -1;
+        EXPECT(at >= 0 && sc.uid[at] == uid1,
+               "APPEND reports the uid the sidecar actually holds");
+    }
+
     /* The scan must adopt the registered uids, not hand out fresh ones:
        that is exactly what a UIDPLUS client relies on. */
     EXPECT(imapd_mbox_peek(&cfg, "erin", "Sent", &mb) == 0 &&
@@ -1118,6 +1441,7 @@ int main(void) {
         cfg.root = root;
 
         uidlist_test(root);
+        uidlist_merge_test(root);
         deliver_test(root);
         appenduid_test(root);
         flags_store_test(root);

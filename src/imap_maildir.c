@@ -5,7 +5,10 @@
  * flags live in the standard ":2,DFRST" filename info suffix; UIDs live in
  * a per-mailbox sidecar file "imapd-uidlist" ("uidvalidity uidnext" header
  * line then "uid base" lines) so a message keeps its UID across flag
- * renames and daemon restarts.  Single-writer: the daemon owns the tree.
+ * renames and daemon restarts.  Several processes share one tree (imapd for
+ * IMAP/POP3/ingest, jmapd for JMAP), so the sidecar is written by
+ * imapd_uidlist_save as a read-merge-write under an exclusive advisory lock and
+ * published with a tmp+rename; no other file here is shared-mutable.
  *
  * Pure helpers (flag suffix codec, seq-sets, base64, wildcards, validation)
  * are exported via imapd.h and unit-tested by imap_check.c. */
@@ -18,9 +21,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <dirent.h>
+#include <pthread.h>
 
 /* ------------------------------------------------------------------ */
 /* Small file helpers (duplicated per house style; cf. smtp_in.c)      */
@@ -1184,31 +1189,318 @@ static UidEnt *uidlist_load(const Mbox *mb, uint32_t *uidvalidity,
     return v;
 }
 
-static int uidlist_save(const Mbox *mb, uint32_t uidvalidity,
-                        uint32_t uidnext, const UidEnt *v, size_t n) {
-    char path[4200];
-    FILE *f;
+/* Record that this session deliberately removed `base` from the uidlist.  The
+   merge in imapd_uidlist_save unions the caller's snapshot with the on-disk
+   file, so without this a row deleted here (EXPUNGE, or a scan-time prune of a
+   vanished file) would come straight back from disk. */
+static void tomb_add(Mbox *mb, const char *base) {
+    char **nv;
+    size_t nc;
+    if (!mb || !base || !base[0]) return;
+    if (mb->ntomb == mb->tomb_cap) {
+        nc = mb->tomb_cap ? mb->tomb_cap * 2 : 16;
+        nv = realloc(mb->tomb, nc * sizeof *nv);
+        if (!nv) return;   /* OOM: worst case one pruned row comes back */
+        mb->tomb = nv;
+        mb->tomb_cap = nc;
+    }
+    mb->tomb[mb->ntomb] = strdup(base);
+    if (!mb->tomb[mb->ntomb]) return;
+    mb->ntomb++;
+}
+
+static void tomb_free(Mbox *mb) {
     size_t i;
+    if (!mb || !mb->tomb) return;
+    for (i = 0; i < mb->ntomb; i++) free(mb->tomb[i]);
+    free(mb->tomb);
+    mb->tomb = NULL;
+    mb->ntomb = mb->tomb_cap = 0;
+}
+
+/* Open-addressed set of nonzero uids (0 = empty slot), used to keep the uids
+   of a merged uidlist unique. */
+typedef struct UidSet {
+    uint32_t *slot;
+    size_t    cap;
+} UidSet;
+
+static void us_free(UidSet *s) {
+    free(s->slot);
+    s->slot = NULL;
+    s->cap = 0;
+}
+
+static int us_init(UidSet *s, size_t n) {
+    size_t cap = 16;
+    while (cap < n * 2) cap <<= 1;
+    s->slot = calloc(cap, sizeof *s->slot);
+    if (!s->slot) { s->cap = 0; return -1; }
+    s->cap = cap;
+    return 0;
+}
+
+/* Returns true when uid was absent (and is now present). */
+static bool us_add(UidSet *s, uint32_t uid) {
+    size_t i;
+    if (s->cap == 0 || uid == 0) return true;
+    i = (size_t)(uid * 2654435761u) & (s->cap - 1);
+    while (s->slot[i]) {
+        if (s->slot[i] == uid) return false;
+        i = (i + 1) & (s->cap - 1);
+    }
+    s->slot[i] = uid;
+    return true;
+}
+
+static int uident_copy(UidEnt *dst, const UidEnt *src) {
+    dst->base = strdup(src->base ? src->base : "");
+    if (!dst->base) return -1;
+    dst->mid = (src->mid && src->mid[0]) ? strdup(src->mid) : NULL;
+    dst->uid = src->uid;
+    dst->modseq = src->modseq;
+    return 0;
+}
+
+/* Read the on-disk sidecar and merge it with the caller's snapshot, keyed by
+   maildir base name.  Returns 0 with a freshly allocated row array in *out
+   (caller frees with uidlist_free) and the header values in uv_out/un_out.
+
+   The rules, and why each one is what it is:
+     - a base present on ONE side is kept (a row another daemon registered
+       after this snapshot was taken must not be lost);
+     - a base present on BOTH keeps one row: the one with the HIGHER modseq.
+       Disk rows are iterated first, so an EQUAL modseq keeps the DISK row and
+       the caller's copy is dropped — modseq is only a change counter, an equal
+       value means the two sides agree, and the row already on disk is the one
+       every other reader has seen;
+     - uidnext = max(disk, memory): it must NEVER rewind, or a later delivery
+       is handed a uid a surviving row already holds;
+     - a uid claimed by two different bases is re-minted from the merged
+       uidnext.  Two daemons that each allocated the same uid from their own
+       stale snapshot would otherwise leave one mailbox with two rows sharing a
+       uid, i.e. a client reading one message as another;
+     - uidvalidity: if the two disagree the sidecar is from another generation
+       (the mailbox was re-minted, e.g. after a crash truncated the sidecar and
+       the loader minted a fresh uidvalidity).  The larger uidvalidity wins and
+       the loser's rows are dropped — they belong to a namespace that no longer
+       exists, and keeping them would hand out uids from that dead namespace;
+     - rows this session deliberately deleted (mb->tomb) are dropped from both
+       sides.  Those tombstones are per SESSION, not per mailbox, so a base
+       expunged by one daemon CAN come back: a daemon that scanned before the
+       unlink still holds the row, and if it saves after the tombstoned save
+       its snapshot unions the row back in.  That is a known case, and bounded
+       — the resurrected row names no file, uidnext has already moved past its
+       uid so no uid is ever reused, and the next scan by any daemon prunes it
+       (the scan-time prune tombstones the base, so it heals for good).  Making
+       it impossible needs a durable mailbox-wide tombstone written by every
+       deleter: a second sidecar to repair a state that repairs itself. */
+static int uidlist_merge(const Mbox *mb, uint32_t uidvalidity, uint32_t uidnext,
+                         const UidEnt *v, size_t n,
+                         uint32_t *uv_out, uint32_t *un_out,
+                         UidEnt **out, size_t *n_out) {
+    UidEnt *dv, *mv = NULL;
+    size_t dn = 0, dn_load = 0, mn = 0, cap = 0, i;
+    uint32_t duv = 0, dun = 1, uv, un;
+    BaseHash idx, tomb;
+    UidSet us;
+    bool use_tomb = false, use_us = false;
+    int rc = -1;
+
+    *out = NULL;
+    *n_out = 0;
+    memset(&idx, 0, sizeof idx);
+    memset(&tomb, 0, sizeof tomb);
+    memset(&us, 0, sizeof us);
+
+    dv = uidlist_load(mb, &duv, &dun, &dn);
+    dn_load = dn;
+    if (dun == 0) dun = 1;
+    uv = uidvalidity ? uidvalidity : duv;
+    un = (uidnext > dun) ? uidnext : dun;   /* never rewind */
+    if (duv != 0 && uidvalidity != 0 && duv != uidvalidity) {
+        if (duv > uidvalidity) {
+            uv = duv;
+            n = 0;          /* disk generation wins: drop the memory rows */
+        } else {
+            uv = uidvalidity;
+            dn = 0;         /* memory generation wins: drop the disk rows */
+        }
+    }
+
+    if (mb && mb->ntomb > 0 && bh_init(&tomb, mb->ntomb) == 0) {
+        use_tomb = true;
+        for (i = 0; i < mb->ntomb; i++)
+            if (bh_put(&tomb, mb->tomb[i], (uint32_t)i) != 0) {
+                bh_free(&tomb);
+                use_tomb = false;
+                break;
+            }
+    }
+    if (bh_init(&idx, n + dn) != 0) goto out;
+    if (us_init(&us, n + dn + 8) != 0) goto out;
+    use_us = true;
+
+    for (i = 0; i < dn + n; i++) {
+        const UidEnt *src = (i < dn) ? &dv[i] : &v[i - dn];
+        uint32_t at;
+        if (!src->base || !src->base[0] || src->uid == 0) continue;
+        if (use_tomb && bh_get(&tomb, src->base, &at)) continue;
+        if (bh_get(&idx, src->base, &at)) {
+            if (src->modseq <= mv[at].modseq) continue;   /* tie: keep disk */
+            free(mv[at].base);
+            free(mv[at].mid);
+            mv[at].base = NULL;
+            mv[at].mid = NULL;
+            if (uident_copy(&mv[at], src) != 0) goto out;
+            continue;
+        }
+        if (mn == cap) {
+            size_t nc = cap ? cap * 2 : 16;
+            UidEnt *nv = realloc(mv, nc * sizeof *nv);
+            if (!nv) goto out;
+            mv = nv;
+            cap = nc;
+        }
+        if (uident_copy(&mv[mn], src) != 0) {
+            mv[mn].base = NULL;
+            mv[mn].mid = NULL;
+            goto out;
+        }
+        if (bh_put(&idx, mv[mn].base, (uint32_t)mn) != 0) {
+            free(mv[mn].base);
+            free(mv[mn].mid);
+            mv[mn].base = NULL;
+            mv[mn].mid = NULL;
+            goto out;
+        }
+        mn++;
+    }
+
+    /* uidnext must exceed every uid we are about to write, and no two rows may
+       share one. */
+    for (i = 0; i < mn; i++)
+        if (mv[i].uid >= un) un = mv[i].uid + 1;
+    for (i = 0; i < mn; i++) {
+        if (us_add(&us, mv[i].uid)) continue;
+        mv[i].uid = un++;
+        if (mv[i].uid == 0) mv[i].uid = un++;   /* UINT32_MAX rollover guard */
+        mv[i].modseq = un;                      /* mirror scan_subdir */
+        (void)us_add(&us, mv[i].uid);
+    }
+
+    *uv_out = uv;
+    *un_out = un;
+    *out = mv;
+    *n_out = mn;
+    mv = NULL;
+    rc = 0;
+out:
+    bh_free(&idx);
+    bh_free(&tomb);
+    if (use_us) us_free(&us);
+    if (mv) uidlist_free(mv, mn);
+    uidlist_free(dv, dn_load);
+    return rc;
+}
+
+/* Persist the uidlist sidecar: read-merge-write under an exclusive advisory
+   lock, published with a tmp+rename so no reader ever sees a partial file.
+
+   Two daemons share one maildir root (imapd for IMAP/POP3/ingest, jmapd for
+   JMAP) and each holds its own snapshot for as long as its view lives (imapd:
+   a whole SELECTed session; jmapd: one request), so writing the snapshot blind
+   loses the other daemon's registrations and can rewind uidnext.  The merge
+   lives here, not at the call sites, so every existing caller gets it.
+
+   `probe_base` (may be NULL) asks for the uid the FILE actually holds for that
+   base once the merge is done: it is the merged uid, which can differ from the
+   one the caller assigned (the merge re-mints a uid two bases claimed) and is
+   0 when no row survives (the caller's rows lost a generation race, or the
+   base was expunged).  Reporting it here rather than re-reading the sidecar
+   after the call keeps the answer inside the lock and costs no second
+   acquisition. */
+int imapd_uidlist_save(const Mbox *mb, uint32_t uidvalidity,
+                       uint32_t uidnext, const UidEnt *v, size_t n,
+                       const char *probe_base, uint32_t *probe_uid) {
+    char path[4200], lockpath[4300], tmp[4400];
+    const UidEnt *wv = v;
+    size_t wn = n, i;
+    uint32_t wuv = uidvalidity, wun = uidnext;
+    UidEnt *mv = NULL;
+    FILE *f = NULL;
+    int lockfd = -1;
+    int rc = -1;
+
+    if (probe_uid) *probe_uid = 0;
     if (uidlist_path(mb, path, sizeof path) != 0) return -1;
-    f = fopen(path, "wb");
-    if (!f) return -1;
-    if (fprintf(f, "%u %u\n", uidvalidity, uidnext) < 0) goto fail;
-    for (i = 0; i < n; i++) {
-        if (v[i].mid && v[i].mid[0]) {
-            if (fprintf(f, "%u %s %llu %s\n", v[i].uid, v[i].base,
-                        (unsigned long long)v[i].modseq, v[i].mid) < 0)
+    if (snprintf(lockpath, sizeof lockpath, "%s.lock", path)
+            >= (int)sizeof lockpath)
+        return -1;
+    /* pid + thread id: two threads of ONE daemon (jmapd's submit worker saves
+       concurrently with its request threads) must not share a temp path.  The
+       lock serialises them, but the lockless fallback below does not — a
+       shared name there lets one writer rename the other's half-written file
+       into place.  imap_check mirrors this scheme to block the write. */
+    if (snprintf(tmp, sizeof tmp, "%s.tmp.%ld.%lx", path, (long)getpid(),
+                 (unsigned long)pthread_self())
+            >= (int)sizeof tmp)
+        return -1;
+
+    /* The lock is advisory and held across read+merge+write.  A daemon that
+       cannot take it (read-only directory, a filesystem without flock) still
+       writes its snapshot atomically rather than nothing: a lost update is
+       repaired by the next scan, a missing sidecar is not. */
+    lockfd = open(lockpath, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lockfd < 0 || flock(lockfd, LOCK_EX) != 0) {
+        fprintf(stderr, "imapd uidlist: lock %s failed (%s): "
+                        "writing without a merge\n", lockpath, strerror(errno));
+        if (lockfd >= 0) { (void)close(lockfd); lockfd = -1; }
+    }
+    if (lockfd >= 0 &&
+        uidlist_merge(mb, uidvalidity, uidnext, v, n,
+                      &wuv, &wun, &mv, &wn) == 0) {
+        wv = mv;
+    } else {
+        wn = n;   /* lockless fallback (or OOM in the merge) */
+    }
+
+    f = fopen(tmp, "wb");
+    if (!f) goto out;
+    if (fprintf(f, "%u %u\n", wuv, wun) < 0) goto fail;
+    for (i = 0; i < wn; i++) {
+        if (wv[i].mid && wv[i].mid[0]) {
+            if (fprintf(f, "%u %s %llu %s\n", wv[i].uid, wv[i].base,
+                        (unsigned long long)wv[i].modseq, wv[i].mid) < 0)
                 goto fail;
         } else {
-            if (fprintf(f, "%u %s %llu\n", v[i].uid, v[i].base,
-                        (unsigned long long)v[i].modseq) < 0)
+            if (fprintf(f, "%u %s %llu\n", wv[i].uid, wv[i].base,
+                        (unsigned long long)wv[i].modseq) < 0)
                 goto fail;
         }
     }
-    if (fclose(f) != 0) return -1;
-    return 0;
+    /* fsync before the rename: the rename must never publish a short file. */
+    if (fflush(f) != 0 || fsync(fileno(f)) != 0) goto fail;
+    if (fclose(f) != 0) { f = NULL; (void)unlink(tmp); goto out; }
+    f = NULL;
+    if (rename(tmp, path) != 0) { (void)unlink(tmp); goto out; }
+    rc = 0;
+    /* the file now holds exactly wv/wn: report the uid that survived for the
+       base the caller cares about (0 when the merge dropped the row) */
+    if (probe_base && probe_uid)
+        for (i = 0; i < wn; i++)
+            if (wv[i].base && strcmp(wv[i].base, probe_base) == 0) {
+                *probe_uid = wv[i].uid;
+                break;
+            }
+out:
+    if (lockfd >= 0) { (void)flock(lockfd, LOCK_UN); (void)close(lockfd); }
+    if (mv) uidlist_free(mv, wn);
+    return rc;
 fail:
-    (void)fclose(f);
-    return -1;
+    (void)fclose(f);          /* the old sidecar stays: no partial file */
+    (void)unlink(tmp);
+    goto out;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1235,12 +1527,13 @@ void imapd_mbox_close(Mbox *mb) {
     mb->nmsgs = mb->cap = 0;
     /* Flush any STORE/EXPUNGE-driven uidlist changes made this session. */
     if (mb->uidlist_dirty && mb->uidmap)
-        (void)uidlist_save(mb, mb->uidvalidity, mb->uidnext,
-                           mb->uidmap, mb->nuidmap);
+        (void)imapd_uidlist_save(mb, mb->uidvalidity, mb->uidnext,
+                               mb->uidmap, mb->nuidmap, NULL, NULL);
     uidlist_free(mb->uidmap, mb->nuidmap);
     mb->uidmap = NULL;
     mb->nuidmap = mb->uidmap_cap = 0;
     mb->uidlist_dirty = false;
+    tomb_free(mb);
 }
 
 /* Append one scanned file to the view (takes ownership of base/path; dups
@@ -1507,6 +1800,9 @@ static int mbox_scan(Mbox *mb, const ImapdConfig *cfg, const char *user,
                     sv == map[i].uid) {
                     i++;
                 } else {
+                    /* the file is gone: drop the row, and remember it so the
+                       merge cannot bring it back from the file we just read */
+                    tomb_add(mb, map[i].base);
                     free(map[i].base);
                     free(map[i].mid);
                     map[i] = map[nmap - 1];
@@ -1547,7 +1843,8 @@ static int mbox_scan(Mbox *mb, const ImapdConfig *cfg, const char *user,
         mb->uidmap_cap = map_cap;
         map_owned = false;   /* ownership transferred to the Mbox */
         if (changed) {
-            if (uidlist_save(mb, uidvalidity, uidnext, map, nmap) != 0)
+            if (imapd_uidlist_save(mb, uidvalidity, uidnext, map, nmap,
+                                   NULL, NULL) != 0)
                 goto out;
         }
     }
@@ -1656,6 +1953,7 @@ static void uidmap_remove(Mbox *mb, uint32_t uid) {
     size_t i;
     for (i = 0; i < mb->nuidmap; i++) {
         if (mb->uidmap[i].uid != uid) continue;
+        tomb_add(mb, mb->uidmap[i].base);   /* the merge must not restore it */
         free(mb->uidmap[i].base);
         free(mb->uidmap[i].mid);
         mb->uidmap[i] = mb->uidmap[mb->nuidmap - 1];
@@ -1695,7 +1993,7 @@ static int mbox_register(const ImapdConfig *cfg, const char *user,
                          const char *mid,
                          uint32_t *uv_out, uint32_t *uid_out) {
     Mbox d;
-    uint32_t uidvalidity, uidnext, uid;
+    uint32_t uidvalidity, uidnext, uid, saved = 0;
     uint64_t modseq;
     size_t n, i;
     UidEnt *v;
@@ -1730,14 +2028,20 @@ static int mbox_register(const ImapdConfig *cfg, const char *user,
     v[n].uid = uid;
     v[n].modseq = modseq;
     n++;
-    if (uidlist_save(&d, uidvalidity, uidnext, v, n) != 0) {
+    if (imapd_uidlist_save(&d, uidvalidity, uidnext, v, n, base,
+                           &saved) != 0) {
         free(v[n - 1].base);
         free(v[n - 1].mid);
         uidlist_free(v, n - 1);
         return -1;
     }
     if (uv_out) *uv_out = uidvalidity;
-    if (uid_out) *uid_out = uid;
+    /* The uid to report is the one the SAVED file holds, not the one assigned
+       above: the locked merge can re-mint this row (another daemon claimed the
+       same uid for a different base) or drop it outright (the disk is from a
+       newer uidvalidity generation).  Reporting the local uid there would hand
+       the client an APPENDUID/COPYUID for a row the sidecar does not have. */
+    if (uid_out) *uid_out = saved;
     uidlist_free(v, n);
     return 0;
 }
