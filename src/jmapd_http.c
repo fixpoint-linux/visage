@@ -368,6 +368,13 @@ static void dispatch_download(JmapdServer *srv, JmapdConn *c,
         drop_status(&c->c, 401);
         return;
     }
+    /* A byte must never be served without the principal THIS request proved:
+       reaching here with no user is a router bug, not a client error. */
+    if (!c->c.user) {
+        jmapd_log(c, "no-request-user", NULL, "route=download");
+        drop_status(&c->c, 500);
+        return;
+    }
     st = download_segments(req, acct, sizeof acct, blob, sizeof blob, name,
                            sizeof name);
     if (st != 0) { drop_status(&c->c, st); return; }

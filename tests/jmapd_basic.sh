@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # jmapd_basic.sh — live HTTP tests for jmapd (M1: session document, Mailbox/get,
-# Identity/get, auth, lockout, keep-alive, the request caps).
+# Identity/get, auth, lockout, keep-alive, the request caps, and that
+# authentication is per REQUEST rather than per connection).
 #
 # REQUIRES live sockets; run on the host via `dhake e2e` or directly.  Three
 # throwaway daemons against one throwaway maildir root:
@@ -293,6 +294,132 @@ head = b""
 while b"\r\n" not in head:
     head += s.recv(4096)
 assert head.startswith(b"HTTP/1.1 400"), head[:64]
+s.close()
+PYEOF
+
+# ---- (5b) authentication is PER REQUEST, not per connection ----
+# A keep-alive connection is not a principal: behind the TLS-terminating proxy
+# (deploy/Caddyfile.jmap) Caddy pools upstream connections, so the next
+# request on a reused connection can come from a different, unauthenticated
+# client.  Each block below authenticates once on a connection and then sends
+# a request with NO credentials on the SAME connection; it must be 401.  A
+# connection-cached principal answers 200 with the session document (measured
+# on the deployed daemon before this fix).
+python3 - "$PORT_A" <<'PYEOF' && pass "auth is per request, not per connection (session, POST /api, download)" \
+                           || fail "auth is per request, not per connection (session, POST /api, download)"
+import base64, json, socket, sys
+
+port = int(sys.argv[1])
+auth = "Basic " + base64.b64encode(b"alice:waldorf").decode()
+API = '{"using":["urn:ietf:params:jmap:core"],"methodCalls":[]}'
+
+
+def connect():
+    return socket.create_connection(("127.0.0.1", port), timeout=10)
+
+
+def send(s, method, path, authorization=None, body=None):
+    head = f"{method} {path} HTTP/1.1\r\nHost: x\r\n"
+    if authorization:
+        head += f"Authorization: {authorization}\r\n"
+    if body is not None:
+        head += ("Content-Type: application/json\r\n"
+                 f"Content-Length: {len(body)}\r\n")
+    head += "\r\n"
+    s.sendall(head.encode() + (body.encode() if body else b""))
+
+
+def response(s):
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = s.recv(4096)
+        assert chunk, "server closed before the response head"
+        buf += chunk
+    head, rest = buf.split(b"\r\n\r\n", 1)
+    lines = head.split(b"\r\n")
+    status = int(lines[0].split()[1])
+    clen = 0
+    for line in lines[1:]:
+        if line.lower().startswith(b"content-length:"):
+            clen = int(line.split(b":", 1)[1])
+    while len(rest) < clen:
+        chunk = s.recv(4096)
+        assert chunk, "server closed mid-body"
+        rest += chunk
+    return status, [l.lower() for l in lines[1:]], rest[:clen]
+
+
+# (a) GET session: authenticated, then the SAME connection with no credential.
+s = connect()
+send(s, "GET", "/.well-known/jmap", auth)
+st, _, body = response(s)
+assert st == 200 and b"apiUrl" in body, (st, body[:80])
+send(s, "GET", "/.well-known/jmap")
+st, hdr, body = response(s)
+assert st == 401, ("no-credential session GET on an authenticated connection",
+                   st, body[:120])
+assert b"apiUrl" not in body, body[:200]      # not one byte of the document
+assert any(l.startswith(b"connection: close") for l in hdr), hdr
+# a 401 closes the connection, so the next request cannot inherit anything
+assert s.recv(4096) == b"", "expected the connection to close after a 401"
+s.close()
+
+# (b) POST /api: authenticated, then no credential on the same connection.
+s = connect()
+send(s, "POST", "/api", auth, API)
+st, _, body = response(s)
+assert st == 200 and b"methodResponses" in body, (st, body[:120])
+send(s, "POST", "/api", None, API)
+st, _, body = response(s)
+assert st == 401, ("no-credential POST /api on an authenticated connection",
+                   st, body[:120])
+assert b"methodResponses" not in body, body[:200]
+s.close()
+
+# (c) the download route: this is where a borrowed principal is most direct
+#     (bytes of a message part), so the assertion is about the bytes, not just
+#     a status.  A real blob id is fetched first; the authenticated download
+#     keeps the connection alive, and the SAME connection then asks for the
+#     same blob with no credential.
+s = connect()
+send(s, "POST", "/api", auth, json.dumps({
+    "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+    "methodCalls": [
+        ["Email/query", {"accountId": "alice"}, "q"],
+        ["Email/get", {"accountId": "alice",
+                       "#ids": {"resultOf": "q", "name": "Email/query",
+                                "path": "/ids"},
+                       "properties": ["id", "textBody"]}, "g"],
+    ]}))
+st, _, body = response(s)
+assert st == 200, (st, body[:120])
+blob = json.loads(body)["methodResponses"][1][1]["list"][0]["textBody"][0]["blobId"]
+s.close()
+assert blob.startswith("g"), blob
+
+s = connect()
+send(s, "GET", f"/download/alice/{blob}/body.txt", auth)
+st, _, first = response(s)
+assert st == 200 and first, (st, first[:80])
+send(s, "GET", f"/download/alice/{blob}/body.txt")
+st, _, body = response(s)
+assert st == 401, ("no-credential download on an authenticated connection",
+                   st, body[:120])
+assert body != first, "the message part's bytes must not be served"
+s.close()
+
+# (d) the fix must not degrade into one-shot credentials: an authenticated
+#     connection keeps serving, and a fresh connection still refuses.
+s = connect()
+for _ in range(3):
+    send(s, "GET", "/.well-known/jmap", auth)
+    st, _, body = response(s)
+    assert st == 200 and b"apiUrl" in body, (st,)
+s.close()
+s = connect()
+send(s, "GET", "/.well-known/jmap")
+st, _, _ = response(s)
+assert st == 401, ("no credential on a fresh connection", st)
 s.close()
 PYEOF
 

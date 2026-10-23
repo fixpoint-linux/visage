@@ -188,7 +188,9 @@ int jmapd_http_respond_head(Conn *c, int status, const char *ctype,
 typedef struct JmapdBlob JmapdBlob;   /* opaque: src/jmap_mail.c (download) */
 
 typedef struct JmapdConn {
-    Conn     c;
+    Conn     c;              /* c.user is the user THIS request proved, not a
+                                session: it is freed and re-resolved by
+                                jmapd_core_auth on every request */
     JmapdBlob *blob;        /* active streamed download (NULL when idle) */
     size_t   hdr_scanned;   /* bytes already scanned for the header end */
     size_t   header_end;    /* 0 until the header block is complete */
@@ -383,10 +385,13 @@ void jmapd_jb_method_error(JsonBuilder *b, const char *type);
    must go away. */
 void jmapd_http_readable(JmapdServer *srv, JmapdConn *c, time_t now);
 
-/* jmap_core.c: authenticate the connection for this request (Basic/Bearer +
-   per-IP lockout).  Returns 0 with c->c.user set, or -1 (the caller answers
-   401).  Exported because the download route lives in jmapd_http.c and must
-   not serve a byte before the credential is checked. */
+/* jmap_core.c: authenticate THIS request (Basic/Bearer + per-IP lockout).
+   Returns 0 with c->c.user set to the user this request's own header proved,
+   or -1 (the caller answers 401).  c->c.user is per REQUEST, never per
+   connection: HTTP has no session, and a pooled upstream connection (Caddy)
+   can carry a different client's next request.  Exported because the download
+   route lives in jmapd_http.c and must not serve a byte before the credential
+   is checked. */
 int jmapd_core_auth(JmapdServer *srv, JmapdConn *c, const JmapdHttpReq *req);
 
 /* jmap_core.c: route one request.  On success returns 0 and sets *status (200)

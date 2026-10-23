@@ -13,7 +13,8 @@
  *       primaryAccounts, capabilities — and the --public-url override
  *       (advertised verbatim, path prefix preserved, every refusal named);
  *   (4) auth verdicts: Basic/Bearer parsing, the passwd table, the per-IP
- *       lockout;
+ *       lockout — and that authentication is PER REQUEST, never cached on the
+ *       connection (a pooled upstream connection is not a principal);
  *   (5) the HTTP/1.1 request parse: method/path/keep-alive, Content-Length
  *       required for POST, chunked refused, the caps (413/431).
  *
@@ -651,6 +652,99 @@ static void auth_tests(void) {
             unlink(path);
             rmdir(root);
         }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* (4b) authentication is per REQUEST, not per connection              */
+/* ------------------------------------------------------------------ */
+
+/* jmapd_core_auth is callable without a socket: it reads srv->auth and the
+   request's Authorization header, and writes c->c.user.  That is enough to
+   pin the property a keep-alive probe measured live — a request carrying no
+   credential must be refused even when an EARLIER request on the same
+   connection authenticated, because behind Caddy a pooled upstream
+   connection can be reused by a different client. */
+static void per_request_auth_tests(void) {
+    static const char basic[] = "Basic YWxpY2U6d2FsZG9yZg==";   /* alice:waldorf */
+    static const char wrong[] = "Basic YWxpY2U6d3Jvbmc=";      /* alice:wrong */
+    char tpl[] = "/tmp/visage_jmapd_req_XXXXXX";
+    char *root = mkdtemp(tpl);
+    JmapdServer srv;
+    JmapdConn c;
+    JmapdHttpReq req;
+    ImapdConfig icfg;
+
+    if (!root) {
+        check_fail("auth per request: mkdtemp scratch root", "mkdtemp failed");
+        return;
+    }
+    {
+        char path[4096];
+        FILE *f;
+        snprintf(path, sizeof path, "%s/%s", root, IMAPD_PASSWD_FILE);
+        f = fopen(path, "w");
+        if (f) {
+            fprintf(f, "alice:waldorf\n");
+            fclose(f);
+        }
+        memset(&icfg, 0, sizeof icfg);
+        icfg.root = root;
+        memset(&srv, 0, sizeof srv);
+        srv.icfg = icfg;
+        if (imapd_auth_load(&icfg, &srv.auth) != 0 || srv.auth.ncreds != 1) {
+            check_fail("auth per request: passwd table loads", NULL);
+            unlink(path);
+            rmdir(root);
+            return;
+        }
+
+        memset(&c, 0, sizeof c);
+        c.c.id = 1;
+        c.c.peer_ip[0] = 127;
+        c.c.peer_ip[3] = 1;
+        c.c.peer_ip_len = 4;
+
+        /* (a) a stale user left on the connection by an earlier request must
+           not authenticate a request that carries no header. */
+        c.c.user = strdup("alice");
+        memset(&req, 0, sizeof req);
+        EXPECT(jmapd_core_auth(&srv, &c, &req) == -1 && c.c.user == NULL,
+               "auth per request: no header on an already-authenticated "
+               "connection is refused, user cleared");
+
+        /* (b) the same connection, now with the header: served. */
+        memset(&req, 0, sizeof req);
+        memcpy(req.auth, basic, sizeof basic - 1);
+        req.auth_len = sizeof basic - 1;
+        EXPECT(jmapd_core_auth(&srv, &c, &req) == 0 && c.c.user &&
+                   strcmp(c.c.user, "alice") == 0,
+               "auth per request: the request's own header authenticates");
+
+        /* (c) the credential does NOT survive to the next request: this is
+           the connection-cached principal the live probe measured. */
+        memset(&req, 0, sizeof req);
+        EXPECT(jmapd_core_auth(&srv, &c, &req) == -1 && c.c.user == NULL,
+               "auth per request: the credential does not carry to the next "
+               "request on the connection");
+
+        /* (d) a failed check leaves no user for a handler to read. */
+        memset(&req, 0, sizeof req);
+        memcpy(req.auth, wrong, sizeof wrong - 1);
+        req.auth_len = sizeof wrong - 1;
+        EXPECT(jmapd_core_auth(&srv, &c, &req) == -1 && c.c.user == NULL,
+               "auth per request: a bad credential leaves no user");
+
+        free(c.c.user);
+        free(srv.auth.creds ? srv.auth.creds[0].user : NULL);
+        free(srv.auth.creds ? srv.auth.creds[0].pass : NULL);
+        free(srv.auth.creds);
+    }
+    {
+        char path[4096];
+        snprintf(path, sizeof path, "%s/%s", root, IMAPD_PASSWD_FILE);
+        unlink(path);
+        rmdir(root);
     }
 }
 
@@ -2774,6 +2868,7 @@ int main(void) {
     session_tests();
     public_url_tests();
     auth_tests();
+    per_request_auth_tests();
     http_tests();
     state_tests();
     cte_tests();

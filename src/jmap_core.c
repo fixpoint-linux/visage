@@ -419,15 +419,26 @@ static int auth_resolve(JmapdServer *srv, const JmapdHttpReq *req,
     return -1;
 }
 
-/* Authenticate the connection.  Returns 0 and leaves c->c.user set on
-   success; on failure logs the attempt, charges the per-IP lockout and
-   returns -1 (the caller answers 401).  Exported because the download route
-   is dispatched from jmapd_http.c and must not serve a byte before this. */
+/* Authenticate THIS request.  Returns 0 and leaves c->c.user set to the user
+   this request's own Authorization header proved; on failure logs the
+   attempt, charges the per-IP lockout and returns -1 (the caller answers
+   401).  Exported because the download route is dispatched from
+   jmapd_http.c and must not serve a byte before this.
+
+   HTTP has no session, so a connection is NOT a principal.  Behind a
+   TLS-terminating proxy (Caddy pools its upstream connections) the next
+   request on a reused connection can come from a different, unauthenticated
+   client: caching the first credential here served the session document to a
+   request that carried none (measured, keep-alive probe).  c->c.user is
+   therefore cleared at the top of every check and set only when this
+   request's header verifies, so a failed check always leaves it NULL and no
+   handler can read the previous request's user. */
 int jmapd_core_auth(JmapdServer *srv, JmapdConn *c, const JmapdHttpReq *req) {
     char user[IMAPD_MAX_USER + 1];
     time_t now = time(NULL);
 
-    if (c->c.user) return 0;              /* already authenticated */
+    free(c->c.user);
+    c->c.user = NULL;
     if (imapd_auth_blocked(&srv->auth, c->c.peer_ip, c->c.peer_ip_len, now)) {
         jmapd_log(c, "auth-blocked", NULL, "reason=lockout");
         return -1;
@@ -843,6 +854,14 @@ int jmapd_core_handle(JmapdServer *srv, JmapdConn *c, const JmapdHttpReq *req,
     if (jmapd_core_auth(srv, c, req) != 0) {
         *status = 401;
         return request_error("unauthorized", out, outlen) == 0 ? 0 : -1;
+    }
+    /* Defence in depth: a handler reached without the principal THIS request
+       proved is a router bug, not a client error — say so and refuse rather
+       than render mail for whatever user is left over. */
+    if (!c->c.user) {
+        jmapd_log(c, "no-request-user", NULL, "route=core");
+        *status = 500;
+        return request_error("serverFail", out, outlen) == 0 ? 0 : -1;
     }
 
     /* GET /.well-known/jmap (and /jmap/session): the session resource. */
