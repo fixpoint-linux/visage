@@ -405,6 +405,7 @@ static void config_defaults(JmapdConfig *cfg) {
     cfg->cert = env_or("JMAPD_CERT", NULL);
     cfg->key = env_or("JMAPD_KEY", NULL);
     cfg->hostname = env_or("JMAPD_HOSTNAME", JMAPD_DEFAULT_HOSTNAME);
+    cfg->public_url = env_or("JMAPD_PUBLIC_URL", "");
     cfg->max_req = (uint32_t)env_num("JMAPD_MAX_REQ", JMAPD_DEFAULT_MAX_REQ);
     cfg->outbox_host = env_or("JMAPD_OUTBOX_HOST", JMAPD_DEFAULT_OUTBOX_HOST);
     cfg->outbox_port = (uint16_t)env_num("JMAPD_OUTBOX_PORT",
@@ -442,6 +443,7 @@ static int config_from_args(JmapdConfig *cfg, int argc, char **argv) {
     if ((v = find_arg(argc, argv, "--cert"))) cfg->cert = v;
     if ((v = find_arg(argc, argv, "--key"))) cfg->key = v;
     if ((v = find_arg(argc, argv, "--hostname"))) cfg->hostname = v;
+    if ((v = find_arg(argc, argv, "--public-url"))) cfg->public_url = v;
     if ((v = find_arg(argc, argv, "--outbox-host"))) cfg->outbox_host = v;
     if ((v = find_arg(argc, argv, "--outbox-user"))) cfg->outbox_user = v;
     if ((v = find_arg(argc, argv, "--outbox-pass"))) cfg->outbox_pass = v;
@@ -485,6 +487,11 @@ static void usage(FILE *f) {
         "  --addr ADDR          bind address (JMAPD_ADDR, default 127.0.0.1)\n"
         "  --port N             bind port (JMAPD_PORT, default %u)\n"
         "  --hostname H         host used in advertised URLs (JMAPD_HOSTNAME)\n"
+        "  --public-url URL     base URL advertised verbatim in the session\n"
+        "                       document, e.g. https://jmap.example.ch when a\n"
+        "                       TLS-terminating proxy sits in front\n"
+        "                       (JMAPD_PUBLIC_URL; empty = derive from\n"
+        "                       --cert/--hostname/--port)\n"
         "  --cert PATH          TLS certificate PEM (JMAPD_CERT): enables\n"
         "                       HTTPS from the first byte\n"
         "  --key PATH           TLS private key PEM (JMAPD_KEY)\n"
@@ -552,6 +559,20 @@ int main(int argc, char **argv) {
                 "--key: JMAP carries the password in an Authorization header\n",
                 cfg.addr);
         return 1;
+    }
+
+    /* The advertised base URL override.  The session document is what a client
+       follows, so an override that cannot be advertised is a startup refusal
+       rather than a document with a wrong (or half-joined) URL in it. */
+    if (cfg.public_url && cfg.public_url[0]) {
+        char norm[JMAPD_PUBLIC_URL_MAX];
+        int why = jmapd_public_url_check(cfg.public_url, cfg.addr, norm,
+                                         sizeof norm);
+        if (why != JMAPD_PUB_OK) {
+            fprintf(stderr, "jmapd: refusing --public-url '%s': %s\n",
+                    cfg.public_url, jmapd_public_url_reason(why));
+            return why == JMAPD_PUB_ERR_PLAINTEXT ? 1 : 2;
+        }
     }
 
     /* The submission relay's TLS mode.  "none" exists for the tests (a

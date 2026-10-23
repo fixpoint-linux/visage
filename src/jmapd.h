@@ -74,6 +74,10 @@
 /* Email/set bounds: a create's built message may not exceed the server's
    max message size, and one call may not touch more objects than a get. */
 #define JMAPD_MAX_SET             JMAPD_MAX_OBJECTS
+/* Cap on the advertised base URL (--public-url).  The session document joins
+   a suffix of at most ~52 bytes onto it, so this stays well inside the 512-byte
+   base buffer jmapd_session_render uses. */
+#define JMAPD_PUBLIC_URL_MAX      384
 #define JMAPD_DEFAULT_TMO         300      /* idle timeout, seconds */
 #define JMAPD_DEFAULT_PORT        8081     /* next to visage's admin :8080 */
 #define JMAPD_DEFAULT_HOSTNAME    "localhost"
@@ -113,6 +117,8 @@ typedef struct JmapdConfig {
     const char *cert;         /* TLS certificate PEM (JMAPD_CERT)     */
     const char *key;          /* TLS private key PEM (JMAPD_KEY)      */
     const char *hostname;     /* name used in advertised URLs         */
+    const char *public_url;   /* advertised base URL override
+                                 (JMAPD_PUBLIC_URL, "" = derive)      */
     uint32_t    max_req;      /* request cap in bytes (JMAPD_MAX_REQ) */
     const char *outbox_host;  /* submission relay (JMAPD_OUTBOX_HOST) */
     uint16_t    outbox_port;
@@ -233,10 +239,44 @@ int jmapd_id_email_parse(const char *id, char *base, size_t basesz,
 
 /* ---- session document -------------------------------------------- */
 
+/* Verdicts from the --public-url validators.  Everything but OK is a startup
+   refusal: the session document is what a client follows, so a base URL that
+   cannot be advertised must never be half-advertised. */
+enum {
+    JMAPD_PUB_OK = 0,
+    JMAPD_PUB_ERR_SCHEME,     /* not http:// or https://              */
+    JMAPD_PUB_ERR_HOST,       /* no host between the scheme and path  */
+    JMAPD_PUB_ERR_USERINFO,   /* user[:pass]@host                     */
+    JMAPD_PUB_ERR_QUERY,      /* '?' or '#'                           */
+    JMAPD_PUB_ERR_CHAR,       /* not printable ASCII, or a space      */
+    JMAPD_PUB_ERR_LONG,       /* does not fit JMAPD_PUBLIC_URL_MAX    */
+    JMAPD_PUB_ERR_PLAINTEXT   /* http:// on a non-loopback bind       */
+};
+
+/* Normalize an advertised base URL: syntax only.  Accepts an optional path
+   suffix (preserved, e.g. "https://host/jmap"), strips trailing '/', and
+   writes the result to *out.  An empty/NULL url is not an error — it means
+   "no override" and yields "".  Returns JMAPD_PUB_OK or a refusal reason. */
+int jmapd_public_url_normalize(const char *url, char *out, size_t outsz);
+
+/* Normalize AND apply the deployment policy for this listener: a plaintext
+   http:// base URL is allowed only when the bind address is loopback, the same
+   rule the plaintext listener itself is held to (the client would otherwise be
+   told to send the password in clear across a network).  `bind_addr` is the
+   configured --addr. */
+int jmapd_public_url_check(const char *url, const char *bind_addr, char *out,
+                           size_t outsz);
+
+/* Human-readable reason for a validator verdict (never NULL). */
+const char *jmapd_public_url_reason(int why);
+
 /* Render the JMAP session resource (RFC 8620 2) for `account_id`.  Every
-   advertised URL is absolute and uses the scheme the listener actually
-   speaks: https when TLS is configured, http otherwise.  Heap-allocates *out
-   (NUL-terminated); *outlen excludes the NUL.  Returns 0, or -1 on OOM. */
+   advertised URL is absolute and shares one base: the --public-url override
+   verbatim when set (behind a TLS-terminating reverse proxy the listener's own
+   scheme/port are the wrong thing to advertise), else the scheme the listener
+   actually speaks — https when TLS is configured, http otherwise — plus
+   --hostname and --port.  Heap-allocates *out (NUL-terminated); *outlen
+   excludes the NUL.  Returns 0, or -1 on OOM or an unadvertisable override. */
 int jmapd_session_render(const JmapdConfig *cfg, const char *account_id,
                          char **out, size_t *outlen);
 

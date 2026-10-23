@@ -145,14 +145,91 @@ int jmapd_auth_parse(const char *v, size_t vlen, int *scheme, char *user,
 /* scheme://host:port for this listener.  The scheme is the one the socket
    actually speaks — https when TLS is configured, http on the plaintext
    loopback dev bind.  A client that trusts this document must never be told a
-   scheme the listener does not serve. */
+   scheme the listener does not serve.
+   With --public-url the override wins: behind a TLS-terminating proxy the
+   listener speaks http on a loopback port that no client can reach, so the
+   derived form is exactly the wrong thing to advertise. */
 static int base_url(const JmapdConfig *cfg, char *out, size_t outsz) {
-    int n = snprintf(out, outsz, "%s://%s:%u", cfg->cert ? "https" : "http",
-                     (cfg->hostname && cfg->hostname[0]) ? cfg->hostname
-                                                         : "localhost",
-                     (unsigned)cfg->port);
+    int n;
+    if (cfg->public_url && cfg->public_url[0])
+        return jmapd_public_url_normalize(cfg->public_url, out, outsz) ==
+                       JMAPD_PUB_OK
+                   ? 0
+                   : -1;
+    n = snprintf(out, outsz, "%s://%s:%u", cfg->cert ? "https" : "http",
+                 (cfg->hostname && cfg->hostname[0]) ? cfg->hostname
+                                                     : "localhost",
+                 (unsigned)cfg->port);
     if (n < 0 || (size_t)n >= outsz) return -1;
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Advertised base URL override (--public-url)                         */
+/* ------------------------------------------------------------------ */
+
+const char *jmapd_public_url_reason(int why) {
+    switch (why) {
+    case JMAPD_PUB_OK:            return "ok";
+    case JMAPD_PUB_ERR_SCHEME:    return "the scheme must be http:// or https://";
+    case JMAPD_PUB_ERR_HOST:      return "no host between the scheme and the path";
+    case JMAPD_PUB_ERR_USERINFO:  return "userinfo (user@host) is not allowed";
+    case JMAPD_PUB_ERR_QUERY:     return "a query string or fragment is not allowed";
+    case JMAPD_PUB_ERR_CHAR:      return "only printable ASCII without spaces is allowed";
+    case JMAPD_PUB_ERR_LONG:      return "the value is too long";
+    case JMAPD_PUB_ERR_PLAINTEXT:
+        return "plaintext http is allowed only when the bind address is "
+               "loopback (the password would cross the network in clear)";
+    }
+    return "invalid";
+}
+
+int jmapd_public_url_normalize(const char *url, char *out, size_t outsz) {
+    size_t n, i, auth, host_end;
+
+    if (!out || outsz == 0) return JMAPD_PUB_ERR_LONG;
+    out[0] = '\0';
+    if (!url || !url[0]) return JMAPD_PUB_OK;   /* no override: derive */
+
+    n = strlen(url);
+    if (n > JMAPD_PUBLIC_URL_MAX || n + 1 > outsz) return JMAPD_PUB_ERR_LONG;
+
+    if (n >= 8 && http_ci_eq(url, "https://", 8))      auth = 8;
+    else if (n >= 7 && http_ci_eq(url, "http://", 7))  auth = 7;
+    else return JMAPD_PUB_ERR_SCHEME;
+
+    /* The authority runs to the first '/'; a '?' or '#' before it is not a
+       path either, and the whole-string scan below rejects both anywhere. */
+    host_end = auth;
+    while (host_end < n && url[host_end] != '/') host_end++;
+    if (host_end == auth) return JMAPD_PUB_ERR_HOST;
+    for (i = auth; i < host_end; i++)
+        if (url[i] == ':') break;
+    if (i == auth) return JMAPD_PUB_ERR_HOST;   /* ":8080" with no host */
+
+    for (i = auth; i < n; i++) {
+        unsigned char ch = (unsigned char)url[i];
+        if (ch < 0x21 || ch > 0x7e) return JMAPD_PUB_ERR_CHAR;
+        if (ch == '?' || ch == '#') return JMAPD_PUB_ERR_QUERY;
+        if (ch == '@' && i < host_end) return JMAPD_PUB_ERR_USERINFO;
+    }
+
+    /* Trailing '/' is stripped so the joined suffixes ("/api", "/download/...")
+       cannot produce a doubled slash.  It cannot eat the scheme: n > auth. */
+    while (n > auth && url[n - 1] == '/') n--;
+    memcpy(out, url, n);
+    out[n] = '\0';
+    return JMAPD_PUB_OK;
+}
+
+int jmapd_public_url_check(const char *url, const char *bind_addr, char *out,
+                           size_t outsz) {
+    int why = jmapd_public_url_normalize(url, out, outsz);
+    if (why != JMAPD_PUB_OK) return why;
+    if (out[0] && http_ci_eq(out, "http://", 7) &&
+        !jmapd_addr_loopback(bind_addr))
+        return JMAPD_PUB_ERR_PLAINTEXT;
+    return JMAPD_PUB_OK;
 }
 
 static int jmapd_url_join(const char *base, const char *suffix, char *out,

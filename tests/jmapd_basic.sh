@@ -9,6 +9,9 @@
 #   B  lockout instance   a separate per-IP failure table, so the lockout test
 #                         cannot poison A's connections
 #   C  small-cap instance --max-request 4096, for the 413
+#   E  proxy-fronted instance --public-url https://jmap.example.test, for the
+#      advertised-base override (the Caddy arrangement: plaintext listener,
+#      https URLs in the session document)
 #
 # The passwd file is written directly (same format `imapd passwd` writes) so
 # this script depends only on jmapd.com, not on imapd.com.
@@ -23,6 +26,7 @@ PORT_A="$PORT_BASE"
 PORT_B=$((PORT_BASE + 1))
 PORT_C=$((PORT_BASE + 2))
 PORT_D=$((PORT_BASE + 3))
+PORT_E=$((PORT_BASE + 4))
 CERT=tests/visage-test-cert.pem
 KEY=tests/visage-test-key.pem
 
@@ -80,11 +84,13 @@ start_daemon "$TMP/a.log" --port "$PORT_A"
 start_daemon "$TMP/b.log" --port "$PORT_B"
 start_daemon "$TMP/c.log" --port "$PORT_C" --max-request 4096
 start_daemon "$TMP/d.log" --port "$PORT_D" --cert "$CERT" --key "$KEY"
+start_daemon "$TMP/e.log" --port "$PORT_E" --public-url https://jmap.example.test
 
 wait_port "$PORT_A" "jmapd A"
 wait_port "$PORT_B" "jmapd B"
 wait_port "$PORT_C" "jmapd C"
 wait_port "$PORT_D" "jmapd D"
+wait_port "$PORT_E" "jmapd E"
 
 AUTH="alice:waldorf"
 BASE_A="http://127.0.0.1:$PORT_A"
@@ -358,7 +364,51 @@ for key in ("uploadUrl", "downloadUrl", "eventSourceUrl"):
 tls.close()
 PYEOF
 
-# ---- (9) a non-loopback bind without TLS must refuse to start ----
+# ---- (9) --public-url: the session document advertises the proxy's base ----
+python3 - "$PORT_E" <<'PYEOF' && pass "--public-url: the advertised base is the override" \
+                           || fail "--public-url: the advertised base is the override"
+import base64, json, sys, urllib.request
+
+port = int(sys.argv[1])
+base = f"http://127.0.0.1:{port}"
+auth = "Basic " + base64.b64encode(b"alice:waldorf").decode()
+req = urllib.request.Request(base + "/.well-known/jmap")
+req.add_header("Authorization", auth)
+with urllib.request.urlopen(req, timeout=10) as r:
+    assert r.status == 200, r.status
+    sess = json.loads(r.read())
+
+# The listener is plaintext on 127.0.0.1:<port>, but the client is told what
+# it can actually reach: the https base the proxy publishes.  A document that
+# advertises the listener instead is exactly the silent downgrade the client
+# refuses.
+assert sess["apiUrl"] == "https://jmap.example.test/api", sess["apiUrl"]
+assert sess["uploadUrl"] == "https://jmap.example.test/upload/{accountId}/", sess["uploadUrl"]
+assert sess["eventSourceUrl"] == "https://jmap.example.test/event/", sess["eventSourceUrl"]
+assert sess["downloadUrl"] == ("https://jmap.example.test/download/"
+                               "{accountId}/{blobId}/{name}?accept={type}"), sess["downloadUrl"]
+# the download template must still be a template: the client substitutes these
+for ph in ("{accountId}", "{blobId}", "{name}"):
+    assert ph in sess["downloadUrl"], (ph, sess["downloadUrl"])
+for key in ("apiUrl", "uploadUrl", "downloadUrl", "eventSourceUrl"):
+    u = sess[key]
+    assert "127.0.0.1" not in u and f":{port}" not in u, (key, u)
+    assert not u.startswith("http://"), (key, u)
+PYEOF
+
+# the same override must refuse a plaintext base URL on a network bind: the
+# client would be told to send the password in clear
+if ./jmapd.com --root "$ROOT" --addr 0.0.0.0 --cert "$CERT" --key "$KEY" \
+        --public-url http://jmap.example.test --port "$PORT_C" \
+        >"$TMP/pubrefuse.log" 2>&1; then
+    fail "http public-url on a non-loopback bind must exit nonzero"
+elif grep -q -- '--public-url' "$TMP/pubrefuse.log"; then
+    pass "http public-url on a non-loopback bind is refused, naming the flag"
+else
+    fail "http public-url refusal does not name --public-url"
+fi
+
+# ---- (10) a non-loopback bind without TLS must refuse to start ----
 if ./jmapd.com --root "$ROOT" --addr 0.0.0.0 --port "$PORT_C" \
         >"$TMP/refuse.log" 2>&1; then
     fail "non-loopback bind without TLS must exit nonzero"

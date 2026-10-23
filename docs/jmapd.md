@@ -178,6 +178,9 @@ jmapd [options]
   --port N             bind port (JMAPD_PORT, default 8081)
   --cert/--key PATH    PEM pair: enables HTTPS from the first byte
   --hostname H         host used in the advertised URLs (JMAPD_HOSTNAME)
+  --public-url URL     base URL advertised verbatim in the session document
+                       (JMAPD_PUBLIC_URL, e.g. https://jmap.jaye.ch); empty =
+                       derive from --cert/--hostname/--port
   --identity ADDRESS   the account's own address (JMAPD_IDENTITY,
                        default <user>@<hostname>)
   --max-request BYTES  request cap (JMAPD_MAX_REQ, default 4 MiB)
@@ -196,14 +199,49 @@ Deployment artifacts live in `deploy/`:
   `NoNewPrivileges`, `ProtectHome`, `PrivateTmp`/`PrivateDevices`, `UMask=0077`,
   `MemoryHigh`/`MemoryMax`, `Restart=on-failure`, journal output. It binds
   `127.0.0.1:8788` and passes `--root /opt/imapd/var/mail` (the same maildir as
-  imapd), `--identity <user>@mail.jaye.ch`, and `--outbox-host 127.0.0.1
+  imapd), `--public-url https://jmap.jaye.ch` (see the reverse-proxy section),
+  `--identity <user>@mail.jaye.ch`, and `--outbox-host 127.0.0.1
   --outbox-port 465`.
 - `deploy/jmapd-outbox.env.example` — the submission credential as an
   `EnvironmentFile` (`/etc/jmapd/outbox.env`, 0600): a unit file is
   world-readable, so the password does not live in it.
 - `deploy/Caddyfile.jmap` — `https://jmap.jaye.ch` → `127.0.0.1:8788`, with the
   note that `jmapd` can also terminate TLS itself with `--cert`/`--key` (the
-  imapd certificate) instead.
+  imapd certificate) instead, and that the proxied unit must set
+  `--public-url`.
+
+### Behind a TLS-terminating reverse proxy
+
+`jmapd` derives the four URLs in the session document from the listener it is
+bound to: `https` when `--cert`/`--key` are set, else `http`, plus `--hostname`
+and `--port`. That is the right answer when `jmapd` itself terminates TLS, and
+the wrong one when a proxy does: the listener is plaintext on
+`127.0.0.1:8788`, which no client can reach, so the document would advertise
+`http://127.0.0.1:8788/api` and every method call after the session fetch would
+go nowhere.
+
+`--public-url` (or `JMAPD_PUBLIC_URL`) replaces that derivation: the value is
+advertised **verbatim** as the base of `apiUrl`, `uploadUrl`, `downloadUrl` and
+`eventSourceUrl`, and the download template keeps its
+`{accountId}/{blobId}/{name}` placeholders.
+
+```
+--addr 127.0.0.1 --port 8788 --public-url https://jmap.jaye.ch
+```
+
+Validation is at startup and fails closed, naming the flag:
+
+- the scheme must be `http` or `https`, and a host must be present;
+- no userinfo (`user@host`), no query string, no fragment; printable ASCII
+  without spaces only; the value is capped at 384 bytes;
+- a trailing `/` is stripped (so the joined suffixes never double up); a path
+  suffix is allowed and preserved — `https://host/jmap` advertises
+  `https://host/jmap/api` and `https://host/jmap/download/{...}`;
+- an **`http://` value is refused unless the bind address is loopback** — the
+  same rule the plaintext listener is held to, and the same reason: the client
+  would be told to send the password in clear across a network.
+
+An empty value means "no override", which is the pre-existing behaviour.
 
 **Two deployment caveats worth knowing before you point Caddy at it.** Both are
 consequences of the design, not defects, and neither is fixed in v1:

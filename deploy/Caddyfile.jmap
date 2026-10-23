@@ -9,6 +9,13 @@
 # serve plaintext at all.  It refuses a non-loopback bind without --cert/--key,
 # because JMAP carries the password in an Authorization header.
 #
+# jmapd MUST BE STARTED WITH --public-url https://jmap.jaye.ch IN THIS SETUP.
+# The session document (GET /.well-known/jmap) is what the client follows, and
+# without the override it advertises the listener it is bound to —
+# http://127.0.0.1:8788, which no client can reach — so every apiUrl/
+# uploadUrl/downloadUrl/eventSourceUrl in it is wrong.  --public-url makes the
+# document advertise this site's own URL instead (see deploy/jmapd.service).
+#
 # TWO CONSEQUENCES, before you deploy it this way:
 #
 #  1. jmapd sees every client as 127.0.0.1.  Its per-IP brute-force lockout
@@ -52,6 +59,10 @@ jmap.jaye.ch {
 #       --addr 0.0.0.0 --port 8788 \
 #       --cert /etc/imapd/tls/fullchain.pem --key /etc/imapd/tls/key.pem \
 #       --identity jaye@mail.jaye.ch --outbox-host 127.0.0.1 --outbox-port 465
+#
+# Here jmapd terminates TLS itself, so it derives the advertised base URL from
+# --cert/--hostname/--port and --public-url is not needed (set it anyway if the
+# public host differs from --hostname).
 #
 # A cert without its key, or a pair mbedTLS cannot parse, fails closed at
 # startup (exit 1) rather than falling back to plaintext.  With jmapd owning

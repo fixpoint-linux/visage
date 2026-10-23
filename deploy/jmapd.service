@@ -43,10 +43,20 @@ Group=imapd
 # Serving plaintext on a NON-loopback address is refused by jmapd at startup
 # unless --cert/--key are given, because JMAP carries the password in an
 # Authorization header.
+#
+# --public-url is what makes the proxy arrangement work: the session document
+# (GET /.well-known/jmap) advertises this URL verbatim to the client, so the
+# client follows https://jmap.jaye.ch/api rather than the http://127.0.0.1:8788
+# it can never reach.  Without it the document advertises the listener itself
+# and every JMAP client fails at the first method call.  The value must be the
+# public URL of the proxy, scheme included and no trailing slash; a path prefix
+# is allowed (https://host/jmap) and preserved.  An http:// value is refused on
+# a non-loopback bind.
 ExecStart=/opt/jmapd/jmapd.com \
     --root /opt/imapd/var/mail \
     --addr 127.0.0.1 \
     --port 8788 \
+    --public-url https://jmap.jaye.ch \
     --identity jaye@mail.jaye.ch \
     --outbox-host 127.0.0.1 \
     --outbox-port 465

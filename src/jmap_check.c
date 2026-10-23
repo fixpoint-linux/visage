@@ -10,7 +10,8 @@
  *   (2) the id codec: round-trip AND rejection (a traversal attempt must not
  *       decode into a path component);
  *   (3) the session document: four absolute URLs with the listener's scheme,
- *       primaryAccounts, capabilities;
+ *       primaryAccounts, capabilities — and the --public-url override
+ *       (advertised verbatim, path prefix preserved, every refusal named);
  *   (4) auth verdicts: Basic/Bearer parsing, the passwd table, the per-IP
  *       lockout;
  *   (5) the HTTP/1.1 request parse: method/path/keep-alive, Content-Length
@@ -401,6 +402,159 @@ static void session_tests(void) {
                strstr(doc, "\"apiUrl\":\"https://jmap.test:8081/api\"") != NULL &&
                strstr(doc, "http://") == NULL,
            "session: https on a TLS listener, and nothing plaintext");
+    free(doc);
+}
+
+/* ---- the --public-url override (behind a TLS-terminating proxy) ---- */
+
+/* Every advertised URL must come from the override verbatim — the listener's
+   own scheme/host/port are unreachable from the client side, so a document
+   that mixes them in is worse than useless. */
+static void public_url_tests(void) {
+    JmapdConfig cfg;
+    char out[JMAPD_PUBLIC_URL_MAX];
+    char *doc = NULL;
+    size_t len = 0;
+
+    memset(&cfg, 0, sizeof cfg);
+    cfg.root = "/tmp";
+    cfg.addr = "127.0.0.1";
+    cfg.port = 8081;
+    cfg.hostname = "127.0.0.1";      /* what the proxy-facing bind would say */
+    cfg.max_req = JMAPD_DEFAULT_MAX_REQ;
+    cfg.cmd_tmo = 300;
+    cfg.public_url = "https://jmap.example.test";
+
+    EXPECT(jmapd_session_render(&cfg, "alice", &doc, &len) == 0 && doc &&
+               strstr(doc, "\"apiUrl\":\"https://jmap.example.test/api\"") !=
+                   NULL &&
+               strstr(doc, "\"uploadUrl\":\"https://jmap.example.test/upload/"
+                           "{accountId}/\"") != NULL &&
+               strstr(doc, "\"eventSourceUrl\":\"https://jmap.example.test/"
+                           "event/\"") != NULL,
+           "public-url: the override is advertised verbatim, no port");
+    EXPECT(doc &&
+               strstr(doc, "\"downloadUrl\":\"https://jmap.example.test/"
+                           "download/{accountId}/{blobId}/{name}?accept="
+                           "{type}\"") != NULL,
+           "public-url: the download template keeps its placeholders");
+    EXPECT(doc && strstr(doc, "http://") == NULL &&
+               strstr(doc, "127.0.0.1") == NULL,
+           "public-url: nothing of the listener leaks into the document");
+    free(doc);
+    doc = NULL;
+
+    /* a trailing '/' must not double up when the suffixes are joined */
+    cfg.public_url = "https://jmap.example.test/";
+    EXPECT(jmapd_session_render(&cfg, "alice", &doc, &len) == 0 && doc &&
+               strstr(doc, "\"apiUrl\":\"https://jmap.example.test/api\"") !=
+                   NULL &&
+               strstr(doc, "//api") == NULL,
+           "public-url: a trailing slash is stripped before joining");
+    free(doc);
+    doc = NULL;
+
+    /* a path prefix is preserved and joined the same way */
+    cfg.public_url = "https://jmap.example.test/jmap";
+    EXPECT(jmapd_session_render(&cfg, "alice", &doc, &len) == 0 && doc &&
+               strstr(doc, "\"apiUrl\":\"https://jmap.example.test/jmap/api\"")
+                   != NULL &&
+               strstr(doc, "\"downloadUrl\":\"https://jmap.example.test/jmap/"
+                           "download/{accountId}/{blobId}/{name}?accept="
+                           "{type}\"") != NULL &&
+               strstr(doc, "\"eventSourceUrl\":\"https://jmap.example.test/"
+                           "jmap/event/\"") != NULL,
+           "public-url: a path prefix is preserved on every URL");
+    free(doc);
+    doc = NULL;
+
+    /* normalization verdicts */
+    EXPECT(jmapd_public_url_normalize("https://h.test/x/", out, sizeof out) ==
+                   JMAPD_PUB_OK &&
+               strcmp(out, "https://h.test/x") == 0,
+           "public-url: normalize strips trailing slashes only");
+    EXPECT(jmapd_public_url_normalize("", out, sizeof out) == JMAPD_PUB_OK &&
+               out[0] == '\0',
+           "public-url: empty means no override");
+    EXPECT(jmapd_public_url_normalize(NULL, out, sizeof out) == JMAPD_PUB_OK &&
+               out[0] == '\0',
+           "public-url: NULL means no override");
+
+    /* refusals — each names a distinct defect */
+    EXPECT(jmapd_public_url_normalize("ftp://h.test", out, sizeof out) ==
+               JMAPD_PUB_ERR_SCHEME,
+           "public-url: a non-http scheme is refused");
+    EXPECT(jmapd_public_url_normalize("jmap.example.test", out, sizeof out) ==
+               JMAPD_PUB_ERR_SCHEME,
+           "public-url: a bare host with no scheme is refused");
+    EXPECT(jmapd_public_url_normalize("https://", out, sizeof out) ==
+               JMAPD_PUB_ERR_HOST,
+           "public-url: a scheme with no host is refused");
+    EXPECT(jmapd_public_url_normalize("https:///jmap", out, sizeof out) ==
+               JMAPD_PUB_ERR_HOST,
+           "public-url: an empty authority is refused");
+    EXPECT(jmapd_public_url_normalize("https://:8443", out, sizeof out) ==
+               JMAPD_PUB_ERR_HOST,
+           "public-url: a port with no host is refused");
+    EXPECT(jmapd_public_url_normalize("https://u:p@h.test", out, sizeof out) ==
+               JMAPD_PUB_ERR_USERINFO,
+           "public-url: userinfo is refused");
+    EXPECT(jmapd_public_url_normalize("https://h.test/?a=b", out, sizeof out) ==
+               JMAPD_PUB_ERR_QUERY,
+           "public-url: a query string is refused");
+    EXPECT(jmapd_public_url_normalize("https://h.test/#frag", out, sizeof out) ==
+               JMAPD_PUB_ERR_QUERY,
+           "public-url: a fragment is refused");
+    EXPECT(jmapd_public_url_normalize("https://h.test/a b", out, sizeof out) ==
+               JMAPD_PUB_ERR_CHAR,
+           "public-url: a space is refused");
+    {
+        char big[JMAPD_PUBLIC_URL_MAX + 32];
+        size_t i;
+        memcpy(big, "https://h.test/", 15);
+        for (i = 15; i < sizeof big - 1; i++) big[i] = 'a';
+        big[sizeof big - 1] = '\0';
+        EXPECT(jmapd_public_url_normalize(big, out, sizeof out) ==
+                   JMAPD_PUB_ERR_LONG,
+               "public-url: an over-long value is refused");
+        EXPECT(jmapd_public_url_normalize("https://h.test/x", out, 8) ==
+                   JMAPD_PUB_ERR_LONG,
+               "public-url: a value that does not fit the caller's buffer is "
+               "refused, not truncated");
+    }
+
+    /* plaintext http is a policy verdict, keyed on the bind address */
+    EXPECT(jmapd_public_url_check("http://127.0.0.1:8788", "127.0.0.1", out,
+                                  sizeof out) == JMAPD_PUB_OK,
+           "public-url: http is accepted on a loopback bind");
+    EXPECT(jmapd_public_url_check("http://localhost:8788", "localhost", out,
+                                  sizeof out) == JMAPD_PUB_OK,
+           "public-url: http is accepted on the localhost bind");
+    EXPECT(jmapd_public_url_check("http://jmap.example.test", "0.0.0.0", out,
+                                  sizeof out) == JMAPD_PUB_ERR_PLAINTEXT,
+           "public-url: http is refused for a non-loopback bind");
+    EXPECT(jmapd_public_url_check("http://jmap.example.test", "10.0.0.5", out,
+                                  sizeof out) == JMAPD_PUB_ERR_PLAINTEXT,
+           "public-url: http is refused for a LAN bind");
+    EXPECT(jmapd_public_url_check("https://jmap.example.test", "0.0.0.0", out,
+                                  sizeof out) == JMAPD_PUB_OK,
+           "public-url: https is accepted on any bind");
+    EXPECT(jmapd_public_url_check("ftp://h.test", "127.0.0.1", out,
+                                  sizeof out) == JMAPD_PUB_ERR_SCHEME,
+           "public-url: check() reports the syntax verdict too");
+
+    /* an unadvertisable override must fail the render, not be advertised */
+    cfg.public_url = "ftp://jmap.example.test";
+    EXPECT(jmapd_session_render(&cfg, "alice", &doc, &len) != 0 && !doc,
+           "public-url: an invalid override fails the session render");
+    free(doc);
+    doc = NULL;
+
+    /* no override: the derived form is unchanged (regression guard) */
+    cfg.public_url = "";
+    EXPECT(jmapd_session_render(&cfg, "alice", &doc, &len) == 0 && doc &&
+               strstr(doc, "\"apiUrl\":\"http://127.0.0.1:8081/api\"") != NULL,
+           "public-url: an empty override keeps the derived base URL");
     free(doc);
 }
 
@@ -2618,6 +2772,7 @@ int main(void) {
     json_reject_tests();
     id_tests();
     session_tests();
+    public_url_tests();
     auth_tests();
     http_tests();
     state_tests();
