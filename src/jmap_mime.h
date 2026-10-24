@@ -114,7 +114,10 @@ typedef struct JmapdTree {
    parts for an empty message), or -1 on allocation failure. */
 int jmapd_tree_build(const char *msg, size_t len, JmapdTree *t);
 
-/* Index of the part with this partId ("" is the whole message), or -1. */
+/* Index of the part with this partId, or -1.  The part ids are RFC 8621
+   4.1.1 numbers: "1.1"/"1.2"/... under a multipart container, and "1" for a
+   single-part message (where the root part IS the body part).  "" is the
+   multipart container's own id; it is never the id of a body part. */
 int jmapd_tree_find(const JmapdTree *t, const char *id);
 
 /* Classify the leaves: textBody (text/plain) / htmlBody (text/html) get
@@ -194,8 +197,10 @@ typedef struct JmapdPartRef {
     char   filename[128];
 } JmapdPartRef;
 
-/* Resolve part_id ("" = the whole message) against an open message file of
-   filesize bytes.  Returns 0, or -1 when the path does not resolve. */
+/* Resolve part_id against an open message file of filesize bytes.  "" and,
+   for a single-part message, "1" both name the whole message; "1" in a
+   multipart message is its first child.  Returns 0, or -1 when the path does
+   not resolve. */
 int jmapd_file_part(int fd, uint64_t filesize, const char *part_id,
                     JmapdPartRef *out);
 

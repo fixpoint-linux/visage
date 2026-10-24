@@ -1156,15 +1156,71 @@ static void mime_tree_tests(void) {
                "mime: multipart without a boundary parameter is one part");
         free(b);
     }
-    /* a plain message: ONE part with partId "" (RFC 8621) */
+    /* a plain message: ONE part, and it is part "1" (RFC 8621 4.1.1) — never
+       "" : an empty partId cannot be interned as a client cache key */
     {
         static const char simple[] =
             "From: a@b\r\nSubject: s\r\n\r\nhello\r\n";
         JmapdTree *s = tree_of(simple, sizeof simple - 1);
-        EXPECT(s && s->nparts == 1 && s->parts[0].info.id[0] == '\0' &&
+        EXPECT(s && s->nparts == 1 && strcmp(s->parts[0].info.id, "1") == 0 &&
                    s->parts[0].body_kind == 1,
-               "mime: a simple message is one text body part with partId \"\"");
+               "mime: a simple message is one text body part with partId \"1\"");
         free(s);
+    }
+    /* No BODY part id jmapd produces for ANY fixture is empty.  An empty
+       partId is both unnumbered (RFC 8621 4.1.1 numbers the parts of a
+       message) and unusable as a cache key: the mail client interns body rows
+       by partId and its datalog engine refuses to intern "".  A multipart
+       CONTAINER keeps its own "" (it is not a body part, and its numbering is
+       pinned by the assertions above); the multipart fixtures here assert
+       their numbering too, so the single-part fix cannot shift a multipart
+       id. */
+    {
+        static const struct {
+            const char *what, *msg;
+            const char *ids;          /* expected ids, space-separated */
+        } cases[] = {
+            {"text-only", "Content-Type: text/plain\r\n\r\ntext body\r\n", "1"},
+            {"html-only", "Content-Type: text/html\r\n\r\n<p>html</p>\r\n", "1"},
+            {"no Content-Type",
+             "From: a@b\r\nSubject: s\r\n\r\nuntyped body\r\n", "1"},
+            {"multipart/alternative",
+             "Content-Type: multipart/alternative; boundary=\"ALT\"\r\n\r\n"
+             "--ALT\r\nContent-Type: text/plain\r\n\r\nplain\r\n"
+             "--ALT\r\nContent-Type: text/html\r\n\r\n<p>html</p>\r\n"
+             "--ALT--\r\n",
+             "1 2"},
+            {"multipart/mixed with an attachment",
+             "Content-Type: multipart/mixed; boundary=\"MX\"\r\n\r\n"
+             "--MX\r\nContent-Type: text/plain\r\n\r\nplain\r\n"
+             "--MX\r\nContent-Type: application/pdf; name=\"a.pdf\"\r\n"
+             "Content-Disposition: attachment; filename=\"a.pdf\"\r\n\r\n"
+             "%PDF-1.4\r\n"
+             "--MX--\r\n",
+             "1 2"},
+        };
+        size_t c;
+        for (c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+            JmapdTree *t2 = tree_of(cases[c].msg, strlen(cases[c].msg));
+            char got[256] = "";
+            size_t o = 0;
+            int i2;
+            bool nonempty = t2 != NULL;
+            for (i2 = 0; t2 && i2 < t2->nparts; i2++) {
+                if (t2->parts[i2].info.multipart) continue;
+                if (!t2->parts[i2].info.id[0]) nonempty = false;
+                o += (size_t)snprintf(got + o, sizeof got - o, "%s%s",
+                                      o ? " " : "", t2->parts[i2].info.id);
+            }
+            EXPECT(nonempty && strcmp(got, cases[c].ids) == 0,
+                   c < 3 ? "mime: a single-part message's only part is \"1\""
+                         : (c == 3 ? "mime: multipart/alternative keeps 1/2"
+                                   : "mime: multipart/mixed keeps 1/2"));
+            if (!(nonempty && strcmp(got, cases[c].ids) == 0))
+                printf("     %s: ids='%s' want='%s'\n", cases[c].what, got,
+                       cases[c].ids);
+            free(t2);
+        }
     }
     /* an empty message: no crash, and no parts is legal */
     {
@@ -1245,6 +1301,56 @@ static void mime_file_part_tests(void) {
     }
     close(fd);
     free(t);
+    unlink(path);
+    rmdir(dir);
+}
+
+/* A single-part message's only part is named "1" (see jmapd_tree_build), so
+   the FILE-based resolver the download uses must resolve "1" to the whole
+   message — otherwise Email/get would describe part "1" and the download of
+   its blobId would 404.  "" keeps resolving, so a blob id minted before the
+   naming rule still downloads. */
+static void single_part_file_tests(void) {
+    char tpl[] = "/tmp/visage_jmapd_one_XXXXXX";
+    char *dir = mkdtemp(tpl);
+    char path[4096];
+    static const char plain[] =
+        "From: a@b\r\nSubject: s\r\nContent-Type: text/plain\r\n\r\nhi there\r\n";
+    int fd;
+
+    if (!dir) {
+        check_fail("mime: single-part resolver scratch dir", "mkdtemp failed");
+        return;
+    }
+    snprintf(path, sizeof path, "%s/one.eml", dir);
+    fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0 || write(fd, plain, sizeof plain - 1) !=
+                      (ssize_t)(sizeof plain - 1)) {
+        check_fail("mime: single-part resolver fixture", "open/write failed");
+        if (fd >= 0) close(fd);
+        unlink(path);
+        rmdir(dir);
+        return;
+    }
+    {
+        JmapdTree *t = tree_of(plain, sizeof plain - 1);
+        JmapdPartRef r1, r0;
+        EXPECT(t && t->nparts == 1 && strcmp(t->parts[0].info.id, "1") == 0,
+               "mime: a single-part message's only part id is \"1\"");
+        EXPECT(jmapd_file_part(fd, sizeof plain - 1, "1", &r1) == 0 &&
+                   r1.start == 0 && r1.end == sizeof plain - 1 &&
+                   r1.hdr_end == t->parts[0].info.hdr_end &&
+                   strcmp(r1.subtype, "plain") == 0,
+               "mime: part \"1\" of a single-part message is the whole message");
+        EXPECT(jmapd_file_part(fd, sizeof plain - 1, "", &r0) == 0 &&
+                   r0.start == r1.start && r0.end == r1.end &&
+                   r0.hdr_end == r1.hdr_end,
+               "mime: \"\" still resolves to the whole message");
+        EXPECT(jmapd_file_part(fd, sizeof plain - 1, "1.1", &r1) == -1,
+               "mime: a single-part message has no part 1.1");
+        free(t);
+    }
+    close(fd);
     unlink(path);
     rmdir(dir);
 }
@@ -1970,6 +2076,270 @@ static void email_get_tests(void) {
                "get: a missing ids argument is invalidArguments");
         jmap_json_free(doc);
         free(res);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* (11b) Bounded work: a refusal, never a silently short answer        */
+/*                                                                    */
+/* The 32k-message deploy found three walls that answered a bare      */
+/* {"type":"serverFail"} (no description, no journal line) or, worse, */
+/* an EMPTY list for a mailbox that holds 32k messages.  These checks */
+/* drive the same three paths through the budgets the daemon exposes: */
+/*                                                                    */
+/*   * an exhausted `text` scan budget is serverLimit WITH a          */
+/*     description (a client can narrow the query and retry);         */
+/*   * the SAME query with a workable budget finds the message, so    */
+/*     the refusal is the budget and not the filter;                  */
+/*   * a paging window past the cap is serverLimit WITH a             */
+/*     description;                                                   */
+/*   * an Email/get body budget that cannot hold the page TRUNCATES   */
+/*     (isTruncated per bodyValue) instead of failing the request —   */
+/*     that failure is what made a big-mailbox page unqueryable.      */
+/* ------------------------------------------------------------------ */
+
+static void bounded_work_tests(void) {
+    char tpl[] = "/tmp/visage_jmapd_bound_XXXXXX";
+    char *root = mkdtemp(tpl);
+    JmapdServer srv;
+    JmapdCtx ctx;
+    char inbox[JMAPD_ID_MAX], eid[JMAPD_ID_MAX];
+    char args[2048];
+    char *res;
+
+    if (!root) {
+        check_fail("bound: scratch root", "mkdtemp failed");
+        return;
+    }
+    memset(&srv, 0, sizeof srv);
+    srv.icfg.root = root;
+    srv.icfg.max_msg = IMAPD_DEFAULT_MAX_MSG;
+    srv.cfg.root = root;
+    srv.cfg.hostname = "localhost";
+    memset(&ctx, 0, sizeof ctx);
+    ctx.srv = &srv;
+    ctx.user = "alice";
+    if (seed_msg(root, "alice", "Inbox", "1700000000.B1.host",
+                 "From: bob@example.com\r\nTo: alice@example.com\r\n"
+                 "Subject: needle\r\nMessage-ID: <b1@example.com>\r\n"
+                 "Content-Type: text/plain\r\n\r\nbody with needle-alpha\r\n",
+                 1700000000, 1) != 0) {
+        check_fail("bound: seed message", "seed failed");
+        return;
+    }
+    (void)jmapd_id_mailbox("Inbox", inbox, sizeof inbox);
+    (void)jmapd_id_email("1700000000.B1.host", NULL, eid, sizeof eid);
+
+    /* --- a workable budget finds the term (the control) --- */
+    srv.cfg.text_scan_max = JMAPD_TEXT_SCAN_MAX;
+    snprintf(args, sizeof args,
+             "{\"accountId\":\"alice\",\"filter\":{\"text\":\"needle-alpha\"}}");
+    res = call_method(&ctx, jmapd_method_email_query, args);
+    if (res) {
+        JmapJsonDoc *doc = NULL;
+        const JmapJsonNode *total = result_get(&doc, res, "total");
+        uint64_t n = 99;
+        EXPECT(jmap_json_u64(total, &n) == 0 && n == 1,
+               "bound: a text query inside the budget finds the message");
+        jmap_json_free(doc);
+        free(res);
+    } else {
+        check_fail("bound: a text query inside the budget finds the message",
+                   "no result");
+    }
+
+    /* --- an exhausted budget is serverLimit WITH a description --- */
+    srv.cfg.text_scan_max = 1;
+    res = call_method(&ctx, jmapd_method_email_query, args);
+    if (res) {
+        JmapJsonDoc *doc = NULL;
+        const JmapJsonNode *type = result_get(&doc, res, "type");
+        const JmapJsonNode *desc = jmap_json_get(jmap_json_root(doc), "description");
+        const char *ts = NULL, *ds = NULL;
+        EXPECT(type && jmap_json_str(type, &ts, NULL) == 0 &&
+                   strcmp(ts, "serverLimit") == 0,
+               "bound: an over-budget text scan is a serverLimit, not a short list");
+        EXPECT(desc && jmap_json_str(desc, &ds, NULL) == 0 && ds[0] &&
+                   strstr(ds, "budget") != NULL,
+               "bound: the over-budget refusal carries a description");
+        jmap_json_free(doc);
+        free(res);
+    } else {
+        check_fail("bound: an over-budget text scan is a serverLimit, not a short list",
+                   "no result");
+    }
+    srv.cfg.text_scan_max = JMAPD_TEXT_SCAN_MAX;
+
+    /* --- a paging window past the cap is serverLimit + description --- */
+    snprintf(args, sizeof args,
+             "{\"accountId\":\"alice\",\"position\":%u,\"limit\":1}",
+             (unsigned)JMAPD_QUERY_MAX_WINDOW);
+    res = call_method(&ctx, jmapd_method_email_query, args);
+    if (res) {
+        JmapJsonDoc *doc = NULL;
+        const JmapJsonNode *type = result_get(&doc, res, "type");
+        const JmapJsonNode *desc = jmap_json_get(jmap_json_root(doc), "description");
+        const char *ts = NULL, *ds = NULL;
+        EXPECT(type && jmap_json_str(type, &ts, NULL) == 0 &&
+                   strcmp(ts, "serverLimit") == 0,
+               "bound: a paging window past the cap is a serverLimit");
+        EXPECT(desc && jmap_json_str(desc, &ds, NULL) == 0 && ds[0],
+               "bound: the paging refusal carries a description");
+        jmap_json_free(doc);
+        free(res);
+    } else {
+        check_fail("bound: a paging window past the cap is a serverLimit",
+                   "no result");
+    }
+
+    /* --- an Email/get that cannot hold the bodies truncates, not fails --- */
+    srv.cfg.get_body_budget = 8;
+    snprintf(args, sizeof args,
+             "{\"accountId\":\"alice\",\"ids\":[\"%s\"],"
+             "\"properties\":[\"id\",\"textBody\",\"subject\"],"
+             "\"fetchTextBodyValues\":true}", eid);
+    res = call_method(&ctx, jmapd_method_email_get, args);
+    if (res) {
+        JmapJsonDoc *doc = NULL;
+        const JmapJsonNode *list = result_get(&doc, res, "list");
+        const JmapJsonNode *e = list ? jmap_json_at(list, 0) : NULL;
+        const JmapJsonNode *bv = e ? jmap_json_get(e, "bodyValues") : NULL;
+        /* A single-part message's body part id is "1" (the multipart
+           fixtures use "1.1"/"1.2"), never "". */
+        const JmapJsonNode *tv = bv ? jmap_json_get(bv, "1") : NULL;
+        const JmapJsonNode *tr = tv ? jmap_json_get(tv, "isTruncated") : NULL;
+        const JmapJsonNode *val = tv ? jmap_json_get(tv, "value") : NULL;
+        const char *vs = NULL;
+        EXPECT(e != NULL && jmap_json_get(e, "id") != NULL,
+               "bound: a body-budget cut still returns the message object");
+        EXPECT(tr && tr->type == JMAP_JSON_BOOL && tr->boolean,
+               "bound: the body the budget cut says isTruncated");
+        EXPECT(val && jmap_json_str(val, &vs, NULL) == 0 && strlen(vs) <= 8,
+               "bound: the truncated body is cut to the remaining budget");
+        jmap_json_free(doc);
+        free(res);
+    } else {
+        check_fail("bound: a body-budget cut still returns the message object",
+                   "no result");
+    }
+    srv.cfg.get_body_budget = JMAPD_GET_BODY_BUDGET;
+
+    /* --- the same get with a normal budget is NOT truncated --- */
+    snprintf(args, sizeof args,
+             "{\"accountId\":\"alice\",\"ids\":[\"%s\"],"
+             "\"properties\":[\"id\",\"textBody\"],"
+             "\"fetchTextBodyValues\":true}", eid);
+    res = call_method(&ctx, jmapd_method_email_get, args);
+    if (res) {
+        JmapJsonDoc *doc = NULL;
+        const JmapJsonNode *list = result_get(&doc, res, "list");
+        const JmapJsonNode *e = list ? jmap_json_at(list, 0) : NULL;
+        const JmapJsonNode *bv = e ? jmap_json_get(e, "bodyValues") : NULL;
+        const JmapJsonNode *tv = bv ? jmap_json_get(bv, "1") : NULL;
+        const JmapJsonNode *tr = tv ? jmap_json_get(tv, "isTruncated") : NULL;
+        const JmapJsonNode *val = tv ? jmap_json_get(tv, "value") : NULL;
+        const char *vs = NULL;
+        EXPECT(tr && tr->type == JMAP_JSON_BOOL && !tr->boolean &&
+                   val && jmap_json_str(val, &vs, NULL) == 0 &&
+                   strstr(vs, "needle-alpha") != NULL,
+               "bound: a normal budget serves the whole body untruncated");
+        jmap_json_free(doc);
+        free(res);
+    } else {
+        check_fail("bound: a normal budget serves the whole body untruncated",
+                   "no result");
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* (15) part ids over Email/get: a single-part message is "1", not ""   */
+/* ------------------------------------------------------------------ */
+
+/* An empty partId is what made the mail client's cache write fail: it interns
+   body rows BY partId and its datalog engine refuses to intern "".  RFC 8621
+   4.1.1 numbers a single-part message's body "1" (Fastmail says "1" too).
+   Asserted over the RESPONSE, not only over the tree, because the response is
+   what the client caches. */
+static void body_part_id_tests(void) {
+    char tpl[] = "/tmp/visage_jmapd_partid_XXXXXX";
+    char *root = mkdtemp(tpl);
+    JmapdServer srv;
+    JmapdCtx ctx;
+    char ids[2][JMAPD_ID_MAX];
+    char args[2048];
+    char *res;
+    int k;
+
+    if (!root) {
+        check_fail("partid: scratch root", "mkdtemp failed");
+        return;
+    }
+    memset(&srv, 0, sizeof srv);
+    srv.icfg.root = root;
+    srv.icfg.max_msg = IMAPD_DEFAULT_MAX_MSG;
+    srv.cfg.root = root;
+    srv.cfg.hostname = "localhost";
+    memset(&ctx, 0, sizeof ctx);
+    ctx.srv = &srv;
+    ctx.user = "alice";
+    if (seed_msg(root, "alice", "Inbox", "1700000000.P1.host",
+                 "From: a@b\r\nSubject: text one\r\n"
+                 "Content-Type: text/plain\r\n\r\nonly text\r\n",
+                 1700000000, 1) != 0 ||
+        seed_msg(root, "alice", "Inbox", "1700000100.P2.host",
+                 "From: a@b\r\nSubject: html one\r\n"
+                 "Content-Type: text/html\r\n\r\n<p>only html</p>\r\n",
+                 1700000100, 1) != 0) {
+        check_fail("partid: seed the single-part fixtures", "seed failed");
+        return;
+    }
+    (void)jmapd_id_email("1700000000.P1.host", NULL, ids[0], sizeof ids[0]);
+    (void)jmapd_id_email("1700000100.P2.host", NULL, ids[1], sizeof ids[1]);
+
+    for (k = 0; k < 2; k++) {
+        const char *prop = k == 0 ? "textBody" : "htmlBody";
+        const char *want = k == 0 ? "only text" : "<p>only html</p>";
+        snprintf(args, sizeof args,
+                 "{\"accountId\":\"alice\",\"ids\":[\"%s\"],"
+                 "\"properties\":[\"id\",\"%s\",\"bodyStructure\"],"
+                 "\"fetchTextBodyValues\":true,\"fetchHTMLBodyValues\":true}",
+                 ids[k], prop);
+        res = call_method(&ctx, jmapd_method_email_get, args);
+        if (!res) {
+            check_fail(k == 0 ? "partid: a text-only message's body part is \"1\""
+                              : "partid: an html-only message's body part is \"1\"",
+                       "no result");
+            continue;
+        }
+        {
+            JmapJsonDoc *doc = NULL;
+            const JmapJsonNode *list = result_get(&doc, res, "list");
+            const JmapJsonNode *e = list ? jmap_json_at(list, 0) : NULL;
+            const JmapJsonNode *bl = e ? jmap_json_get(e, prop) : NULL;
+            const JmapJsonNode *bs = e ? jmap_json_get(e, "bodyStructure") : NULL;
+            const JmapJsonNode *bv = e ? jmap_json_get(e, "bodyValues") : NULL;
+            const JmapJsonNode *one = bv ? jmap_json_get(bv, "1") : NULL;
+            const char *s = NULL, *v = NULL;
+
+            EXPECT(bl && jmap_json_count(bl) == 1 &&
+                       jmap_json_str(jmap_json_get(jmap_json_at(bl, 0),
+                                                   "partId"), &s, NULL) == 0 &&
+                       strcmp(s, "1") == 0,
+                   k == 0 ? "partid: a text-only message's textBody is part \"1\""
+                          : "partid: an html-only message's htmlBody is part \"1\"");
+            s = NULL;
+            EXPECT(bs && jmap_json_str(jmap_json_get(bs, "partId"), &s,
+                                       NULL) == 0 && strcmp(s, "1") == 0,
+                   k == 0 ? "partid: its bodyStructure root is part \"1\" too"
+                          : "partid: its bodyStructure root is part \"1\" too");
+            EXPECT(bv && one && jmap_json_get(bv, "") == NULL &&
+                       jmap_json_str(jmap_json_get(one, "value"), &v,
+                                     NULL) == 0 && strstr(v, want) != NULL,
+                   k == 0 ? "partid: bodyValues is keyed \"1\" with no empty key"
+                          : "partid: html bodyValues is keyed \"1\" with no empty key");
+            jmap_json_free(doc);
+            free(res);
+        }
     }
 }
 
@@ -2874,12 +3244,15 @@ int main(void) {
     cte_tests();
     mime_tree_tests();
     mime_file_part_tests();
+    single_part_file_tests();
     preview_tests();
     blob_id_tests();
     addr_tests();
     ref_tests();
     query_tests();
     email_get_tests();
+    body_part_id_tests();
+    bounded_work_tests();
     patch_tests();
     state_sidecar_tests();
     thread_tests();

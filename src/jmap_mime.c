@@ -270,6 +270,15 @@ int jmapd_tree_build(const char *msg, size_t len, JmapdTree *t) {
     if (imapd_mime_iterate(msg ? msg : "", msg ? len : 0, tree_push, &tb) != 0)
         return -1;
     jmapd_tree_classify(t);
+    /* The walker names the ROOT part "" (the whole message).  For a multipart
+       container that is the right name, but for a SINGLE-part message the root
+       IS the body part, and RFC 8621 4.1.1 numbers it "1" (Fastmail says "1"
+       too).  An empty partId is also unusable as a client cache key: the mail
+       client interns body rows by partId and its datalog engine refuses to
+       intern "".  Only that one case is renamed; multipart numbering
+       ("" for the container, "1.1"/"1.2"/... below it) is untouched. */
+    if (t->nparts == 1 && !t->parts[0].info.multipart)
+        strcpy(t->parts[0].info.id, "1");
     return 0;
 }
 
@@ -684,6 +693,24 @@ int jmapd_file_part(int fd, uint64_t filesize, const char *part_id,
 
     if (fd < 0 || !part_id || !out) return -1;
     he = file_hdr_end(fd, cs, ce);
+    /* A single-part message's body part is "1" and it IS the whole message
+       (RFC 8621 4.1.1 — the name jmapd_tree_build gives it), so a blobId
+       built from that partId must resolve here.  In a multipart message "1"
+       is the first child, which the walk below resolves.  "" keeps naming
+       the whole message in either case, so a blobId minted before this
+       naming rule still downloads. */
+    if (strcmp(part_id, "1") == 0) {
+        char ct[1024], type[64], sub[64], boundary[512];
+        char *h = NULL;
+        size_t hl = 0;
+        if (file_read_span(fd, cs, he, &h, &hl) != 0) return -1;
+        if (mail_header_get(h, hl, "Content-Type", ct, sizeof ct) != 0)
+            strcpy(ct, "text/plain");
+        imapd_mime_ct_parse(ct, type, sizeof type, sub, sizeof sub, boundary,
+                            sizeof boundary);
+        free(h);
+        if (strcasecmp(type, "multipart") != 0) part_id = "";
+    }
     /* Walk one level per dotted component. */
     while (part_id[k] != '\0') {
         /* parse this container's Content-Type */

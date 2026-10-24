@@ -417,6 +417,10 @@ static void config_defaults(JmapdConfig *cfg) {
     cfg->submit_wait = (uint32_t)env_num("JMAPD_SUBMIT_WAIT",
                                          JMAPD_SUBMIT_DEFAULT_WAIT);
     cfg->cmd_tmo = (uint32_t)env_num("JMAPD_TMO", JMAPD_DEFAULT_TMO);
+    cfg->text_scan_max = (size_t)env_num("JMAPD_TEXT_SCAN_MAX",
+                                         JMAPD_TEXT_SCAN_MAX);
+    cfg->get_body_budget = (size_t)env_num("JMAPD_GET_BODY_BUDGET",
+                                           JMAPD_GET_BODY_BUDGET);
 }
 
 static const char *find_arg(int argc, char **argv, const char *name) {
@@ -474,6 +478,20 @@ static int config_from_args(JmapdConfig *cfg, int argc, char **argv) {
         if (*end != '\0') return -1;
         cfg->cmd_tmo = (uint32_t)n;
     }
+    if ((v = find_arg(argc, argv, "--text-scan-max"))) {
+        unsigned long n;
+        char *end;
+        n = strtoul(v, &end, 10);
+        if (*end != '\0' || n == 0) return -1;
+        cfg->text_scan_max = (size_t)n;
+    }
+    if ((v = find_arg(argc, argv, "--get-body-budget"))) {
+        unsigned long n;
+        char *end;
+        n = strtoul(v, &end, 10);
+        if (*end != '\0' || n == 0) return -1;
+        cfg->get_body_budget = (size_t)n;
+    }
     return 0;
 }
 
@@ -497,6 +515,13 @@ static void usage(FILE *f) {
         "  --key PATH           TLS private key PEM (JMAPD_KEY)\n"
         "  --max-request BYTES  request cap (JMAPD_MAX_REQ, default %u)\n"
         "  --timeout SECONDS    idle timeout (JMAPD_TMO, default %u)\n"
+        "  --text-scan-max N    bytes one Email/query `text` scan may read\n"
+        "                       before it answers serverLimit instead of a\n"
+        "                       short list (JMAPD_TEXT_SCAN_MAX, default %u)\n"
+        "  --get-body-budget N  bytes of message bodies one Email/get reply\n"
+        "                       renders; the rest arrive isTruncated rather\n"
+        "                       than failing the request\n"
+        "                       (JMAPD_GET_BODY_BUDGET, default %u)\n"
         "  --outbox-host HOST   submission relay (JMAPD_OUTBOX_HOST, default %s)\n"
         "  --outbox-port N      submission relay port (JMAPD_OUTBOX_PORT, "
         "default %u)\n"
@@ -513,7 +538,9 @@ static void usage(FILE *f) {
         "  --help               show this help and exit\n"
         "  --version            print the version and exit\n",
         IMAPD_DEFAULT_ROOT, (unsigned)JMAPD_DEFAULT_PORT,
-        JMAPD_DEFAULT_MAX_REQ, JMAPD_DEFAULT_TMO, JMAPD_DEFAULT_OUTBOX_HOST,
+        (unsigned)JMAPD_DEFAULT_MAX_REQ, (unsigned)JMAPD_DEFAULT_TMO,
+        (unsigned)JMAPD_TEXT_SCAN_MAX, (unsigned)JMAPD_GET_BODY_BUDGET,
+        JMAPD_DEFAULT_OUTBOX_HOST,
         (unsigned)JMAPD_DEFAULT_OUTBOX_PORT, JMAPD_SUBMIT_DEFAULT_WAIT);
 }
 
@@ -647,10 +674,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("jmapd %s: %s on %s:%u, root %s, max request %u, outbox %s:%u "
-           "(tls %s), identity %s\n",
+    printf("jmapd %s: %s on %s:%u, root %s, max request %u, text scan %llu, "
+           "body budget %llu, outbox %s:%u (tls %s), identity %s\n",
            VISAGE_VERSION, srv.tls_ready ? "https" : "http", cfg.addr,
-           (unsigned)cfg.port, cfg.root, cfg.max_req, cfg.outbox_host,
+           (unsigned)cfg.port, cfg.root, cfg.max_req,
+           (unsigned long long)cfg.text_scan_max,
+           (unsigned long long)cfg.get_body_budget, cfg.outbox_host,
            (unsigned)cfg.outbox_port, cfg.outbox_tls,
            (cfg.identity && cfg.identity[0]) ? cfg.identity : "<user>@<host>");
     fflush(stdout);

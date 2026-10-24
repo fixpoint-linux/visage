@@ -80,10 +80,21 @@ int jmapd_http_respond(Conn *c, int status, const char *ctype,
     if (!body) bodylen = 0;
     if (bodylen > JMAPD_MAX_RESP) {
         /* Never emit an unbounded response: the caller's body is replaced by a
-           small, honest error rather than being truncated mid-JSON. */
+           small, honest error rather than being truncated mid-JSON.  The type
+           is serverLimit, not serverFail: the request was legal and the answer
+           would have been correct, it is the SIZE that is beyond this server,
+           and a client can narrow it (fewer objects, a smaller limit). */
+        char why[192];
+        snprintf(why, sizeof why,
+                 "response of %llu bytes exceeds this server's limit of %u "
+                 "bytes; request fewer objects or a smaller limit",
+                 (unsigned long long)bodylen, (unsigned)JMAPD_MAX_RESP);
+        jmapd_log_conn(c, "response-over-limit", why);
         status = 500;
         ctype = "application/json; charset=utf-8";
-        body = "{\"type\":\"serverFail\",\"description\":\"response too large\"}";
+        body = "{\"type\":\"serverLimit\",\"description\":\"response exceeds "
+               "this server's limit; request fewer objects or a smaller "
+               "limit\"}";
         bodylen = strlen(body);
     }
     n = snprintf(head, sizeof head,

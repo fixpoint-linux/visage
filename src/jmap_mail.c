@@ -1360,15 +1360,51 @@ int jmapd_method_email_get(JmapdCtx *ctx, const JmapJsonNode *args,
     jsonb_begin_array(out);
     {
         int first = 1;
+        /* Bodies are rendered inline, so a page of large messages can outgrow
+           ONE reply (JMAPD_MAX_RESP would then replace the whole answer with an
+           error — measured: a 32k-message archive whose newest page holds big
+           newsletters answered 500 for every page request).  Bound the rendered
+           bytes per response and let the tail of the page arrive TRUNCATED
+           instead: RFC 8621 4.2 says maxBodyValueBytes is a hint the server may
+           undercut, and every cut bodyValue carries isTruncated, so the client
+           sees exactly what it got. */
+        size_t budget = srv->cfg.get_body_budget ? srv->cfg.get_body_budget
+                                                 : JMAPD_GET_BODY_BUDGET;
+        size_t cut = 0;
         for (i = 0; i < nids; i++) {
             char *msg = NULL;
-            size_t msglen = 0;
+            size_t msglen = 0, before;
+            BodyFetch cur = bf;
             if (!want[i].found || !want[i].id[0]) continue;
             (void)jmapd_read_file(srv, want[i].path, want[i].size, &msg, &msglen);
+            if (cur.text || cur.html || cur.all) {
+                size_t client_max = bf.maxbytes ? bf.maxbytes
+                                                : JMAPD_MAX_BODY_VALUE;
+                size_t lim = budget < client_max ? budget : client_max;
+                if (lim < 1) lim = 1;      /* 0 means "server default" to
+                                              jmapd_body_value: never pass 0 */
+                if (lim < client_max) cut++;   /* the RESPONSE cut this body */
+                cur.maxbytes = lim;
+            }
             if (!first) jsonb_comma(out);
             first = 0;
-            write_email(out, srv, &want[i], msg, msglen, &pr, &bf);
+            before = out->len;
+            write_email(out, srv, &want[i], msg, msglen, &pr, &cur);
+            if (out->len > before) {
+                size_t used = out->len - before;
+                budget = used >= budget ? 0 : budget - used;
+            }
             free(msg);
+        }
+        if (cut) {
+            char why[160];
+            snprintf(why, sizeof why,
+                     "method=Email/get budget=%llu objects=%llu truncated",
+                     (unsigned long long)(srv->cfg.get_body_budget
+                                              ? srv->cfg.get_body_budget
+                                              : JMAPD_GET_BODY_BUDGET),
+                     (unsigned long long)cut);
+            jmapd_log_ctx(ctx, "get-truncated", why);
         }
     }
     jsonb_end_array(out);

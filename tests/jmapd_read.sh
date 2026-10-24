@@ -289,7 +289,30 @@ st, resp = call({"using": [CORE, MAIL], "methodCalls": [
                    "fetchTextBodyValues": True}, "g0"]]})
 qp = resp["methodResponses"][0][1]["list"][0]
 # a single-part body runs to EOF, so its trailing CRLF is part of the body
+assert qp["textBody"][0]["partId"] == "1", qp["textBody"]
 assert qp["bodyValues"][qp["textBody"][0]["partId"]]["value"] == "qp body line\r\n", qp
+
+# --- a SINGLE-PART message: part "1", never "" -------------------------
+# The client caches body rows BY partId and its datalog engine refuses to
+# intern the empty string, so an empty partId makes its whole cache write fail
+# and the mailbox cannot be listed.  RFC 8621 4.1.1 numbers the part "1".
+st, resp = call({"using": [CORE, MAIL], "methodCalls": [
+    ["Email/get", {"ids": [desc_ids[1]], "properties":
+                   ["id", "textBody", "htmlBody", "bodyStructure", "attachments"],
+                   "fetchTextBodyValues": True, "fetchHTMLBodyValues": True},
+     "g0"]]})
+one = resp["methodResponses"][0][1]["list"][0]
+assert one["textBody"][0]["partId"] == "1", one["textBody"]
+assert one["bodyStructure"]["partId"] == "1", one["bodyStructure"]
+assert one["bodyValues"] == {"1": one["bodyValues"]["1"]}, one["bodyValues"]
+assert "" not in one["bodyValues"], one["bodyValues"]
+assert one["bodyValues"]["1"]["value"] == "plain body line\r\n", one["bodyValues"]
+assert one["htmlBody"] == [] and one["attachments"] == [], one
+# the blobId minted from part "1" downloads the whole message's body: the
+# resolver must accept the id the response just named
+st, body, hdrs = http_get(f"/download/alice/{one['textBody'][0]['blobId']}/one.txt")
+assert st == 200 and body == b"plain body line\r\n", (st, body)
+assert hdrs.get("Content-Type", "").startswith("text/plain"), hdrs
 
 # --- download: the DECODED bytes of the attachment part ---
 blob = att[0]["blobId"]
@@ -311,6 +334,7 @@ assert hdrs.get("Content-Type", "").startswith("text/plain"), hdrs
 # --- the 12 MiB part: a bounded, flagged response rather than OOM ---
 big = by_id[desc_ids[0]]
 bigpart = big["textBody"][0]["partId"]
+assert bigpart == "1", big["textBody"]        # single-part message: part "1"
 assert big["size"] > 12582912, big["size"]
 assert big["bodyValues"][bigpart]["isTruncated"] is True, "the 12 MiB body must be truncated"
 assert len(big["bodyValues"][bigpart]["value"].encode()) == 1048576, "maxBodyValueBytes is exact"

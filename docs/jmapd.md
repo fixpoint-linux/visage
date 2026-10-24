@@ -32,8 +32,8 @@ Three capabilities, advertised in the session document and required in
 | --- | --- |
 | `Mailbox/get` | yes (no `Mailbox/set`) |
 | `Identity/get` | yes (no `Identity/set`) |
-| `Email/query` | yes — filters `inMailbox`, `text`, `from`, `to`, `subject`; sort `receivedAt` asc/desc (the only advertised sort option); exact `total`, paged `ids` (`position` + `limit`, window capped at 8192). Any other filter condition answers the RFC-legal `unsupportedFilter` method error rather than being silently ignored, and any other sort property answers `unsupportedSort` |
-| `Email/get` | yes — full property set, `bodyValues` with `fetchTextBodyValues` / `fetchHTMLBodyValues` / `maxBodyValueBytes`, `bodyStructure`, `attachments`, `preview` |
+| `Email/query` | yes — filters `inMailbox`, `text`, `from`, `to`, `subject`; sort `receivedAt` asc/desc (the only advertised sort option); exact `total`, paged `ids` (`position` + `limit`, window capped at 32768 so a whole 32k mailbox pages to its tail). Any other filter condition answers the RFC-legal `unsupportedFilter` method error rather than being silently ignored, and any other sort property answers `unsupportedSort`. Bounded work answers a **typed, described** error — see [Bounded work](#bounded-work) |
+| `Email/get` | yes — full property set, `bodyValues` with `fetchTextBodyValues` / `fetchHTMLBodyValues` / `maxBodyValueBytes`, `bodyStructure`, `attachments`, `preview`. Bodies past the per-response body budget arrive `isTruncated` instead of failing the request |
 | `Email/set` | yes — `create` (drafts), `update` (RFC 8620 3.3 patch objects: `keywords/$x`, `mailboxIds/<id>`, null-deletes), `destroy`; `ifInState` enforced |
 | `Thread/get` | yes |
 | `Email/changes`, `Mailbox/changes`, `Thread/changes`, `Email/queryChanges` | RFC-legal `cannotCalculateChanges` — see [v1 limitations](#v1-limitations) |
@@ -134,7 +134,11 @@ method's response (`Email/set`, `EmailSubmission/set`), and `Email/set` answers
   payloads (`g` + b64(`../../etc/passwd`) + …) answer `404`, and
   `tests/jmapd_read.sh` sends exactly that.
 - **Bounded everything.** 4 MiB request cap (`--max-request`), 16 MiB response
-  cap, 256 KiB per-connection output backlog with `POLLIN` backpressure, 512
+  cap and an 8 MiB body budget per `Email/get` (`--get-body-budget`), a 512 MiB
+  `text` scan budget (`--text-scan-max`) and a 32768-entry query window — each
+  of the last three answered with a described typed error rather than a short
+  result (see [Bounded work](#bounded-work)), 256 KiB per-connection output
+  backlog with `POLLIN` backpressure, 512
   connections / 16 per IP, 100 requests per keep-alive connection, JSON depth
   cap 32, 32 calls and 256 objects per request, 16 recipients and an 8-job /
   8 MiB submission queue (the 8 MiB is the send limit for ONE message — the
@@ -185,6 +189,10 @@ jmapd [options]
                        default <user>@<hostname>)
   --max-request BYTES  request cap (JMAPD_MAX_REQ, default 4 MiB)
   --timeout SECONDS    idle timeout (JMAPD_TMO, default 300)
+  --text-scan-max N    bytes one Email/query `text` scan may read before it
+                       answers serverLimit (JMAPD_TEXT_SCAN_MAX, default 512 MiB)
+  --get-body-budget N  bytes of bodies one Email/get reply renders; the rest
+                       arrive isTruncated (JMAPD_GET_BODY_BUDGET, default 8 MiB)
   --outbox-host/--outbox-port   submission relay (default 127.0.0.1:465)
   --outbox-user/--outbox-pass   submission AUTH PLAIN credential
   --outbox-tls MODE    implicit (default), starttls, starttls-verify, none
@@ -258,6 +266,38 @@ consequences of the design, not defects, and neither is fixed in v1:
    costs uid churn only — JMAP ids never contain a uid — but an IMAP client may
    see `UIDVALIDITY`/uid numbers move after a JMAP-side change.
 
+## Bounded work
+
+`jmapd` serves one poll loop, so no single request may run for minutes. Every
+path whose cost is a function of mailbox size is bounded, and **a bound is
+answered, never silently applied** — the failure this section exists to prevent
+is an empty list standing in for "we could not ask", which a client renders as
+"no mail here":
+
+| Bound | Default | Over budget |
+| --- | --- | --- |
+| `Email/query` `text` scan (whole-message reads) | 512 MiB (`--text-scan-max`, `JMAPD_TEXT_SCAN_MAX`) | `serverLimit` + description naming the budget, plus a `query-over-budget` journal line |
+| `Email/query` paging window (`position` + `limit`) | 32768 entries | `serverLimit` + description, `query-over-window` journal line |
+| `Email/get` rendered bodies per response | 8 MiB (`--get-body-budget`, `JMAPD_GET_BODY_BUDGET`) | the remaining bodies are **truncated** (`isTruncated` per `bodyValue`), the page is still served, `get-truncated` journal line |
+| One response, all methods | 16 MiB (`JMAPD_MAX_RESP`) | `serverLimit` + description, `response-over-limit` journal line |
+| A mailbox or message that cannot be read | — | `serverFail` + description, `query-unreadable-mailbox` / `query-unreadable-message` journal line |
+
+`serverLimit` is the RFC 8620 3.6.2 type for "the work this request asks for is
+beyond this server": the request was legal and the answer would have been
+correct, so the client can narrow it (a mailbox scope, a smaller page) and
+retry. The body budget is the one place a bound is applied rather than
+answered, because RFC 8621 4.2 already defines the honest form for it —
+`maxBodyValueBytes` is a hint the server may undercut, and each cut `bodyValue`
+says `isTruncated`.
+
+Sizing: the `text` filter reads one whole message per candidate, so the default
+budget is about a 32k-message archive averaging 16 KiB (measured: 208 MiB of
+30,000 messages scans in 0.8 s warm). A bigger archive wants a bigger flag or a
+mailbox scope; the bound exists so a 100k-message mailbox cannot stall every
+other connection for a minute. `tests/jmapd_scale.sh` is the gate: a synthetic
+30,000-message archive, its newest page too big for one reply, its text search
+run both inside and outside the budget.
+
 ## v1 limitations
 
 Named, because a client acts on them:
@@ -297,7 +337,7 @@ Named, because a client acts on them:
 
 ## Gates
 
-Unit checks (pure, no sockets) and five host end-to-end scripts. The end-to-end
+Unit checks (pure, no sockets) and six host end-to-end scripts. The end-to-end
 scripts need live sockets; run them on the host, not in a sandbox.
 
 ```sh
@@ -314,6 +354,10 @@ scripts need live sockets; run them on the host, not in a sandbox.
 ./tests/jmapd_write.sh          # flag/move/destroy, id stability, ifInState,
                                 # Thread/get
 ./tests/jmapd_submit.sh         # EmailSubmission/set against a recording SMTP sink
+./tests/jmapd_scale.sh          # 30,000-message archive: exact total/paging, a
+                                # ~20 MiB page served isTruncated (not 500), a
+                                # global text search that finds the term, and a
+                                # typed+described+journaled refusal over budget
 ./tests/jmapd_hub.sh            # THE ACCEPTANCE TEST: builds the real mail-hub
                                 # client (MAIL_HUB_DIR, default /home/jaye/email)
                                 # and drives its own API at jmapd: list, fetch
@@ -322,7 +366,7 @@ scripts need live sockets; run them on the host, not in a sandbox.
 
 Each script exits non-zero on the first failed assertion and prints
 `<name>: all checks passed` on success; `jmap_check.com` prints
-`N checks, 0 failed`. `dhake e2e` runs all five along with the rest of the host
+`N checks, 0 failed`. `dhake e2e` runs all six along with the rest of the host
 suite.
 
 Pins: after changing a source file, rebuild with

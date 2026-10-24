@@ -61,6 +61,24 @@ void jmapd_jb_method_error(JsonBuilder *b, const char *type) {
     jsonb_end_object(b);
 }
 
+/* The same object with the RFC's optional `description`.  Every refusal this
+   server raises because the WORK was too big (not because the request was
+   wrong) uses this: a bare {"type":"serverFail"} is what a client can only
+   report as an internal error, which is how a bounded scan turned into a
+   silent empty list. */
+void jmapd_jb_method_error_desc(JsonBuilder *b, const char *type,
+                                const char *desc) {
+    jsonb_begin_object(b);
+    jsonb_key(b, "type");
+    jsonb_str(b, type);
+    if (desc && desc[0]) {
+        jsonb_comma(b);
+        jsonb_key(b, "description");
+        jsonb_str(b, desc);
+    }
+    jsonb_end_object(b);
+}
+
 /* ------------------------------------------------------------------ */
 /* Session tracing                                                     */
 /* ------------------------------------------------------------------ */
@@ -78,6 +96,27 @@ void jmapd_log(const JmapdConn *c, const char *event, const char *user,
             (unsigned)c->c.id, ip, (user && user[0]) ? user : "-",
             detail ? " " : "", detail ? detail : "");
     fflush(stderr);
+}
+
+void jmapd_log_ctx(const JmapdCtx *ctx, const char *event, const char *detail) {
+    if (ctx && ctx->conn) {
+        jmapd_log(ctx->conn, event, ctx->user, detail);
+        return;
+    }
+    /* No connection (a method driven directly): the line still has to exist —
+       a refusal nobody can find in the journal is the failure this whole path
+       exists to prevent. */
+    fprintf(stderr, "jmapd %s user=%s%s%s\n", event,
+            (ctx && ctx->user && ctx->user[0]) ? ctx->user : "-",
+            detail ? " " : "", detail ? detail : "");
+    fflush(stderr);
+}
+
+void jmapd_log_conn(const Conn *c, const char *event, const char *detail) {
+    /* Conn is the FIRST member of JmapdConn (jmapd.h:186): every Conn* this
+       daemon hands to the HTTP layer points at the embedded one. */
+    const JmapdConn *jc = (const JmapdConn *)(const void *)c;
+    jmapd_log(jc, event, c->user, detail);
 }
 
 /* ------------------------------------------------------------------ */
@@ -662,8 +701,9 @@ static int request_error(const char *type, char **out, size_t *outlen) {
     return 0;
 }
 
-static int api_call(JmapdServer *srv, const char *user, const char *body,
-                    size_t bodylen, int *status, char **out, size_t *outlen) {
+static int api_call(JmapdServer *srv, const JmapdConn *conn, const char *user,
+                    const char *body, size_t bodylen, int *status, char **out,
+                    size_t *outlen) {
     JmapJsonErr jerr = JMAP_JSON_OK;
     JmapJsonDoc *doc;
     const JmapJsonNode *root, *calls, *using;
@@ -757,6 +797,7 @@ static int api_call(JmapdServer *srv, const char *user, const char *body,
         jsonb_init(&rb);
         ctx.srv = srv;
         ctx.user = user;
+        ctx.conn = conn;
         ctx.prev = prev;
         ctx.nprev = i;
         ctx.argerr = NULL;
@@ -866,6 +907,6 @@ int jmapd_core_handle(JmapdServer *srv, JmapdConn *c, const JmapdHttpReq *req,
 
     /* GET /.well-known/jmap (and /jmap/session): the session resource. */
     if (!path_is(req, "/jmap/session") && !path_is(req, "/.well-known/jmap"))
-        return api_call(srv, c->c.user, body, bodylen, status, out, outlen);
+        return api_call(srv, c, c->c.user, body, bodylen, status, out, outlen);
     return jmapd_session_render(&srv->cfg, c->c.user, out, outlen) == 0 ? 0 : -1;
 }

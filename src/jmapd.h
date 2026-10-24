@@ -64,7 +64,30 @@
    position), and the `text` filter's raw-byte scan is charged against a
    per-request budget so one query cannot hold the poll loop for a minute. */
 #define JMAPD_QUERY_DEFAULT_LIMIT 256
-#define JMAPD_TEXT_SCAN_MAX       (128u * 1024u * 1024u)
+/* Bounded page window (position + limit): the query keeps the first
+   position+limit matches in a heap, so this bounds one query's memory.  It has
+   to cover a whole large mailbox — a 32k archive whose tail page is
+   position 32000 is otherwise unpageable, and an 8k cap refused exactly that
+   (measured on the live 32,107-message Archive).  32768 entries is ~34 MiB of
+   heap, and the poll loop is synchronous, so only ONE query heap exists at a
+   time.  Deeper paging is still refused, with a described serverLimit. */
+#define JMAPD_QUERY_MAX_WINDOW    32768
+/* Default for --text-scan-max: the `text` filter reads whole messages, so one
+   query over a large archive would hold the poll loop for minutes.  The scan is
+   charged against this budget and an exhausted budget is answered with a typed
+   serverLimit carrying a description — never a silently short result set.
+   Sizing: the filter costs one whole-message read per candidate, so 512 MiB is
+   about a 32k-message archive averaging 16 KiB (measured: 208 MiB of 30k
+   messages scans in 0.8 s warm).  Bigger archives want a bigger flag or a
+   mailbox scope; the bound exists so a 100k-message mailbox cannot stall every
+   other connection for a minute. */
+#define JMAPD_TEXT_SCAN_MAX       (512u * 1024u * 1024u)
+/* Email/get renders every requested body inline, so a page of large messages
+   can outgrow one reply.  Past this many rendered bytes the remaining bodies
+   are TRUNCATED (RFC 8621 4.2 allows it; each bodyValue says isTruncated)
+   instead of the whole request failing on JMAPD_MAX_RESP — that failure is
+   what made a 32k-message archive unqueryable: its newest page is big. */
+#define JMAPD_GET_BODY_BUDGET     (8u * 1024u * 1024u)
 /* Hard cap on one streamed blob (decoded bytes).  A message is already capped
    by IMAPD_DEFAULT_MAX_MSG; this bounds the SERVED part independently. */
 #define JMAPD_MAX_BLOB_BYTES      (64u * 1024u * 1024u)
@@ -128,6 +151,10 @@ typedef struct JmapdConfig {
     const char *identity;     /* own address (JMAPD_IDENTITY, "" = derive) */
     uint32_t    submit_wait;  /* ms to wait for a submission's outcome */
     uint32_t    cmd_tmo;      /* idle timeout, seconds                */
+    size_t      text_scan_max;/* Email/query `text` scan budget in bytes
+                                 (JMAPD_TEXT_SCAN_MAX; 0 = the default) */
+    size_t      get_body_budget;/* Email/get rendered-body budget in bytes
+                                 (JMAPD_GET_BODY_BUDGET; 0 = the default) */
 } JmapdConfig;
 
 /* ------------------------------------------------------------------ */
@@ -373,12 +400,19 @@ int jmapd_envelope_render(const char *msg, size_t msglen, const char *identity,
 /* jmapd.c */
 void jmapd_log(const JmapdConn *c, const char *event, const char *user,
                const char *detail);
+/* jmap_core.c: the same journal line from an HTTP-level path, which only has
+   the embedded Conn* (Conn is the FIRST member of JmapdConn — jmapd.h:186). */
+void jmapd_log_conn(const Conn *c, const char *event, const char *detail);
 
 /* jmap_core.c response-builder helpers: json.c's builder has no literal/null
    emitter, and every JMAP object needs one (parentId, role, replyTo, ...). */
 void jmapd_jb_lit(JsonBuilder *b, const char *lit);
 void jmapd_jb_u64(JsonBuilder *b, uint64_t v);
 void jmapd_jb_method_error(JsonBuilder *b, const char *type);
+/* A method error that also carries `description` (RFC 8620 3.6.1), which is
+   what tells a client "too expensive" apart from "broken". */
+void jmapd_jb_method_error_desc(JsonBuilder *b, const char *type,
+                                const char *desc);
 
 /* jmapd_http.c: buffer bytes into c and dispatch every complete request.
    Appends the response(s) to c->out; sets c->c.closed when the connection
@@ -424,6 +458,11 @@ typedef struct JmapdCtx {
     /* Set by jmapd_arg when a back-reference could not be resolved; the
        method must answer this method-level error instead of its result. */
     const char          *argerr;
+    /* The connection this request arrived on, for the journal line an
+       over-budget refusal must leave behind.  NULL when a method is driven
+       directly (jmap_check.c): the log helper then writes the line without a
+       peer/session field rather than dereferencing it. */
+    const JmapdConn     *conn;
 } JmapdCtx;
 
 /* Method handlers (jmap_core.c dispatch table).  Each writes the method's
@@ -431,6 +470,12 @@ typedef struct JmapdCtx {
    method-level error is a result object of the form {"type":...}. */
 typedef int (*JmapdMethodFn)(JmapdCtx *ctx, const JmapJsonNode *args,
                              JsonBuilder *out);
+
+/* jmap_core.c: journal one line for a refusal raised inside a METHOD handler.
+   With ctx->conn set this is the ordinary session line; without one (a method
+   driven directly by jmap_check.c) it still writes the line, so a refusal is
+   never silent in either path. */
+void jmapd_log_ctx(const JmapdCtx *ctx, const char *event, const char *detail);
 
 /* Look one argument up, following a "#name" back-reference.  Returns the
    argument node (which may live in an earlier result's document — it is valid
