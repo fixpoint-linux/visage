@@ -96,12 +96,21 @@ printf 'From: alice@example.com\r\nTo: zoe@example.com\r\nSubject: sent one\r\nM
     printf '\r\n'
 } > "$ROOT/alice/Inbox/cur/1700000400.E.host:2,S"
 
+# ---- F: 8-bit bytes that are NOT UTF-8, in the Subject and in the body ----
+# An ISO-8859-1 header and a raw 8-bit body, both of which jmapd copies through
+# verbatim (charset conversion is out of scope).  Seeded in its OWN mailbox so
+# the Inbox assertions above keep their exact counts.
+mkdir -p "$ROOT/alice/.Odd/tmp" "$ROOT/alice/.Odd/new" "$ROOT/alice/.Odd/cur"
+printf 'From: bob@example.com\r\nTo: alice@example.com\r\nSubject: bad \xae byte\r\nMessage-ID: <f1@example.com>\r\nContent-Type: text/plain; charset=us-ascii\r\n\r\nbody \xae and \xff here\r\n' \
+    > "$ROOT/alice/.Odd/cur/1700000500.F.host:2,S"
+
 # fixed mtimes so receivedAt ordering is deterministic (maildir INTERNALDATE)
 touch -d @1700000100 "$ROOT/alice/Inbox/cur/1700000100.A.host:2,S"
 touch -d @1700000200 "$ROOT/alice/Inbox/new/1700000200.B.host"
 touch -d @1700000050 "$ROOT/alice/Inbox/cur/1700000050.C.host:2,S"
 touch -d @1700000300 "$ROOT/alice/.Sent/cur/1700000300.D.host:2,S"
 touch -d @1700000400 "$ROOT/alice/Inbox/cur/1700000400.E.host:2,S"
+touch -d @1700000500 "$ROOT/alice/.Odd/cur/1700000500.F.host:2,S"
 
 DAEMONS=()
 FAILS=0
@@ -448,6 +457,107 @@ assert head.startswith(b"HTTP/1.1 200"), head[:60]
 assert b"apiUrl" in body3, body3[:80]
 s.close()
 PYEOF
+
+# ======================================================================
+# (4) every emitted string is valid UTF-8, and a stale sinceState is REFUSED
+# ======================================================================
+# MEASURED (live): a 100-message page over the real Inbox was 1,740,593 bytes
+# and NOT valid UTF-8 (0xAE at offset 206223).  A conforming client refuses the
+# WHOLE response, so one 8-bit byte in one body froze the mailbox list.  The
+# instrument below is that client's: decode the body as UTF-8, then parse it.
+#
+# And /changes: the store keeps no per-object change log, so the honest answer
+# is the RFC 8620 5.2 method error.  An EMPTY diff is what makes a client
+# conclude "nothing changed" and never refresh, so an empty list is refused
+# here — with one journal line saying which state was refused and why.
+python3 - "$PORT_A" <<'PYEOF' && pass "utf8: every emitted string is valid UTF-8, with U+FFFD for 8-bit bytes" \
+                           || fail "utf8: every emitted string is valid UTF-8, with U+FFFD for 8-bit bytes"
+import base64, json, sys, urllib.request
+
+port = int(sys.argv[1])
+base = f"http://127.0.0.1:{port}"
+auth = "Basic " + base64.b64encode(b"alice:waldorf").decode()
+CORE = "urn:ietf:params:jmap:core"
+MAIL = "urn:ietf:params:jmap:mail"
+
+
+def raw_call(payload):
+    req = urllib.request.Request(base + "/api", data=json.dumps(payload).encode())
+    req.add_header("Authorization", auth)
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read()
+
+
+def call(payload):
+    raw = raw_call(payload)
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise AssertionError(f"the response is not valid UTF-8: {e}")
+    return json.loads(raw)
+
+
+# --- the 8-bit message, found through its own mailbox ---
+mbs = call({"using": [CORE, MAIL], "methodCalls": [["Mailbox/get", {}, "m0"]]})
+odd = [m for m in mbs["methodResponses"][0][1]["list"] if m["name"] == "Odd"][0]
+q = call({"using": [CORE, MAIL], "methodCalls": [
+    ["Email/query", {"filter": {"inMailbox": odd["id"]}}, "q0"]]})
+ids = q["methodResponses"][0][1]["ids"]
+assert len(ids) == 1, q
+
+raw = raw_call({"using": [CORE, MAIL], "methodCalls": [
+    ["Email/get", {"ids": ids, "properties": ["id", "subject", "textBody"],
+                   "fetchTextBodyValues": True}, "g0"]]})
+try:
+    text = raw.decode("utf-8")
+except UnicodeDecodeError as e:
+    raise AssertionError(f"Email/get over an 8-bit message is not valid UTF-8 "
+                         f"({e}) — a client refuses the whole page")
+assert b"\xae" not in raw and b"\xff" not in raw, "a raw 8-bit byte survived"
+e = json.loads(text)["methodResponses"][0][1]["list"][0]
+assert e["subject"] == "bad \ufffd byte", repr(e["subject"])
+bv = e["bodyValues"][e["textBody"][0]["partId"]]["value"]
+assert bv == "body \ufffd and \ufffd here\r\n", repr(bv)
+print("utf8: subject and body carry U+FFFD")
+PYEOF
+
+check "$([ "$(grep -c 'utf8-replaced' "$TMP/a.log")" = 1 ] && echo 0 || echo 1)" \
+    "utf8: ONE counted journal line for the response that needed it"
+check "$(grep -q 'utf8-replaced .*count=3' "$TMP/a.log" && echo 0 || echo 1)" \
+    "utf8: the line names how many substitutions were made"
+
+python3 - "$PORT_A" <<'PYEOF' && pass "changes: a sinceState that cannot be diffed is REFUSED, not answered empty" \
+                           || fail "changes: a sinceState that cannot be diffed is REFUSED, not answered empty"
+import base64, json, sys, urllib.request
+
+port = int(sys.argv[1])
+base = f"http://127.0.0.1:{port}"
+auth = "Basic " + base64.b64encode(b"alice:waldorf").decode()
+CORE = "urn:ietf:params:jmap:core"
+MAIL = "urn:ietf:params:jmap:mail"
+
+for method, arg in (("Email/changes", "sinceState"),
+                    ("Mailbox/changes", "sinceState"),
+                    ("Thread/changes", "sinceState"),
+                    ("Email/queryChanges", "sinceQueryState")):
+    payload = {"using": [CORE, MAIL], "methodCalls": [
+        [method, {"accountId": "alice", arg: "e10"}, "c0"]]}
+    req = urllib.request.Request(base + "/api", data=json.dumps(payload).encode())
+    req.add_header("Authorization", auth)
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=60) as r:
+        assert r.status == 200, (method, r.status)
+        res = json.loads(r.read())["methodResponses"][0][1]
+    assert res.get("type") == "cannotCalculateChanges", (method, res)
+    # an empty diff is the answer that makes a client believe nothing changed
+    assert "created" not in res and "updated" not in res, (method, res)
+print("changes: four methods refused, no empty diff")
+PYEOF
+
+check "$(grep -q 'changes-refused .*method=Email/changes sinceState=e10' "$TMP/a.log" \
+        && echo 0 || echo 1)" \
+    "changes: the refusal is in the journal, naming the method and the state"
 
 echo
 if [ "$FAILS" = 0 ]; then

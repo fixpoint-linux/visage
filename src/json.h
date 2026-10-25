@@ -11,8 +11,24 @@
 
 /* Escape `s` (len bytes, which may include NULs) as a JSON string body (no
  * surrounding quotes) into out[0..outsz).  Always NUL-terminates.  Returns 0
- * on success, -1 if out is too small or an argument is NULL. */
-int json_escape(const char *s, size_t len, char *out, size_t outsz);
+ * on success, -1 if out is too small or an argument is NULL.
+ *
+ * A byte that is not part of a valid UTF-8 sequence is emitted as U+FFFD
+ * (EF BF BD), never verbatim: RFC 8259 8.1 defines a JSON string as Unicode
+ * text, so one raw 8-bit byte from a mail header or body makes the whole
+ * document unparseable for a conforming client.  `replaced`, when non-NULL,
+ * receives the number of substitutions this call made. */
+int json_escape(const char *s, size_t len, char *out, size_t outsz,
+                size_t *replaced);
+
+/* U+FFFD substitutions made since the last json_utf8_reset().  jmapd renders
+ * one response through several builders (a method's own buffer, then the
+ * request's), so the count is process-global rather than per-builder: the
+ * request layer resets it before rendering and logs ONE line from it after.
+ * jmapd is one thread (jmapd.c: a single poll() loop), which is what makes a
+ * plain counter the whole mechanism. */
+void   json_utf8_reset(void);
+size_t json_utf8_replacements(void);
 
 /* A tiny JSON object/array builder into a heap buffer.  Errors are sticky in
  * b->err; check jsonb_detach's return. */

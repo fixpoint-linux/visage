@@ -273,8 +273,8 @@ static int cmd_alias(const Config *cfg, const char *alias, const char *dest, int
     char ea[512], ed[512];
     int bn, st;
 
-    if (json_escape(alias, strlen(alias), ea, sizeof ea) != 0 ||
-        json_escape(dest, strlen(dest), ed, sizeof ed) != 0) {
+    if (json_escape(alias, strlen(alias), ea, sizeof ea, NULL) != 0 ||
+        json_escape(dest, strlen(dest), ed, sizeof ed, NULL) != 0) {
         fprintf(stderr, "visage: address too long\n");
         return 1;
     }

@@ -304,7 +304,11 @@ Named, because a client acts on them:
 
 - **`cannotCalculateChanges`** on `Email/changes`, `Mailbox/changes`,
   `Thread/changes` and `Email/queryChanges`: there is no per-object change log
-  to diff against, and an invented diff is worse than an honest refusal. The
+  to diff against, and an invented diff is worse than an honest refusal. An
+  empty diff is never answered — a client reads one as "nothing changed" and
+  stops refreshing. Each refusal is journaled
+  (`changes-refused method=… sinceState=… reason=no-log`), so a client's
+  refresh cadence is explainable from the log. The
   mail-hub client's response is a **full refresh**, and since it polls
   `/api/sync` every 60 s, that means a `Mailbox/get` + `Email/query` +
   `Email/get` **with bodies** every 60 s. Fine for a personal mailbox on a LAN,
@@ -334,6 +338,17 @@ Named, because a client acts on them:
 - **Charset passthrough.** `bodyValues` are transfer-decoded but not
   transcoded, and an unknown `Content-Transfer-Encoding` sets
   `isEncodingProblem` rather than being guessed at.
+- **Bytes that are not UTF-8 are replaced, not transcoded.** A JSON string is
+  Unicode text (RFC 8259 8.1), so a header or body carrying 8-bit bytes is a
+  byte sequence no client can parse — one such byte in one message used to make
+  a whole 100-message page unreadable (measured: 1,740,593 bytes refused at
+  0xAE). Every string the server emits is now valid UTF-8: an ill-formed byte
+  becomes U+FFFD at the JSON boundary, and a response that needed it logs one
+  `utf8-replaced count=N` line. This is not a fix for the charset — it is the
+  honest representation of bytes that are not text. Note that
+  `isEncodingProblem` is a per-`bodyValue` flag about the
+  `Content-Transfer-Encoding` and is NOT set by a replacement; a client that
+  needs to know a body was altered must compare it with the source message.
 
 ## Gates
 

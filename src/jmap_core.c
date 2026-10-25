@@ -775,6 +775,10 @@ static int api_call(JmapdServer *srv, const JmapdConn *conn, const char *user,
     jsonb_begin_object(&b);
     jsonb_key(&b, "methodResponses");
     jsonb_begin_array(&b);
+    /* The replacement count is per RESPONSE, not per string: a mail body with
+       unrepresentable bytes must produce one log line naming the count, not one
+       line per byte (json.c). */
+    json_utf8_reset();
     memset(prev, 0, sizeof prev);
     for (i = 0; i < ncalls; i++) {
         const JmapJsonNode *call = jmap_json_at(calls, i);
@@ -845,6 +849,16 @@ static int api_call(JmapdServer *srv, const JmapdConn *conn, const char *user,
     }
     jsonb_str(&b, state);
     jsonb_end_object(&b);
+
+    /* ONE line per response that needed it.  The alternative — a silent
+       substitution — leaves an operator reading a body that differs from the
+       message on disk with nothing in the journal to explain it. */
+    if (json_utf8_replacements() > 0) {
+        char detail[64];
+        snprintf(detail, sizeof detail, "count=%llu",
+                 (unsigned long long)json_utf8_replacements());
+        jmapd_log(conn, "utf8-replaced", user, detail);
+    }
 
     jmap_json_free(doc);
     for (i = 0; i < ncalls; i++) {

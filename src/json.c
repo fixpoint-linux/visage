@@ -4,8 +4,63 @@
 #include <string.h>
 #include <stdio.h>
 
-int json_escape(const char *s, size_t len, char *out, size_t outsz) {
-    size_t i, o = 0;
+/* U+FFFD in UTF-8: what an unrepresentable byte becomes (see json.h). */
+static const char utf8_replacement[3] = { '\xEF', '\xBF', '\xBD' };
+
+static size_t utf8_replaced = 0;
+
+void json_utf8_reset(void) { utf8_replaced = 0; }
+size_t json_utf8_replacements(void) { return utf8_replaced; }
+
+/* Length of the well-formed UTF-8 sequence at p (avail bytes available), or 0
+   when p does not start one.  Overlong forms, surrogates and anything above
+   U+10FFFF are rejected: each is as unrepresentable in JSON text as a raw
+   0xAE, so each is replaced rather than copied. */
+static size_t utf8_seq(const unsigned char *p, size_t avail) {
+    unsigned char c0 = p[0];
+    size_t n, i;
+    unsigned cp;
+
+    if (c0 < 0x80) return 1;
+    if (c0 >= 0xC2 && c0 <= 0xDF) { n = 2; cp = c0 & 0x1F; }
+    else if (c0 >= 0xE0 && c0 <= 0xEF) { n = 3; cp = c0 & 0x0F; }
+    else if (c0 >= 0xF0 && c0 <= 0xF4) { n = 4; cp = c0 & 0x07; }
+    else return 0;
+    if (avail < n) return 0;
+    for (i = 1; i < n; i++) {
+        unsigned char c = p[i];
+        if ((c & 0xC0) != 0x80) return 0;
+        cp = (cp << 6) | (c & 0x3F);
+    }
+    if (n == 3 && (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF))) return 0;
+    if (n == 4 && (cp < 0x10000 || cp > 0x10FFFF)) return 0;
+    return n;
+}
+
+/* How many bytes ONE ill-formed subpart starting at p consumes, so it becomes
+   ONE U+FFFD: the lead byte plus every continuation byte that follows it
+   (bounded by the length its lead byte announces).  A body cut mid-character
+   by maxBodyValueBytes is the case that makes this matter — it costs one
+   replacement, not one per byte.  A sequence that is structurally complete but
+   encodes an overlong form, a surrogate or a code point above U+10FFFF also
+   collapses to a single replacement. */
+static size_t utf8_bad_len(const unsigned char *p, size_t avail) {
+    size_t n = utf8_seq(p, avail);
+    size_t i;
+
+    if (n) return n;                    /* not reachable: caller checks */
+    if (p[0] < 0xC2 || p[0] > 0xF4) return 1;
+    if (p[0] <= 0xDF) n = 2;
+    else if (p[0] <= 0xEF) n = 3;
+    else n = 4;
+    for (i = 1; i < n && i < avail; i++)
+        if ((p[i] & 0xC0) != 0x80) break;
+    return i;
+}
+
+int json_escape(const char *s, size_t len, char *out, size_t outsz,
+                size_t *replaced) {
+    size_t i, o = 0, bad = 0;
     if (!s || !out) return -1;
     for (i = 0; i < len; i++) {
         unsigned char c = (unsigned char)s[i];
@@ -27,14 +82,30 @@ int json_escape(const char *s, size_t len, char *out, size_t outsz) {
                 if (o + 6 + 1 > outsz) return -1;
                 n = snprintf(out + o, 7, "\\u%04x", c);
                 o += (size_t)n;
-            } else {
+            } else if (c < 0x80) {
                 if (o + 1 + 1 > outsz) return -1;
                 out[o++] = (char)c;
+            } else {
+                size_t n = utf8_seq((const unsigned char *)s + i, len - i);
+                if (n == 0) {
+                    if (o + sizeof utf8_replacement + 1 > outsz) return -1;
+                    memcpy(out + o, utf8_replacement, sizeof utf8_replacement);
+                    o += sizeof utf8_replacement;
+                    bad++;
+                    i += utf8_bad_len((const unsigned char *)s + i, len - i) - 1;
+                } else {
+                    if (o + n + 1 > outsz) return -1;
+                    memcpy(out + o, s + i, n);
+                    o += n;
+                    i += n - 1;
+                }
             }
             break;
         }
     }
     out[o] = '\0';
+    if (replaced) *replaced = bad;
+    utf8_replaced += bad;
     return 0;
 }
 
@@ -85,7 +156,7 @@ int jsonb_key(JsonBuilder *b, const char *key) {
     klen = strlen(key);
     esc = malloc(klen * 6 + 3);
     if (!esc) { b->err = 1; return -1; }
-    if (json_escape(key, klen, esc, klen * 6 + 3) != 0 ||
+    if (json_escape(key, klen, esc, klen * 6 + 3, NULL) != 0 ||
         jsonb_raw(b, "\"", 1) != 0 ||
         jsonb_raw(b, esc, strlen(esc)) != 0 ||
         jsonb_raw(b, "\":", 2) != 0) {
@@ -101,7 +172,7 @@ int jsonb_str(JsonBuilder *b, const char *val) {
     size_t vlen = val ? strlen(val) : 0;
     char *esc = malloc(vlen * 6 + 3);
     if (!esc) { b->err = 1; return -1; }
-    if (json_escape(val ? val : "", vlen, esc, vlen * 6 + 3) != 0 ||
+    if (json_escape(val ? val : "", vlen, esc, vlen * 6 + 3, NULL) != 0 ||
         jsonb_raw(b, "\"", 1) != 0 ||
         jsonb_raw(b, esc, strlen(esc)) != 0 ||
         jsonb_raw(b, "\"", 1) != 0) {

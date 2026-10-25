@@ -3175,6 +3175,126 @@ static void rfc2047_tests(void) {
            "rfc2047: the empty value stays empty");
 }
 
+/* The JSON boundary must never emit a byte that is not part of a valid UTF-8
+   sequence.  RFC 8259 8.1 defines a JSON string as Unicode text, so ONE raw
+   8-bit byte from a mail header or body makes the whole document unparseable
+   for a conforming client: measured live, a 100-message page carried 0xAE at
+   offset 206223 and the client refused all 1,740,593 bytes of it.  Charset
+   conversion is out of scope — the byte is replaced by U+FFFD, which is the
+   honest representation of bytes that are not text. */
+static void utf8_emit_tests(void) {
+    char tpl[] = "/tmp/visage_jmapd_utf8_XXXXXX";
+    char *root = mkdtemp(tpl);
+    JmapdServer srv;
+    JmapdCtx ctx;
+    char email_id[JMAPD_ID_MAX];
+    char args[1024];
+    char buf[64];
+    char *res;
+    size_t n = 0;
+
+    /* ---- the escape boundary itself ---- */
+    json_utf8_reset();
+    EXPECT(json_escape("a\xae b", 4, buf, sizeof buf, &n) == 0 &&
+               strcmp(buf, "a\xef\xbf\xbd b") == 0 && n == 1,
+           "utf8: an unrepresentable byte becomes U+FFFD, and is counted");
+    EXPECT(json_utf8_replacements() == 1,
+           "utf8: the substitution count is visible to the request layer");
+    json_utf8_reset();
+    EXPECT(json_escape("\"\\\x01", 3, buf, sizeof buf, &n) == 0 &&
+               strcmp(buf, "\\\"\\\\\\u0001") == 0 && n == 0,
+           "utf8: quotes, backslashes and controls are still escaped");
+    json_utf8_reset();
+    EXPECT(json_escape("Caf\xc3\xa9", 5, buf, sizeof buf, &n) == 0 &&
+               strcmp(buf, "Caf\xc3\xa9") == 0 && n == 0,
+           "utf8: valid multi-byte text is copied byte for byte");
+    json_utf8_reset();
+    EXPECT(json_escape("x\xe2\x82", 3, buf, sizeof buf, &n) == 0 &&
+               strcmp(buf, "x\xef\xbf\xbd") == 0 && n == 1,
+           "utf8: a body cut mid-character costs ONE replacement, not one per "
+           "byte");
+
+    /* ---- the same bytes on their way out of a real message ---- */
+    if (!root) {
+        check_fail("utf8: scratch root", "mkdtemp failed");
+        return;
+    }
+    memset(&srv, 0, sizeof srv);
+    srv.icfg.root = root;
+    srv.icfg.max_msg = IMAPD_DEFAULT_MAX_MSG;
+    srv.cfg.root = root;
+    srv.cfg.hostname = "localhost";
+    memset(&ctx, 0, sizeof ctx);
+    ctx.srv = &srv;
+    ctx.user = "alice";
+
+    {
+        /* One 8-bit byte in the Subject, two in the body, plus the escapes a
+           replacement must not disturb. */
+        static const char bad[] =
+            "From: bob@example.com\r\n"
+            "To: alice@example.com\r\n"
+            "Subject: bad \xae byte \"q\" back\\slash \x01 ctl\r\n"
+            "Message-ID: <u1@example.com>\r\n"
+            "Content-Type: text/plain; charset=us-ascii\r\n"
+            "\r\n"
+            "body \xae and \xff here\r\n";
+
+        if (seed_msg(root, "alice", "Inbox", "1700000500.UTF8.host", bad,
+                     1700000500, 1) != 0) {
+            check_fail("utf8: seed the 8-bit fixture", "seed failed");
+            return;
+        }
+    }
+    (void)jmapd_id_email("1700000500.UTF8.host", NULL, email_id,
+                         sizeof email_id);
+    snprintf(args, sizeof args,
+             "{\"accountId\":\"alice\",\"ids\":[\"%s\"],\"properties\":"
+             "[\"id\",\"subject\",\"textBody\"],\"fetchTextBodyValues\":true}",
+             email_id);
+    json_utf8_reset();
+    res = call_method(&ctx, jmapd_method_email_get, args);
+    EXPECT(res != NULL, "utf8: Email/get returns a result");
+    if (res) {
+        JmapJsonDoc *doc = NULL;
+        const JmapJsonNode *list, *e, *v;
+
+        EXPECT(parse_err(res, strlen(res)) == JMAP_JSON_OK,
+               "utf8: the rendered Email is valid UTF-8 JSON");
+        list = result_get(&doc, res, "list");
+        e = list ? jmap_json_at(list, 0) : NULL;
+        EXPECT(e != NULL, "utf8: the 8-bit message is found");
+        if (e) {
+            const char *s = NULL;
+
+            v = jmap_json_get(e, "subject");
+            EXPECT(v && jmap_json_str(v, &s, NULL) == 0 &&
+                       strcmp(s, "bad \xef\xbf\xbd byte \"q\" back\\slash "
+                                 "\x01 ctl") == 0,
+                   "utf8: the Subject carries U+FFFD, not the raw byte");
+            v = jmap_json_get(e, "bodyValues");
+            v = v ? jmap_json_get(v, "1") : NULL;
+            EXPECT(v && jmap_json_str(jmap_json_get(v, "value"), &s, NULL) == 0 &&
+                       strcmp(s, "body \xef\xbf\xbd and \xef\xbf\xbd here\r\n")
+                           == 0,
+                   "utf8: the body carries one U+FFFD per unrepresentable byte");
+            /* the escapes are still escapes in the BYTES, not only after a
+               parse: a fix that emitted the raw bytes as \u-escapes would pass
+               the checks above and still be wrong for every client. */
+            EXPECT(strstr(res, "\\\"q\\\"") != NULL &&
+                       strstr(res, "back\\\\slash") != NULL &&
+                       strstr(res, "\\u0001") != NULL,
+                   "utf8: quotes, backslashes and controls stay escaped");
+            EXPECT(strstr(res, "\xae") == NULL && strstr(res, "\xff") == NULL,
+                   "utf8: no raw 8-bit byte survives into the response");
+        }
+        jmap_json_free(doc);
+        free(res);
+    }
+    EXPECT(json_utf8_replacements() == 3,
+           "utf8: the whole response reports three substitutions in one count");
+}
+
 static void envelope_tests(void) {
     static const char msg1[] =
         "From: Alice <alice@example.com>\r\n"
@@ -3259,6 +3379,7 @@ int main(void) {
     set_tests();
     review_fix_tests();
     rfc2047_tests();
+    utf8_emit_tests();
     envelope_tests();
     printf("\n%d checks, %d failed\n", nchecks, nfails);
     return nfails ? 1 : 0;
