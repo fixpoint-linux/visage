@@ -922,5 +922,18 @@ int jmapd_core_handle(JmapdServer *srv, JmapdConn *c, const JmapdHttpReq *req,
     /* GET /.well-known/jmap (and /jmap/session): the session resource. */
     if (!path_is(req, "/jmap/session") && !path_is(req, "/.well-known/jmap"))
         return api_call(srv, c, c->c.user, body, bodylen, status, out, outlen);
-    return jmapd_session_render(&srv->cfg, c->c.user, out, outlen) == 0 ? 0 : -1;
+    /* The replacement counter is process-global (json.c), and this path renders
+       a JSON document too: a --hostname (or account id) with an ill-formed byte
+       was substituted into the session document with NO journal line, and the
+       count survived until the next /api call reset it — a silent substitution,
+       which is the one thing the counter exists to prevent.  Count it here. */
+    json_utf8_reset();
+    if (jmapd_session_render(&srv->cfg, c->c.user, out, outlen) != 0) return -1;
+    if (json_utf8_replacements() > 0) {
+        char detail[64];
+        snprintf(detail, sizeof detail, "count=%llu",
+                 (unsigned long long)json_utf8_replacements());
+        jmapd_log(c, "utf8-replaced", c->c.user, detail);
+    }
+    return 0;
 }

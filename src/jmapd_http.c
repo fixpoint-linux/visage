@@ -83,7 +83,13 @@ int jmapd_http_respond(Conn *c, int status, const char *ctype,
            small, honest error rather than being truncated mid-JSON.  The type
            is serverLimit, not serverFail: the request was legal and the answer
            would have been correct, it is the SIZE that is beyond this server,
-           and a client can narrow it (fewer objects, a smaller limit). */
+           and a client can narrow it (fewer objects, a smaller limit).
+
+           MEASURED, not assumed: this branch is REACHABLE.  The 8 MiB body
+           budget is per METHOD CALL, not per response, so one request with
+           five Email/get calls over a 12 MiB message builds a 20 MiB reply and
+           lands here (tests/jmapd_read.sh, "response cap").  It is the last
+           resort that keeps a client from receiving half a JSON document. */
         char why[192];
         snprintf(why, sizeof why,
                  "response of %llu bytes exceeds this server's limit of %u "

@@ -274,9 +274,13 @@ void jmapd_state_bump(JmapdServer *srv, const char *user, JmapdState *st,
    journal — a silent 200 that a client reads as "nothing changed" is the
    failure this line exists to make impossible to hide. */
 static int changes_refused(JmapdCtx *ctx, const char *method,
-                           const JmapJsonNode *args, JsonBuilder *out) {
+                           const char *state_key, const JmapJsonNode *args,
+                           JsonBuilder *out) {
     char detail[160];
-    const JmapJsonNode *since = args ? jmap_json_get(args, "sinceState") : NULL;
+    /* /queryChanges takes `sinceQueryState`, not `sinceState` (RFC 8620 5.6);
+       reading the wrong key logged sinceState=- for every one of those calls,
+       whatever the client named.  The key is the caller's to state. */
+    const JmapJsonNode *since = args ? jmap_json_get(args, state_key) : NULL;
     const char *s = NULL;
     size_t sl = 0;
 
@@ -285,8 +289,8 @@ static int changes_refused(JmapdCtx *ctx, const char *method,
         sl = 1;
     }
     if (sl > 64) sl = 64;
-    snprintf(detail, sizeof detail, "method=%s sinceState=%.*s reason=no-log",
-             method, (int)sl, s);
+    snprintf(detail, sizeof detail, "method=%s %s=%.*s reason=no-log",
+             method, state_key, (int)sl, s);
     jmapd_log_ctx(ctx, "changes-refused", detail);
     jmapd_jb_method_error(out, "cannotCalculateChanges");
     return 0;
@@ -294,20 +298,20 @@ static int changes_refused(JmapdCtx *ctx, const char *method,
 
 int jmapd_method_email_changes(JmapdCtx *ctx, const JmapJsonNode *args,
                                JsonBuilder *out) {
-    return changes_refused(ctx, "Email/changes", args, out);
+    return changes_refused(ctx, "Email/changes", "sinceState", args, out);
 }
 
 int jmapd_method_mailbox_changes(JmapdCtx *ctx, const JmapJsonNode *args,
                                  JsonBuilder *out) {
-    return changes_refused(ctx, "Mailbox/changes", args, out);
+    return changes_refused(ctx, "Mailbox/changes", "sinceState", args, out);
 }
 
 int jmapd_method_thread_changes(JmapdCtx *ctx, const JmapJsonNode *args,
                                 JsonBuilder *out) {
-    return changes_refused(ctx, "Thread/changes", args, out);
+    return changes_refused(ctx, "Thread/changes", "sinceState", args, out);
 }
 
 int jmapd_method_email_query_changes(JmapdCtx *ctx, const JmapJsonNode *args,
                                      JsonBuilder *out) {
-    return changes_refused(ctx, "Email/queryChanges", args, out);
+    return changes_refused(ctx, "Email/queryChanges", "sinceQueryState", args, out);
 }

@@ -1089,9 +1089,12 @@ typedef struct BodyFetch {
     size_t maxbytes;
 } BodyFetch;
 
-/* bodyValues: one entry per requested body part, keyed by partId. */
+/* bodyValues: one entry per requested body part, keyed by partId.  `truncated`
+   counts the bodyValues that carry isTruncated, so the caller can journal what
+   the response actually cut instead of what it MIGHT have cut. */
 static void write_body_values(JsonBuilder *b, const char *msg,
-                              const JmapdTree *t, const BodyFetch *bf) {
+                              const JmapdTree *t, const BodyFetch *bf,
+                              size_t *truncated) {
     int i, first = 1;
     jsonb_begin_object(b);
     for (i = 0; i < t->nparts; i++) {
@@ -1115,19 +1118,20 @@ static void write_body_values(JsonBuilder *b, const char *msg,
         jsonb_comma(b);
         jsonb_key(b, "isTruncated");
         jsonb_bool(b, bv.truncated ? 1 : 0);
+        if (bv.truncated && truncated) (*truncated)++;
         jsonb_end_object(b);
         jmapd_body_value_free(&bv);
     }
     jsonb_end_object(b);
 }
 
-/* Render one Email object.  `msg` may be NULL when the file could not be read
-   (then only the metadata properties that need no body are emitted — the id
-   is still answered, so a client sees a message it cannot read rather than a
-   silent notFound). */
+/* Render one Email object.  `msg` is the whole message file: the caller refuses
+   the call when it cannot read it, because every property here is derived from
+   those bytes.  `truncated`, when non-NULL, counts the bodyValues this object
+   emitted with isTruncated set. */
 static void write_email(JsonBuilder *b, JmapdServer *srv, const JmapdEmail *e,
                         const char *msg, size_t msglen, const EmailProps *pr,
-                        const BodyFetch *bf) {
+                        const BodyFetch *bf, size_t *truncated) {
     JmapdTree *t = NULL;
     char received[32];
     int i;
@@ -1271,7 +1275,7 @@ static void write_email(JsonBuilder *b, JmapdServer *srv, const JmapdEmail *e,
     if (bf->text || bf->html || bf->all) {
         jsonb_comma(b);
         jsonb_key(b, "bodyValues");
-        if (t) write_body_values(b, msg, t, bf);
+        if (t) write_body_values(b, msg, t, bf, truncated);
         else jsonb_begin_object(b), jsonb_end_object(b);
     }
     (void)srv;
@@ -1290,7 +1294,7 @@ int jmapd_method_email_get(JmapdCtx *ctx, const JmapJsonNode *args,
     EmailProps pr;
     BodyFetch bf;
     JmapdEmail want[JMAPD_MAX_OBJECTS];
-    size_t nids = 0, i, k;
+    size_t nids = 0, i, k, start;
     char state[32];
     JmapdState st;
 
@@ -1351,6 +1355,7 @@ int jmapd_method_email_get(JmapdCtx *ctx, const JmapJsonNode *args,
     }
     (void)jmapd_email_locate(srv, user, want, nids);
 
+    start = out->len;      /* rollback point for a refused read, below */
     jsonb_begin_object(out);
     jsonb_key(out, "accountId"); jsonb_str(out, user);
     jsonb_comma(out);
@@ -1371,25 +1376,57 @@ int jmapd_method_email_get(JmapdCtx *ctx, const JmapJsonNode *args,
         size_t budget = srv->cfg.get_body_budget ? srv->cfg.get_body_budget
                                                  : JMAPD_GET_BODY_BUDGET;
         size_t cut = 0;
+        char why[1024];
         for (i = 0; i < nids; i++) {
             char *msg = NULL;
-            size_t msglen = 0, before;
+            size_t msglen = 0, before, expect, tr = 0;
             BodyFetch cur = bf;
             if (!want[i].found || !want[i].id[0]) continue;
-            (void)jmapd_read_file(srv, want[i].path, want[i].size, &msg, &msglen);
+            /* Everything this object says about the message — the headers,
+               preview, hasAttachment, bodyStructure, every bodyValue — comes
+               from these bytes.  A file that cannot be opened (or a short
+               read: a partial body is a cut body with no isTruncated) used to
+               leave msg NULL and emit the object with textBody:[] and
+               bodyValues:{}: a 200 whose body is silently empty.  Refuse the
+               call instead, like Email/query's unreadable-message refusal
+               (jmap_query.c).  RFC 8620 5.1 has no per-object error, so the
+               whole call is the only place to say it. */
+            expect = want[i].size > srv->icfg.max_msg ? srv->icfg.max_msg
+                                                      : want[i].size;
+            if (jmapd_read_file(srv, want[i].path, want[i].size, &msg,
+                                &msglen) != 0 || msglen < expect) {
+                free(msg);
+                if (out->err) return -1;   /* the buffer is already broken */
+                if (out->buf) {
+                    /* Roll the half-built response back before refusing: a
+                       method error must be the whole result. */
+                    out->len = start;
+                    out->buf[start] = '\0';
+                }
+                snprintf(why, sizeof why,
+                         "message '%s' could not be read; Email/get was not "
+                         "answered rather than answered with an empty body",
+                         want[i].id);
+                jmapd_log_ctx(ctx, "get-unreadable-message", why);
+                jmapd_jb_method_error_desc(out, "serverFail", why);
+                return 0;
+            }
             if (cur.text || cur.html || cur.all) {
                 size_t client_max = bf.maxbytes ? bf.maxbytes
                                                 : JMAPD_MAX_BODY_VALUE;
                 size_t lim = budget < client_max ? budget : client_max;
                 if (lim < 1) lim = 1;      /* 0 means "server default" to
                                               jmapd_body_value: never pass 0 */
-                if (lim < client_max) cut++;   /* the RESPONSE cut this body */
                 cur.maxbytes = lim;
             }
             if (!first) jsonb_comma(out);
             first = 0;
             before = out->len;
-            write_email(out, srv, &want[i], msg, msglen, &pr, &cur);
+            /* Counted from the response, not predicted from the budget: a
+               reduced limit with a body that fits under it cuts nothing, and
+               the journal line must not claim otherwise. */
+            write_email(out, srv, &want[i], msg, msglen, &pr, &cur, &tr);
+            if (tr) cut++;
             if (out->len > before) {
                 size_t used = out->len - before;
                 budget = used >= budget ? 0 : budget - used;

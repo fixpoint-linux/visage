@@ -104,6 +104,17 @@ mkdir -p "$ROOT/alice/.Odd/tmp" "$ROOT/alice/.Odd/new" "$ROOT/alice/.Odd/cur"
 printf 'From: bob@example.com\r\nTo: alice@example.com\r\nSubject: bad \xae byte\r\nMessage-ID: <f1@example.com>\r\nContent-Type: text/plain; charset=us-ascii\r\n\r\nbody \xae and \xff here\r\n' \
     > "$ROOT/alice/.Odd/cur/1700000500.F.host:2,S"
 
+# ---- G/H: two SMALL bodies, for the "a reduced limit that cut nothing" case
+# (rendered under a tiny --get-body-budget by the daemon in section 5b)
+mkdir -p "$ROOT/alice/.Mid/tmp" "$ROOT/alice/.Mid/new" "$ROOT/alice/.Mid/cur"
+{
+    printf 'From: mid@example.com\r\nTo: alice@example.com\r\nSubject: mid one\r\nMessage-ID: <g1@example.com>\r\nContent-Type: text/plain; charset=us-ascii\r\n\r\n'
+    head -c 300 /dev/zero | tr '\0' 'm'
+    printf '\r\n'
+} > "$ROOT/alice/.Mid/cur/1700000600.G.host:2,S"
+printf 'From: mid@example.com\r\nTo: alice@example.com\r\nSubject: mid two\r\nMessage-ID: <h1@example.com>\r\nContent-Type: text/plain; charset=us-ascii\r\n\r\ntiny body\r\n' \
+    > "$ROOT/alice/.Mid/cur/1700000601.H.host:2,S"
+
 # fixed mtimes so receivedAt ordering is deterministic (maildir INTERNALDATE)
 touch -d @1700000100 "$ROOT/alice/Inbox/cur/1700000100.A.host:2,S"
 touch -d @1700000200 "$ROOT/alice/Inbox/new/1700000200.B.host"
@@ -111,6 +122,8 @@ touch -d @1700000050 "$ROOT/alice/Inbox/cur/1700000050.C.host:2,S"
 touch -d @1700000300 "$ROOT/alice/.Sent/cur/1700000300.D.host:2,S"
 touch -d @1700000400 "$ROOT/alice/Inbox/cur/1700000400.E.host:2,S"
 touch -d @1700000500 "$ROOT/alice/.Odd/cur/1700000500.F.host:2,S"
+touch -d @1700000600 "$ROOT/alice/.Mid/cur/1700000600.G.host:2,S"
+touch -d @1700000601 "$ROOT/alice/.Mid/cur/1700000601.H.host:2,S"
 
 DAEMONS=()
 FAILS=0
@@ -558,6 +571,315 @@ PYEOF
 check "$(grep -q 'changes-refused .*method=Email/changes sinceState=e10' "$TMP/a.log" \
         && echo 0 || echo 1)" \
     "changes: the refusal is in the journal, naming the method and the state"
+
+# /queryChanges carries its state in sinceQueryState (RFC 8620 5.6); the line
+# must name what the client actually sent, not a key it never uses.
+check "$(grep -q 'changes-refused .*method=Email/queryChanges sinceQueryState=e10' "$TMP/a.log" \
+        && echo 0 || echo 1)" \
+    "changes: the queryChanges refusal names sinceQueryState=e10"
+check "$(grep -q 'method=Email/queryChanges sinceState=' "$TMP/a.log" && echo 1 || echo 0)" \
+    "changes: no queryChanges line reads the sinceState key"
+
+# ======================================================================
+# (5) a bounded-work refusal is ANSWERED and JOURNALED, never a short page
+# ======================================================================
+# Three claims of commit 227c28f had no covering assertion: the paging-window
+# refusal, the unreadable-mailbox refusal, and the HTTP response cap.  Each is
+# one probe against the live daemon.
+python3 - "$PORT_A" <<'PYEOF' && pass "window: position+limit past the window is a described serverLimit" \
+                           || fail "window: position+limit past the window is a described serverLimit"
+import base64, json, sys, urllib.request
+
+port = int(sys.argv[1])
+base = f"http://127.0.0.1:{port}"
+auth = "Basic " + base64.b64encode(b"alice:waldorf").decode()
+CORE = "urn:ietf:params:jmap:core"
+MAIL = "urn:ietf:params:jmap:mail"
+
+
+def call(payload):
+    req = urllib.request.Request(base + "/api", data=json.dumps(payload).encode())
+    req.add_header("Authorization", auth)
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.status, json.loads(r.read())
+
+
+st, resp = call({"using": [CORE, MAIL], "methodCalls": [
+    ["Email/query", {"accountId": "alice", "position": 32768, "limit": 256},
+     "q0"]]})
+assert st == 200, st
+res = resp["methodResponses"][0][1]
+assert res.get("type") == "serverLimit", res
+assert "window" in (res.get("description") or ""), res
+assert "ids" not in res, ("a refused page must not also carry ids", res)
+PYEOF
+
+check "$(grep -q 'query-over-window .*position+limit=33024' "$TMP/a.log" \
+        && echo 0 || echo 1)" \
+    "window: the refusal is in the journal with the window it refused"
+
+python3 - "$PORT_A" <<'PYEOF' && pass "response cap: a reply past 16 MiB is a described 500, not a truncated body" \
+                           || fail "response cap: a reply past 16 MiB is a described 500, not a truncated body"
+import base64, json, sys, urllib.error, urllib.request
+
+port = int(sys.argv[1])
+base = f"http://127.0.0.1:{port}"
+auth = "Basic " + base64.b64encode(b"alice:waldorf").decode()
+CORE = "urn:ietf:params:jmap:core"
+MAIL = "urn:ietf:params:jmap:mail"
+
+
+def call(payload):
+    req = urllib.request.Request(base + "/api", data=json.dumps(payload).encode())
+    req.add_header("Authorization", auth)
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+# the fixture's 12 MiB message: one Email/get call renders up to
+# JMAPD_MAX_BODY_VALUE (4 MiB) of it, and the body budget is PER CALL, so five
+# calls in one request build a reply past the 16 MiB cap.
+st, raw = call({"using": [CORE, MAIL], "methodCalls": [
+    ["Email/query", {"accountId": "alice", "limit": 10}, "q0"],
+    ["Email/get", {"#ids": {"resultOf": "q0", "name": "Email/query",
+                            "path": "/ids"},
+                   "properties": ["id", "size"]}, "g0"]]})
+listing = json.loads(raw)["methodResponses"][1][1]["list"]
+big = max(listing, key=lambda e: e["size"])
+assert big["size"] > 12 * 1024 * 1024, big
+big = big["id"]
+
+calls = [["Email/get", {"accountId": "alice", "ids": [big],
+                        "properties": ["id", "textBody"],
+                        "fetchTextBodyValues": True}, f"g{i}"] for i in range(5)]
+st, raw = call({"using": [CORE, MAIL], "methodCalls": calls})
+assert st == 500, (st, raw[:200])
+err = json.loads(raw)
+assert err.get("type") == "serverLimit", err
+assert "limit" in (err.get("description") or ""), err
+PYEOF
+
+check "$(grep -q 'response-over-limit' "$TMP/a.log" && echo 0 || echo 1)" \
+    "response cap: the journal names the response that was too big"
+
+# --- the get-truncated count is the RESPONSE's, not the budget's -----------
+# A reduced limit with a body that FITS under it cuts nothing, so the journal
+# must not claim an object was truncated when no bodyValue says isTruncated.
+PORT_D="$((PORT_BASE + 3))"
+./jmapd.com --root "$ROOT" --addr 127.0.0.1 --port "$PORT_D" \
+    --hostname localhost --get-body-budget 2000 >"$TMP/d.log" 2>&1 &
+DAEMONS+=("$!")
+wait_port "$PORT_D" "jmapd (small body budget)"
+
+python3 - "$PORT_D" <<'PYEOF' && pass "get-truncated: the count is the response's — a limit that cut nothing logs nothing" \
+                           || fail "get-truncated: the count is the response's — a limit that cut nothing logs nothing"
+import base64, json, sys, urllib.request
+
+port = int(sys.argv[1])
+base = f"http://127.0.0.1:{port}"
+auth = "Basic " + base64.b64encode(b"alice:waldorf").decode()
+CORE = "urn:ietf:params:jmap:core"
+MAIL = "urn:ietf:params:jmap:mail"
+
+
+def call(payload):
+    req = urllib.request.Request(base + "/api", data=json.dumps(payload).encode())
+    req.add_header("Authorization", auth)
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())
+
+
+mbs = call({"using": [CORE, MAIL], "methodCalls": [
+    ["Mailbox/get", {"accountId": "alice"}, "m0"]]})
+mid = [m["id"] for m in mbs["methodResponses"][0][1]["list"] if m["name"] == "Mid"][0]
+ids = call({"using": [CORE, MAIL], "methodCalls": [
+    ["Email/query", {"accountId": "alice", "filter": {"inMailbox": mid},
+                     "sort": [{"property": "receivedAt", "isAscending": True}]},
+     "q0"]]})["methodResponses"][0][1]["ids"]
+assert len(ids) == 2, ids
+
+# 300-byte body first: it leaves ~1.5 KiB of the 2 KiB budget, so the second
+# (18-byte) body is rendered under a REDUCED limit that still fits it whole
+res = call({"using": [CORE, MAIL], "methodCalls": [
+    ["Email/get", {"accountId": "alice", "ids": ids,
+                   "properties": ["id", "textBody"],
+                   "fetchTextBodyValues": True}, "g0"]]})["methodResponses"][0][1]
+assert "type" not in res, res
+cuts = [v for e in res["list"] for v in e["bodyValues"].values() if v["isTruncated"]]
+assert not cuts, ("no body in this page was cut", cuts)
+PYEOF
+
+check "$([ -f "$TMP/d.log" ] && ! grep -q 'get-truncated' "$TMP/d.log" && echo 0 || echo 1)" \
+    "get-truncated: no line was written for a page nothing was cut from"
+
+# ======================================================================
+# (6) Email/get REFUSES a message it cannot read (it used to answer 200 with
+#     textBody:[] and bodyValues:{} — a body silently empty, no flag, no line)
+# ======================================================================
+# Last but one, because it makes one of the fixture's messages unreadable.
+ODD_FILE="$ROOT/alice/.Odd/cur/1700000500.F.host:2,S"
+PAIR="$(python3 - "$PORT_A" <<'PYEOF'
+import base64, json, sys, urllib.request
+
+port = int(sys.argv[1])
+base = f"http://127.0.0.1:{port}"
+auth = "Basic " + base64.b64encode(b"alice:waldorf").decode()
+CORE = "urn:ietf:params:jmap:core"
+MAIL = "urn:ietf:params:jmap:mail"
+
+
+def call(payload):
+    req = urllib.request.Request(base + "/api", data=json.dumps(payload).encode())
+    req.add_header("Authorization", auth)
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())
+
+
+mbs = call({"using": [CORE, MAIL], "methodCalls": [
+    ["Mailbox/get", {"accountId": "alice"}, "m0"]]})
+by_name = {m["name"]: m["id"] for m in mbs["methodResponses"][0][1]["list"]}
+# a readable message FIRST, so the refusal has to roll back a page already
+# built: the unreadable one is the second id in the request
+ok_q = call({"using": [CORE, MAIL], "methodCalls": [
+    ["Email/query", {"accountId": "alice", "filter": {"inMailbox": by_name["Inbox"]},
+                     "limit": 1}, "q0"]]})
+bad_q = call({"using": [CORE, MAIL], "methodCalls": [
+    ["Email/query", {"accountId": "alice", "filter": {"inMailbox": by_name["Odd"]}},
+     "q0"]]})
+print(ok_q["methodResponses"][0][1]["ids"][0],
+      bad_q["methodResponses"][0][1]["ids"][0])
+PYEOF
+)" || PAIR=""
+
+if [ -n "$PAIR" ] && [ -f "$ODD_FILE" ]; then
+    chmod 000 "$ODD_FILE"
+    python3 - "$PORT_A" $PAIR <<'PYEOF' && pass "get: an unreadable message is a described serverFail, never an empty body" \
+                                  || fail "get: an unreadable message is a described serverFail, never an empty body"
+import base64, json, sys, urllib.request
+
+port = int(sys.argv[1])
+good, bad = sys.argv[2], sys.argv[3]
+base = f"http://127.0.0.1:{port}"
+auth = "Basic " + base64.b64encode(b"alice:waldorf").decode()
+CORE = "urn:ietf:params:jmap:core"
+MAIL = "urn:ietf:params:jmap:mail"
+
+req = urllib.request.Request(base + "/api", data=json.dumps({
+    "using": [CORE, MAIL],
+    "methodCalls": [["Email/get", {"accountId": "alice", "ids": [good, bad],
+                                   "properties": ["id", "subject", "textBody"],
+                                   "fetchTextBodyValues": True}, "g0"]]}).encode())
+req.add_header("Authorization", auth)
+req.add_header("Content-Type", "application/json")
+with urllib.request.urlopen(req, timeout=60) as r:
+    assert r.status == 200, r.status          # a method error, not a transport one
+    res = json.loads(r.read())["methodResponses"][0][1]
+assert res.get("type") == "serverFail", res
+assert res.get("description"), res
+assert "could not be read" in res["description"], res
+# the refused call is the WHOLE result: no half-built page, no object whose
+# bodyValues are empty because nobody read the file
+assert "list" not in res, ("a refused get must not also carry a page", res)
+assert "bodyValues" not in json.dumps(res), res
+PYEOF
+    chmod 644 "$ODD_FILE"
+else
+    fail "get: an unreadable message is a described serverFail, never an empty body (no fixture)"
+fi
+
+check "$(grep -q 'get-unreadable-message' "$TMP/a.log" && echo 0 || echo 1)" \
+    "get: the refused read is in the journal"
+
+# ======================================================================
+# (7) a MAILBOX that cannot be opened is refused, not searched-and-skipped
+# ======================================================================
+# Last: hiding the directory hides it from every later assertion.
+if [ -d "$ROOT/alice/.Odd" ]; then
+    chmod 000 "$ROOT/alice/.Odd"
+    python3 - "$PORT_A" <<'PYEOF' && pass "query: an unreadable mailbox is a described serverFail, not an empty list" \
+                               || fail "query: an unreadable mailbox is a described serverFail, not an empty list"
+import base64, json, sys, urllib.request
+
+port = int(sys.argv[1])
+base = f"http://127.0.0.1:{port}"
+auth = "Basic " + base64.b64encode(b"alice:waldorf").decode()
+CORE = "urn:ietf:params:jmap:core"
+MAIL = "urn:ietf:params:jmap:mail"
+
+req = urllib.request.Request(base + "/api", data=json.dumps({
+    "using": [CORE, MAIL],
+    "methodCalls": [["Email/query", {"accountId": "alice"}, "q0"]]}).encode())
+req.add_header("Authorization", auth)
+req.add_header("Content-Type", "application/json")
+with urllib.request.urlopen(req, timeout=60) as r:
+    assert r.status == 200, r.status
+    res = json.loads(r.read())["methodResponses"][0][1]
+assert res.get("type") == "serverFail", res
+assert "could not be read" in (res.get("description") or ""), res
+assert "ids" not in res, ("a refused query must not also carry ids", res)
+PYEOF
+    chmod 755 "$ROOT/alice/.Odd"
+else
+    fail "query: an unreadable mailbox is a described serverFail, not an empty list (no fixture)"
+fi
+
+check "$(grep -q 'query-unreadable-mailbox' "$TMP/a.log" && echo 0 || echo 1)" \
+    "query: the unreadable mailbox is in the journal"
+
+# ======================================================================
+# (8) a session document is COUNTED like any other: the utf8 counter is
+#     process-global, and a --hostname with an ill-formed byte used to be
+#     substituted into the session doc with no journal line at all
+# ======================================================================
+PORT_C="$((PORT_BASE + 2))"
+./jmapd.com --root "$ROOT" --addr 127.0.0.1 --port "$PORT_C" \
+    --hostname "$(printf 'bad\xaehost')" >"$TMP/c.log" 2>&1 &
+DAEMONS+=("$!")
+wait_port "$PORT_C" "jmapd (8-bit hostname)"
+
+python3 - "$PORT_C" <<'PYEOF' && pass "session: an ill-formed hostname is U+FFFD, and the substitution is counted" \
+                           || fail "session: an ill-formed hostname is U+FFFD, and the substitution is counted"
+import base64, json, sys, urllib.request
+
+port = int(sys.argv[1])
+base = f"http://127.0.0.1:{port}"
+auth = "Basic " + base64.b64encode(b"alice:waldorf").decode()
+CORE = "urn:ietf:params:jmap:core"
+MAIL = "urn:ietf:params:jmap:mail"
+
+
+def get(path):
+    req = urllib.request.Request(base + path)
+    req.add_header("Authorization", auth)
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.status, r.read()
+
+
+st, raw = get("/.well-known/jmap")
+assert st == 200, st
+text = raw.decode("utf-8")          # raises if the document is not valid UTF-8
+assert "\ufffd" in text, text[:200]
+
+# a following /api response must not inherit the session's count
+req = urllib.request.Request(base + "/api", data=json.dumps({
+    "using": [CORE, MAIL],
+    "methodCalls": [["Mailbox/get", {"accountId": "alice"}, "m0"]]}).encode())
+req.add_header("Authorization", auth)
+req.add_header("Content-Type", "application/json")
+with urllib.request.urlopen(req, timeout=60) as r:
+    assert r.status == 200, r.status
+    assert json.loads(r.read())["methodResponses"][0][0] == "Mailbox/get"
+PYEOF
+
+check "$([ "$(grep -c 'utf8-replaced' "$TMP/c.log")" = 1 ] && echo 0 || echo 1)" \
+    "session: exactly ONE counted line — the session's, not a leaked count"
 
 echo
 if [ "$FAILS" = 0 ]; then

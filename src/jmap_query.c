@@ -208,9 +208,11 @@ static int query_mbox_names(JmapdServer *srv, const char *user, char ***out,
 
 /* Search one message's raw bytes (headers + body) for the needle, charging
    the cost against *budget.  Returns 1 on a match, 0 on a clean miss, -1 when
-   the budget is exhausted, or -2 when the message could not be read — which is
-   NOT a miss: answering "no match" for a message nobody read is the silent
-   wrong result this filter must never produce. */
+   the budget is exhausted, -2 when the message could not be read in full, or
+   -3 when this server could not allocate the buffer.  None of the negatives is
+   a miss: answering "no match" for a message nobody read — or read only
+   halfway, which a short read from a failing disk gives — is the silent wrong
+   result this filter must never produce. */
 static int msg_text_match(JmapdServer *srv, const Imail *m,
                           const QueryFilter *q, size_t *budget) {
     char *buf;
@@ -220,19 +222,29 @@ static int msg_text_match(JmapdServer *srv, const Imail *m,
     if (cap > srv->icfg.max_msg) cap = srv->icfg.max_msg;
     if (cap > *budget) return -1;
     buf = malloc(cap + 1);
-    if (!buf) return -1;
+    /* Out of memory is not "the scan budget": the client cannot narrow its way
+       out of an allocation failure, so the refusal has to say so. */
+    if (!buf) return -3;
     fd = open(m->path, O_RDONLY);
     if (fd < 0) { free(buf); return -2; }
     while (got < cap) {
         ssize_t r = read(fd, buf + got, cap - got);
         if (r < 0) {
             if (errno == EINTR) continue;
-            break;
+            close(fd);
+            free(buf);
+            return -2;
         }
         if (r == 0) break;
         got += (size_t)r;
     }
     close(fd);
+    if (got < cap) {
+        /* A short read is a PARTIAL message: scanning what arrived would turn
+           a match past the cut into a silent non-match. */
+        free(buf);
+        return -2;
+    }
     *budget -= got;
     hit = ci_contains(buf, got, q->text_s) ? 1 : 0;
     free(buf);
@@ -377,17 +389,31 @@ int jmapd_method_email_query(JmapdCtx *ctx, const JmapJsonNode *args,
                     /* The description is built BEFORE the view is closed:
                        imapd_mbox_close frees the message names it would name
                        (measured: the refusal carried freed bytes). */
-                    if (hit == -2)
+                    const char *ev, *ty;
+                    if (hit == -2) {
+                        ev = "query-unreadable-message";
+                        ty = "serverFail";
                         snprintf(why, sizeof why,
-                                 "message '%s' could not be read; the text "
-                                 "filter was not answered rather than answered "
-                                 "with a short list", m->base ? m->base : "?");
-                    else
+                                 "message '%s' could not be read in full; the "
+                                 "text filter was not answered rather than "
+                                 "answered with a short list",
+                                 m->base ? m->base : "?");
+                    } else if (hit == -3) {
+                        ev = "query-out-of-memory";
+                        ty = "serverFail";
+                        snprintf(why, sizeof why,
+                                 "not enough memory to read a message for the "
+                                 "text filter; scope the search with inMailbox "
+                                 "or retry");
+                    } else {
+                        ev = "query-over-budget";
+                        ty = "serverLimit";
                         snprintf(why, sizeof why,
                                  "text filter exceeded this server's scan "
                                  "budget of %llu bytes; scope the search with "
                                  "inMailbox, or raise --text-scan-max",
                                  (unsigned long long)budget_max);
+                    }
                     imapd_mbox_close(&mb);
                     free(heap);
                     for (k = 0; k < nnames; k++) free(names[k]);
@@ -397,12 +423,11 @@ int jmapd_method_email_query(JmapdCtx *ctx, const JmapJsonNode *args,
                        hold the poll loop for minutes.  `serverLimit` is the
                        RFC 8620 3.6.2 type for "the work this request asks for
                        is beyond this server" — the client can narrow it (a
-                       mailbox scope, a smaller page) and retry. */
-                    jmapd_log_ctx(ctx, hit == -2 ? "query-unreadable-message"
-                                                 : "query-over-budget", why);
-                    jmapd_jb_method_error_desc(out,
-                                               hit == -2 ? "serverFail"
-                                                         : "serverLimit", why);
+                       mailbox scope, a smaller page) and retry.  A message
+                       that could not be read, or a failed allocation, is not
+                       that: it is this server's fault, so `serverFail`. */
+                    jmapd_log_ctx(ctx, ev, why);
+                    jmapd_jb_method_error_desc(out, ty, why);
                     return 0;
                 }
                 if (!hit) ok = false;

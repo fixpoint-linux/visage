@@ -278,14 +278,20 @@ is an empty list standing in for "we could not ask", which a client renders as
 | --- | --- | --- |
 | `Email/query` `text` scan (whole-message reads) | 512 MiB (`--text-scan-max`, `JMAPD_TEXT_SCAN_MAX`) | `serverLimit` + description naming the budget, plus a `query-over-budget` journal line |
 | `Email/query` paging window (`position` + `limit`) | 32768 entries | `serverLimit` + description, `query-over-window` journal line |
-| `Email/get` rendered bodies per response | 8 MiB (`--get-body-budget`, `JMAPD_GET_BODY_BUDGET`) | the remaining bodies are **truncated** (`isTruncated` per `bodyValue`), the page is still served, `get-truncated` journal line |
-| One response, all methods | 16 MiB (`JMAPD_MAX_RESP`) | `serverLimit` + description, `response-over-limit` journal line |
-| A mailbox or message that cannot be read | — | `serverFail` + description, `query-unreadable-mailbox` / `query-unreadable-message` journal line |
+| `Email/get` rendered bodies per call | 8 MiB (`--get-body-budget`, `JMAPD_GET_BODY_BUDGET`) | the remaining bodies are **truncated** (`isTruncated` per `bodyValue`), the page is still served, `get-truncated` journal line |
+| One response, all methods | 16 MiB (`JMAPD_MAX_RESP`) | `serverLimit` + description, `response-over-limit` journal line. The body budget is per CALL, so a request with several `Email/get` calls can reach this cap: the last resort that keeps a client from receiving half a JSON document (`tests/jmapd_read.sh`, "response cap") |
+| A mailbox or message that cannot be read | — | `serverFail` + description, `query-unreadable-mailbox` / `query-unreadable-message` / `get-unreadable-message` journal line |
 
 `serverLimit` is the RFC 8620 3.6.2 type for "the work this request asks for is
 beyond this server": the request was legal and the answer would have been
 correct, so the client can narrow it (a mailbox scope, a smaller page) and
-retry. The body budget is the one place a bound is applied rather than
+retry. A message file that cannot be opened or read in full, and an allocation
+that fails, are not that — they are this server's fault, so those answer
+`serverFail`. `Email/get` refuses the whole call for one unreadable message
+(RFC 8620 5.1 has no per-object error) instead of emitting the object with
+`textBody: []` and `bodyValues: {}`: every property of that object — headers,
+preview, `hasAttachment`, `bodyStructure`, every body value — is derived from
+the bytes nobody read, so an empty one is a 200 that lies. The body budget is the one place a bound is applied rather than
 answered, because RFC 8621 4.2 already defines the honest form for it —
 `maxBodyValueBytes` is a hint the server may undercut, and each cut `bodyValue`
 says `isTruncated`.
