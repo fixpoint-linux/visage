@@ -40,6 +40,10 @@
 /* Keywords <-> maildir flags                                          */
 /* ------------------------------------------------------------------ */
 
+/* The one keyword table: Email/set writes through it, Email/query filters on
+   it, Email/get renders it.  A keyword absent here is one no maildir filename
+   can carry ($forwarded has no flag letter), so it is refused rather than
+   accepted and dropped. */
 static const struct {
     const char *kw;
     uint8_t     flag;
@@ -53,7 +57,7 @@ static const struct {
 
 #define NKEYWORDS (sizeof KEYWORDS / sizeof KEYWORDS[0])
 
-static int kw_flag(const char *kw, size_t kwlen, uint8_t *out) {
+int jmapd_kw_flag(const char *kw, size_t kwlen, uint8_t *out) {
     size_t i;
     for (i = 0; i < NKEYWORDS; i++)
         if (strlen(KEYWORDS[i].kw) == kwlen &&
@@ -154,7 +158,7 @@ JmapdPatchErr jmapd_patch_apply(const JmapJsonNode *patch, const char *cur_mbox,
                     uint8_t f = 0;
                     bool on = false;
                     if (!e || !e->key) continue;
-                    if (kw_flag(e->key, e->keylen, &f) != 0) {
+                    if (jmapd_kw_flag(e->key, e->keylen, &f) != 0) {
                         patch_bad(out, key);
                         return JMAPD_PATCH_E_KEYWORD;
                     }
@@ -168,7 +172,7 @@ JmapdPatchErr jmapd_patch_apply(const JmapJsonNode *patch, const char *cur_mbox,
                 out->flags = flags;
             } else {
                 uint8_t f = 0;
-                if (kw_flag(seg[1], strlen(seg[1]), &f) != 0) {
+                if (jmapd_kw_flag(seg[1], strlen(seg[1]), &f) != 0) {
                     patch_bad(out, key);
                     return JMAPD_PATCH_E_KEYWORD;
                 }
@@ -535,7 +539,7 @@ static const char *create_flags(const JmapJsonNode *email, uint8_t *flags) {
         uint8_t f = 0;
         bool on = false;
         if (!e || !e->key) continue;
-        if (kw_flag(e->key, e->keylen, &f) != 0) return "invalidProperties";
+        if (jmapd_kw_flag(e->key, e->keylen, &f) != 0) return "invalidProperties";
         if (e->type != JMAP_JSON_BOOL) return "invalidProperties";
         (void)jmap_json_bool(e, &on);
         if (on) *flags |= f;

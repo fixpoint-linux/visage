@@ -107,14 +107,19 @@ for n in range(nmsg):
         "MIME-Version: 1.0\r\nContent-Type: %s; charset=utf-8\r\n\r\n%s\r\n"
         % (n, n, n, ctype, body)
     )
-    path = os.path.join(arch, "cur", "%d.M%d.host:2,S" % (1700000000 + n, n))
+    # 10 of the 30,000 are UNREAD (no ":2,S" in the filename): the keyword
+    # query has a non-trivial, exactly known answer to be checked against.
+    unread = (n % 3000) == 0
+    path = os.path.join(arch, "cur",
+                        "%d.M%d.host%s" % (1700000000 + n, n,
+                                          "" if unread else ":2,S"))
     with open(path, "w") as f:
         f.write(msg)
     # internal_date is the file mtime, and the query sorts on it: the order has
     # to be explicit, not filesystem-dependent.
     os.utime(path, (1700000000 + n, 1700000000 + n))
 PYEOF
-check $? "seed a 30,000-message archive"
+check $? "seed a 30,000-message archive (10 of them unread)"
 
 start_daemon "$TMP/a.log" --port "$PORT_A"
 start_daemon "$TMP/b.log" --port "$PORT_B" --text-scan-max 1048576
@@ -221,6 +226,44 @@ st, body, dt = call({"using": [CORE, MAIL], "methodCalls": [
 res = json.loads(body)["methodResponses"][0][1]
 assert "type" not in res, res
 assert res["total"] == 0 and res["ids"] == [], res
+
+# --- KEYWORD filters over the 30k archive: exact, and body-free ---
+# "which messages in this mailbox are unread" is the bulk-action question.  The
+# flags come from the FILENAME, so this must answer 10 exactly and quickly,
+# without paging the mailbox and without reading one message body.
+NUNREAD = 10
+st, body, dt = call({"using": [CORE, MAIL], "methodCalls": [
+    ["Email/query", {"accountId": "alice",
+                     "filter": {"inMailbox": arch, "notKeyword": "$seen"},
+                     "sort": [{"property": "receivedAt", "isAscending": False}],
+                     "limit": 100}, "q"]]})
+unread = json.loads(body)["methodResponses"][0][1]
+assert st == 200 and "type" not in unread, (st, unread)
+assert unread["total"] == NUNREAD, unread["total"]
+assert len(unread["ids"]) == NUNREAD, len(unread["ids"])
+assert dt < 20, "a 30k keyword query took %.1fs" % dt
+
+# the complement is exact too, and the two pages PARTITION the mailbox
+st, body, dt = call({"using": [CORE, MAIL], "methodCalls": [
+    ["Email/query", {"accountId": "alice",
+                     "filter": {"inMailbox": arch, "keyword": "$seen"},
+                     "limit": 100}, "q"]]})
+seen = json.loads(body)["methodResponses"][0][1]
+assert st == 200 and "type" not in seen, (st, seen)
+assert seen["total"] == nmsg - NUNREAD, seen["total"]
+assert len(seen["ids"]) == 100, len(seen["ids"])
+assert set(unread["ids"]).isdisjoint(seen["ids"]), "seen/unseen overlap"
+
+# --- an unknown keyword is a DESCRIBED refusal, never an empty list ---
+# ($forwarded has no maildir flag, so this server cannot test it.)
+st, body, dt = call({"using": [CORE, MAIL], "methodCalls": [
+    ["Email/query", {"accountId": "alice",
+                     "filter": {"inMailbox": arch, "keyword": "$forwarded"},
+                     "limit": 5}, "q"]]})
+res = json.loads(body)["methodResponses"][0][1]
+assert res.get("type") == "unsupportedFilter", res
+assert res.get("description"), res
+assert "ids" not in res and "total" not in res, res
 PYEOF
 
 # ---- (2) an over-budget scan is a typed, described, journaled refusal -----
@@ -248,6 +291,45 @@ assert res.get("type") == "serverLimit", res
 desc = res.get("description") or ""
 assert desc, "the refusal must carry a description"
 assert "budget" in desc, desc
+PYEOF
+
+# ---- (2b) a keyword query is body-free: the SAME tiny budget answers it -----
+# This daemon's scan budget is 1 MiB, so any body read would be refused.  The
+# keyword answer must be exact anyway — that is only possible if the flags came
+# from the filenames (proving the query reads no message bytes).
+python3 - "$PORT_B" <<'PYEOF' && pass "tiny-budget daemon still answers the keyword query exactly (no body reads)" \
+                           || fail "tiny-budget daemon still answers the keyword query exactly (no body reads)"
+import base64, json, sys, time, urllib.request
+
+port = int(sys.argv[1])
+base = "http://127.0.0.1:%d" % port
+auth = "Basic " + base64.b64encode(b"alice:waldorf").decode()
+CORE = "urn:ietf:params:jmap:core"
+MAIL = "urn:ietf:params:jmap:mail"
+
+
+def call(payload):
+    req = urllib.request.Request(base + "/api", data=json.dumps(payload).encode())
+    req.add_header("Authorization", auth)
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return json.loads(r.read())
+
+
+resp = call({"using": [CORE, MAIL], "methodCalls": [
+    ["Mailbox/get", {"accountId": "alice"}, "m"]]})
+arch = {m["name"]: m["id"] for m in resp["methodResponses"][0][1]["list"]}["Archive"]
+
+t = time.time()
+res = call({"using": [CORE, MAIL], "methodCalls": [
+    ["Email/query", {"accountId": "alice",
+                     "filter": {"inMailbox": arch, "notKeyword": "$seen"},
+                     "limit": 100}, "q"]]})["methodResponses"][0][1]
+dt = time.time() - t
+assert "type" not in res, res
+assert res["total"] == 10, res["total"]
+assert len(res["ids"]) == 10, len(res["ids"])
+assert dt < 20, "the keyword query took %.1fs" % dt
 PYEOF
 if grep -q 'query-over-budget' "$TMP/b.log"; then
     pass "over-budget scan leaves a query-over-budget line in the journal"

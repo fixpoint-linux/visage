@@ -242,6 +242,44 @@ for filt, want in (({"inMailbox": inbox_id, "from": "carol"}, 1),
     got = resp["methodResponses"][0][1]["total"]
     assert got == want, (filt, got, want)
 
+# --- KEYWORD filters: "which messages in THIS mailbox are unread" ---
+# B is the only message in new/ (no \Seen flag), so Inbox is 4 messages of
+# which exactly 1 is unread.  This is the bulk-action question ("mark all
+# read"), and it must be answered without paging the mailbox.
+st, resp = call({"using": [CORE, MAIL], "methodCalls": [
+    ["Email/query", {"accountId": "alice",
+                     "filter": {"inMailbox": inbox_id, "notKeyword": "$seen"},
+                     "sort": [{"property": "receivedAt", "isAscending": False}],
+                     "limit": 50}, "q0"]]})
+unread = resp["methodResponses"][0][1]
+assert "type" not in unread, unread
+assert unread["total"] == 1, unread
+assert len(unread["ids"]) == 1, unread
+
+st, resp = call({"using": [CORE, MAIL], "methodCalls": [
+    ["Email/query", {"accountId": "alice",
+                     "filter": {"inMailbox": inbox_id, "keyword": "$seen"},
+                     "limit": 50}, "q0"]]})
+seen = resp["methodResponses"][0][1]
+assert "type" not in seen, seen
+assert seen["total"] == 3, seen
+assert len(seen["ids"]) == 3, seen
+# the two answers PARTITION the mailbox: no id is in both, none is missing
+assert set(unread["ids"]).isdisjoint(seen["ids"]), (unread, seen)
+assert set(unread["ids"]) | set(seen["ids"]) == set(desc_ids), (unread, seen,
+                                                                desc_ids)
+
+# an unknown keyword is a DESCRIBED refusal, never an empty result set
+for bad in ({"inMailbox": inbox_id, "keyword": "$forwarded"},
+            {"inMailbox": inbox_id, "notKeyword": "$no-such-keyword"},
+            {"inMailbox": inbox_id, "keyword": True}):
+    st, resp = call({"using": [CORE, MAIL], "methodCalls": [
+        ["Email/query", {"filter": bad}, "q0"]]})
+    res = resp["methodResponses"][0][1]
+    assert res.get("type") == "unsupportedFilter", (bad, res)
+    assert res.get("description"), (bad, res)
+    assert "ids" not in res and "total" not in res, (bad, res)
+
 # an unsupported sort is a method error, not a silently different order
 st, resp = call({"using": [CORE, MAIL], "methodCalls": [
     ["Email/query", {"sort": [{"property": "subject"}]}, "q0"]]})

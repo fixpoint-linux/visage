@@ -502,6 +502,31 @@ int jmapd_method_thread_get(JmapdCtx *ctx, const JmapJsonNode *args,
 int jmapd_method_email_query(JmapdCtx *ctx, const JmapJsonNode *args,
                              JsonBuilder *out);
 
+/* The parsed Email/query FilterCondition (RFC 8621 4.4.1).  Every set
+   condition must hold (the conditions are ANDed); `keyword`/`not_keyword` test
+   one maildir flag, which comes from the message FILENAME, so a keyword query
+   never reads a message body. */
+typedef struct JmapdQueryFilter {
+    bool    in_mailbox, text, from, to, subject, keyword, not_keyword;
+    uint8_t kw_flag;                 /* IMAIL_* bit `keyword` requires */
+    uint8_t not_kw_flag;             /* IMAIL_* bit `notKeyword` forbids */
+    char    mbox[IMAPD_MAX_MBOX + 1];
+    char    text_s[512], from_s[512], to_s[512], subject_s[512];
+} JmapdQueryFilter;
+
+/* Parse one FilterCondition.  Returns 0, or -1 with `why` filled in: a
+   condition this server cannot evaluate, a value of the wrong JSON type, or a
+   keyword no maildir flag backs (the caller answers unsupportedFilter — never
+   an empty list, which would claim "no mail matches").  Pure: jmap_check.c
+   drives the accept/reject matrix without a maildir. */
+int jmapd_query_filter_parse(const JmapJsonNode *f, JmapdQueryFilter *q,
+                             char *why, size_t whysz);
+
+/* The IMAIL_* flag a JMAP keyword names (jmap_set.c's table — one mapping for
+   Email/set, Email/query and Email/get).  Returns 0 and sets *out, or -1 for a
+   keyword this store cannot carry ($forwarded has no maildir flag). */
+int jmapd_kw_flag(const char *kw, size_t kwlen, uint8_t *out);
+
 /* Thread id of a message: "t" + base64url(root key), where the root key is the
    first Message-ID in References, else In-Reply-To, else the message's own
    Message-ID, else `fallback` (its uidlist Message-ID or maildir base).  One

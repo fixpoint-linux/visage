@@ -1579,10 +1579,12 @@ static void ref_tests(void) {
 /* ------------------------------------------------------------------ */
 
 /* Seed one message file into a maildir.  `mbox` is the JMAP/maildir name
-   ("Inbox", "Sent", ...).  A ":2,S" suffix marks it \Seen. */
-static int seed_msg(const char *root, const char *user, const char *mbox,
-                    const char *base, const char *content, time_t mtime,
-                    int seen) {
+   ("Inbox", "Sent", ...).  `info` is the maildir info suffix AFTER the colon
+   ("" for no flags, "2,S" for \Seen, "2,FS" for \Flagged+\Seen): the flags
+   live in the FILENAME, which is exactly what a keyword query reads. */
+static int seed_msg_info(const char *root, const char *user, const char *mbox,
+                         const char *base, const char *content, time_t mtime,
+                         const char *info) {
     char dir[2048], tmp[2100], path[2200];
     int fd;
     snprintf(dir, sizeof dir, "%s/%s/%s%s/cur", root, user,
@@ -1602,7 +1604,8 @@ static int seed_msg(const char *root, const char *user, const char *mbox,
         mkdir(tmp, 0700);
         mkdir(dir, 0700);
     }
-    snprintf(path, sizeof path, "%s/%s%s", dir, base, seen ? ":2,S" : "");
+    snprintf(path, sizeof path, "%s/%s%s%s", dir, base,
+             info && info[0] ? ":" : "", info ? info : "");
     fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) return -1;
     if (write(fd, content, strlen(content)) != (ssize_t)strlen(content)) {
@@ -1618,6 +1621,13 @@ static int seed_msg(const char *root, const char *user, const char *mbox,
         (void)utimensat(AT_FDCWD, path, ts, 0);
     }
     return 0;
+}
+
+static int seed_msg(const char *root, const char *user, const char *mbox,
+                    const char *base, const char *content, time_t mtime,
+                    int seen) {
+    return seed_msg_info(root, user, mbox, base, content, mtime,
+                         seen ? "2,S" : "");
 }
 
 static char *call_method(JmapdCtx *ctx, JmapdMethodFn fn, const char *args) {
@@ -1674,6 +1684,10 @@ static void query_tests(void) {
     for (i = 0; i < 5; i++) {
         char content[512];
         char base[64];
+        /* The flags are the maildir FILENAME's, which is all a keyword query
+           reads: q1 and q3 are \Seen, q2 is \Flagged and unseen, q0/q4 are
+           plain unseen.  So Inbox = 5 messages, 2 seen, 3 unseen, 1 flagged. */
+        static const char *info[5] = { "", "2,S", "2,F", "2,S", "" };
         dates[i] = 1700000000 + i * 60;
         snprintf(base, sizeof base, "170000000%d.M%dP%d.host", i, i, i);
         snprintf(content, sizeof content,
@@ -1681,7 +1695,8 @@ static void query_tests(void) {
                  "Message-ID: <%s@example.com>\r\n"
                  "Content-Type: text/plain\r\n\r\nbody-%s-%s\r\n",
                  msgs[i][1], msgs[i][0], msgs[i][0], msgs[i][2], msgs[i][0]);
-        if (seed_msg(root, "alice", "Inbox", base, content, dates[i], 0) != 0)
+        if (seed_msg_info(root, "alice", "Inbox", base, content, dates[i],
+                          info[i]) != 0)
             check_fail("query: seed message", base);
     }
     /* one message in Sent, to prove inMailbox narrows the scan */
@@ -1819,6 +1834,119 @@ static void query_tests(void) {
             free(res);
         }
     }
+    /* --- keyword filters: "which messages in this mailbox are unread" --- */
+    {
+        struct { const char *filter; int want; const char *what; } cases[] = {
+            { "{\"inMailbox\":\"%s\",\"notKeyword\":\"$seen\"}", 3,
+              "query: notKeyword $seen counts the 3 unread in the mailbox" },
+            { "{\"inMailbox\":\"%s\",\"keyword\":\"$seen\"}", 2,
+              "query: keyword $seen counts the 2 read messages" },
+            { "{\"inMailbox\":\"%s\",\"keyword\":\"$flagged\"}", 1,
+              "query: keyword $flagged matches the one flagged message" },
+            { "{\"inMailbox\":\"%s\",\"notKeyword\":\"$flagged\"}", 4,
+              "query: notKeyword $flagged matches the other four" },
+            { "{\"inMailbox\":\"%s\",\"notKeyword\":\"$seen\","
+              "\"keyword\":\"$flagged\"}", 1,
+              "query: keyword and notKeyword are AND-ed" },
+            { "{\"inMailbox\":\"%s\",\"notKeyword\":\"$seen\","
+              "\"from\":\"carol\"}", 0,
+              "query: a keyword condition AND-s with a header condition" },
+            { "{\"inMailbox\":\"%s\",\"notKeyword\":\"$draft\"}", 5,
+              "query: a flag no message carries still counts every message" }
+        };
+        size_t c;
+        for (c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+            char args[2048], filt[512];
+            char *res;
+            JmapJsonDoc *doc = NULL;
+            const JmapJsonNode *total;
+            uint64_t v = 99;
+            snprintf(filt, sizeof filt, cases[c].filter, id1);
+            snprintf(args, sizeof args, "{\"filter\":%s}", filt);
+            res = call_method(&ctx, jmapd_method_email_query, args);
+            if (!res) { check_fail(cases[c].what, "no result"); continue; }
+            total = result_get(&doc, res, "total");
+            EXPECT(jmap_json_u64(total, &v) == 0 && v == (uint64_t)cases[c].want,
+                   cases[c].what);
+            jmap_json_free(doc);
+            free(res);
+        }
+    }
+    /* --- the unread ids are EXACTLY the unread ones (not just the count) --- */
+    {
+        char args[2048];
+        char *res;
+        JmapJsonDoc *doc = NULL;
+        const JmapJsonNode *ids;
+        char want[JMAPD_ID_MAX];
+        snprintf(args, sizeof args,
+                 "{\"filter\":{\"inMailbox\":\"%s\",\"notKeyword\":\"$seen\"},"
+                 "\"sort\":[{\"property\":\"receivedAt\",\"isAscending\":true}]}",
+                 id1);
+        res = call_method(&ctx, jmapd_method_email_query, args);
+        ids = res ? result_get(&doc, res, "ids") : NULL;
+        (void)jmapd_id_email("1700000002.M2P2.host", NULL, want, sizeof want);
+        EXPECT(ids && jmap_json_count(ids) == 3,
+               "query: notKeyword $seen returns the 3 unread ids");
+        if (ids && jmap_json_count(ids) == 3) {
+            const char *s0;
+            (void)jmap_json_str(jmap_json_at(ids, 0), &s0, NULL);
+            EXPECT(strcmp(s0, id2) == 0,
+                   "query: the oldest unread message is first when ascending");
+            (void)jmap_json_str(jmap_json_at(ids, 1), &s0, NULL);
+            EXPECT(strcmp(s0, want) == 0,
+                   "query: the flagged-but-unread message is in the unread set");
+        }
+        jmap_json_free(doc);
+        free(res);
+    }
+    /* --- an unknown keyword is a DESCRIBED refusal, never an empty list --- */
+    {
+        static const char *bad[] = {
+            "{\"filter\":{\"inMailbox\":\"%s\",\"keyword\":\"$forwarded\"}}",
+            "{\"filter\":{\"inMailbox\":\"%s\",\"notKeyword\":\"$custom\"}}",
+            "{\"filter\":{\"inMailbox\":\"%s\",\"keyword\":true}}"
+        };
+        size_t c;
+        for (c = 0; c < sizeof bad / sizeof bad[0]; c++) {
+            char args[2048];
+            char *res;
+            JmapJsonDoc *doc = NULL;
+            const JmapJsonNode *type, *desc;
+            const char *s = NULL;
+            snprintf(args, sizeof args, bad[c], id1);
+            res = call_method(&ctx, jmapd_method_email_query, args);
+            type = res ? result_get(&doc, res, "type") : NULL;
+            desc = res ? jmap_json_get(jmap_json_root(doc), "description") : NULL;
+            EXPECT(type && jmap_json_str(type, &s, NULL) == 0 &&
+                       strcmp(s, "unsupportedFilter") == 0,
+                   "query: a keyword filter this server cannot test is a "
+                   "typed unsupportedFilter");
+            EXPECT(desc && jmap_json_str(desc, &s, NULL) == 0 && s[0],
+                   "query: the unsupportedFilter carries a description");
+            jmap_json_free(doc);
+            free(res);
+        }
+    }
+    /* --- a keyword filter does not bypass the paging window guard --- */
+    {
+        char args[2048];
+        char *res;
+        JmapJsonDoc *doc = NULL;
+        const JmapJsonNode *type;
+        const char *s = NULL;
+        snprintf(args, sizeof args,
+                 "{\"filter\":{\"inMailbox\":\"%s\",\"notKeyword\":\"$seen\"},"
+                 "\"position\":%u,\"limit\":1}", id1,
+                 (unsigned)JMAPD_QUERY_MAX_WINDOW);
+        res = call_method(&ctx, jmapd_method_email_query, args);
+        type = res ? result_get(&doc, res, "type") : NULL;
+        EXPECT(type && jmap_json_str(type, &s, NULL) == 0 &&
+                   strcmp(s, "serverLimit") == 0,
+               "query: a keyword filter is still bounded by the paging window");
+        jmap_json_free(doc);
+        free(res);
+    }
     /* --- a query across all mailboxes sees Inbox + Sent --- */
     {
         char *res = call_method(&ctx, jmapd_method_email_query, "{}");
@@ -1870,6 +1998,99 @@ static void query_tests(void) {
         free(res);
     }
     (void)id3;
+}
+
+/* Parse one filter fixture and hand the root to the parser.  Returns the
+   parser's verdict (-2 when the FIXTURE itself is broken, so a typo in a test
+   cannot masquerade as a rejected filter). */
+static int parse_filter(const char *json, JmapdQueryFilter *q, char *why,
+                        size_t whysz) {
+    JmapJsonErr e = JMAP_JSON_OK;
+    JmapJsonDoc *d = jmap_json_parse(json, strlen(json), &e);
+    int r;
+    if (!d) {
+        if (whysz) snprintf(why, whysz, "fixture did not parse");
+        return -2;
+    }
+    r = jmapd_query_filter_parse(jmap_json_root(d), q, why, whysz);
+    jmap_json_free(d);
+    return r;
+}
+
+/* ------------------------------------------------------------------ */
+/* (13b) Email/query's FilterCondition parser (RFC 8621 4.4.1)         */
+/* ------------------------------------------------------------------ */
+
+static void query_filter_tests(void) {
+    JmapdQueryFilter q;
+    char why[256];
+    char inbox[JMAPD_ID_MAX];
+    char json[JMAPD_ID_MAX + 64];
+    (void)jmapd_id_mailbox("Inbox", inbox, sizeof inbox);
+
+    /* --- keyword/notKeyword are accepted and map to ONE maildir flag --- */
+    EXPECT(parse_filter("{\"keyword\":\"$seen\"}", &q, why, sizeof why) == 0 &&
+               q.keyword && !q.not_keyword && q.kw_flag == IMAIL_SEEN,
+           "filter: keyword $seen is accepted and maps to IMAIL_SEEN");
+    EXPECT(parse_filter("{\"notKeyword\":\"$seen\"}", &q, why, sizeof why) == 0 &&
+               q.not_keyword && !q.keyword && q.not_kw_flag == IMAIL_SEEN,
+           "filter: notKeyword $seen is accepted and maps to IMAIL_SEEN");
+    EXPECT(parse_filter("{\"keyword\":\"$flagged\"}", &q, why, sizeof why) == 0 &&
+               q.kw_flag == IMAIL_FLAGGED,
+           "filter: keyword $flagged maps to IMAIL_FLAGGED");
+    EXPECT(parse_filter("{\"notKeyword\":\"$answered\"}", &q, why,
+                        sizeof why) == 0 &&
+               q.not_kw_flag == IMAIL_ANSWERED,
+           "filter: notKeyword $answered maps to IMAIL_ANSWERED");
+    EXPECT(parse_filter("{\"keyword\":\"$draft\"}", &q, why, sizeof why) == 0 &&
+               q.kw_flag == IMAIL_DRAFT,
+           "filter: keyword $draft maps to IMAIL_DRAFT");
+    EXPECT(parse_filter("{\"notKeyword\":\"$deleted\"}", &q, why, sizeof why) == 0 &&
+               q.not_kw_flag == IMAIL_TRASHED,
+           "filter: notKeyword $deleted maps to IMAIL_TRASHED");
+    /* the shape a bulk-action client sends for "which are unread here" */
+    snprintf(json, sizeof json, "{\"inMailbox\":\"%s\",\"notKeyword\":\"$seen\"}",
+             inbox);
+    EXPECT(parse_filter(json, &q, why, sizeof why) == 0 && q.in_mailbox &&
+               !strcmp(q.mbox, "Inbox") && q.not_keyword &&
+               q.not_kw_flag == IMAIL_SEEN,
+           "filter: {inMailbox, notKeyword:$seen} parses as one condition");
+    /* both at once are two AND-ed conditions, not one overriding the other */
+    EXPECT(parse_filter("{\"keyword\":\"$flagged\",\"notKeyword\":\"$seen\"}",
+                        &q, why, sizeof why) == 0 &&
+               q.keyword && q.kw_flag == IMAIL_FLAGGED &&
+               q.not_keyword && q.not_kw_flag == IMAIL_SEEN,
+           "filter: keyword and notKeyword coexist (conditions are AND-ed)");
+
+    /* --- a keyword no maildir flag backs is REFUSED, with a description --- */
+    why[0] = '\0';
+    EXPECT(parse_filter("{\"keyword\":\"$forwarded\"}", &q, why, sizeof why) == -1 &&
+               why[0] != '\0' && strstr(why, "$forwarded"),
+           "filter: $forwarded is refused (no flag backs it), and described");
+    why[0] = '\0';
+    EXPECT(parse_filter("{\"notKeyword\":\"$custom\"}", &q, why, sizeof why) == -1 &&
+               why[0] != '\0',
+           "filter: an unknown keyword is refused, not silently unmatched");
+    /* a non-string value is the same typed refusal, not a 0-hit result */
+    why[0] = '\0';
+    EXPECT(parse_filter("{\"keyword\":true}", &q, why, sizeof why) == -1 &&
+               why[0] != '\0',
+           "filter: a boolean keyword is refused, and described");
+    EXPECT(parse_filter("{\"notKeyword\":[\"$seen\"]}", &q, why, sizeof why) == -1,
+           "filter: an array keyword is refused");
+    /* a condition this server has no evaluator for */
+    why[0] = '\0';
+    EXPECT(parse_filter("{\"hasKeyword\":\"$seen\"}", &q, why, sizeof why) == -1 &&
+               why[0] != '\0' && strstr(why, "hasKeyword"),
+           "filter: hasKeyword is refused with the condition named");
+    /* --- absent/empty filters match everything --- */
+    EXPECT(parse_filter("{}", &q, why, sizeof why) == 0 && !q.in_mailbox &&
+               !q.keyword && !q.not_keyword && !q.text && !q.from,
+           "filter: an empty condition matches everything");
+    EXPECT(parse_filter("null", &q, why, sizeof why) == 0 && !q.keyword,
+           "filter: a null filter matches everything");
+    EXPECT(parse_filter("[]", &q, why, sizeof why) == -1,
+           "filter: a non-object filter is refused");
 }
 
 static void email_get_tests(void) {
@@ -3370,6 +3591,7 @@ int main(void) {
     addr_tests();
     ref_tests();
     query_tests();
+    query_filter_tests();
     email_get_tests();
     body_part_id_tests();
     bounded_work_tests();

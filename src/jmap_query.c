@@ -13,9 +13,14 @@
  * Deeper paging than that is refused rather than answered wrong.
  *
  * Filters: inMailbox, text (raw headers+body bytes, like IMAP SEARCH TEXT),
- * from, to, subject.  A filter this server cannot evaluate is answered with
- * the RFC-legal unsupportedFilter method error — never silently ignored,
- * which would return the wrong set.
+ * from, to, subject, keyword, notKeyword.  The keyword conditions test the
+ * maildir flags the mailbox scan already parsed out of the FILENAME, so
+ * "which messages in this mailbox are unread" ({inMailbox, notKeyword:
+ * "$seen"}) costs one bounded directory scan and reads no message bodies —
+ * with an exact `total`.  A filter this server cannot evaluate, or a keyword
+ * no flag backs ($forwarded), is answered with the RFC-legal described
+ * unsupportedFilter method error — never silently ignored, and never an empty
+ * list, which would return the wrong set to a bulk action.
  */
 #include "visage.h"
 #include "jmapd.h"
@@ -29,12 +34,6 @@ typedef struct QueryEntry {
     char    mbox[IMAPD_MAX_MBOX + 1];
     char    base[IMAPD_MAX_MBOX + 1];
 } QueryEntry;
-
-typedef struct QueryFilter {
-    bool in_mailbox, text, from, to, subject;
-    char mbox[IMAPD_MAX_MBOX + 1];
-    char text_s[512], from_s[512], to_s[512], subject_s[512];
-} QueryFilter;
 
 /* ASCII case-insensitive substring search. */
 static bool ci_contains(const char *hay, size_t hl, const char *needle) {
@@ -133,38 +132,95 @@ static void heap_drain(QueryEntry *v, size_t n, bool desc) {
 /* Filter parsing                                                      */
 /* ------------------------------------------------------------------ */
 
-static int filter_parse(const JmapJsonNode *f, QueryFilter *q) {
+/* Parse one FilterCondition (RFC 8621 4.4.1).  A condition this server cannot
+   evaluate, a value of the wrong JSON type, or a keyword no maildir flag backs
+   all fill `why` and return -1: the caller answers a described
+   unsupportedFilter, because an empty result set would claim "no mail
+   matches", which is a different and wrong answer. */
+int jmapd_query_filter_parse(const JmapJsonNode *f, JmapdQueryFilter *q,
+                             char *why, size_t whysz) {
     size_t n, i;
     memset(q, 0, sizeof *q);
+    if (why && whysz) why[0] = '\0';
     if (!f || f->type == JMAP_JSON_NULL) return 0;
-    if (f->type != JMAP_JSON_OBJ) return -1;
+    if (f->type != JMAP_JSON_OBJ) {
+        if (why) snprintf(why, whysz, "filter must be an object");
+        return -1;
+    }
     n = jmap_json_count(f);
     for (i = 0; i < n; i++) {
         const JmapJsonNode *m = jmap_json_at(f, i);
         const char *s;
-        if (!m || !m->key) return -1;
+        if (!m || !m->key) {
+            if (why) snprintf(why, whysz, "filter condition has no name");
+            return -1;
+        }
         if (!strcmp(m->key, "inMailbox")) {
-            if (jmap_json_str(m, &s, NULL) != 0) return -1;
-            if (jmapd_id_mailbox_parse(s, q->mbox, sizeof q->mbox) != 0)
+            if (jmap_json_str(m, &s, NULL) != 0) {
+                if (why) snprintf(why, whysz, "inMailbox must be an id string");
                 return -1;
+            }
+            if (jmapd_id_mailbox_parse(s, q->mbox, sizeof q->mbox) != 0) {
+                if (why) snprintf(why, whysz, "inMailbox is not a mailbox id");
+                return -1;
+            }
             q->in_mailbox = true;
         } else if (!strcmp(m->key, "text")) {
-            if (jmap_json_str(m, &s, NULL) != 0) return -1;
+            if (jmap_json_str(m, &s, NULL) != 0) {
+                if (why) snprintf(why, whysz, "text must be a string");
+                return -1;
+            }
             snprintf(q->text_s, sizeof q->text_s, "%s", s);
             q->text = true;
         } else if (!strcmp(m->key, "from")) {
-            if (jmap_json_str(m, &s, NULL) != 0) return -1;
+            if (jmap_json_str(m, &s, NULL) != 0) {
+                if (why) snprintf(why, whysz, "from must be a string");
+                return -1;
+            }
             snprintf(q->from_s, sizeof q->from_s, "%s", s);
             q->from = true;
         } else if (!strcmp(m->key, "to")) {
-            if (jmap_json_str(m, &s, NULL) != 0) return -1;
+            if (jmap_json_str(m, &s, NULL) != 0) {
+                if (why) snprintf(why, whysz, "to must be a string");
+                return -1;
+            }
             snprintf(q->to_s, sizeof q->to_s, "%s", s);
             q->to = true;
         } else if (!strcmp(m->key, "subject")) {
-            if (jmap_json_str(m, &s, NULL) != 0) return -1;
+            if (jmap_json_str(m, &s, NULL) != 0) {
+                if (why) snprintf(why, whysz, "subject must be a string");
+                return -1;
+            }
             snprintf(q->subject_s, sizeof q->subject_s, "%s", s);
             q->subject = true;
+        } else if (!strcmp(m->key, "keyword") ||
+                   !strcmp(m->key, "notKeyword")) {
+            bool neg = m->key[0] == 'n';
+            uint8_t flag = 0;
+            if (jmap_json_str(m, &s, NULL) != 0) {
+                if (why) snprintf(why, whysz,
+                                  "%s must be a single keyword string",
+                                  m->key);
+                return -1;
+            }
+            if (jmapd_kw_flag(s, strlen(s), &flag) != 0) {
+                if (why) snprintf(why, whysz,
+                                  "keyword '%s' is not one this server can "
+                                  "test; it supports $seen, $flagged, "
+                                  "$answered, $draft and $deleted", s);
+                return -1;
+            }
+            if (neg) {
+                q->not_kw_flag = flag;
+                q->not_keyword = true;
+            } else {
+                q->kw_flag = flag;
+                q->keyword = true;
+            }
         } else {
+            if (why) snprintf(why, whysz,
+                              "filter condition '%s' is not supported by this "
+                              "server", m->key);
             return -1;   /* a condition this server cannot evaluate */
         }
     }
@@ -214,7 +270,7 @@ static int query_mbox_names(JmapdServer *srv, const char *user, char ***out,
    halfway, which a short read from a failing disk gives — is the silent wrong
    result this filter must never produce. */
 static int msg_text_match(JmapdServer *srv, const Imail *m,
-                          const QueryFilter *q, size_t *budget) {
+                          const JmapdQueryFilter *q, size_t *budget) {
     char *buf;
     size_t cap, got = 0;
     int fd, hit;
@@ -259,7 +315,7 @@ int jmapd_method_email_query(JmapdCtx *ctx, const JmapJsonNode *args,
     const JmapJsonNode *snode = jmapd_arg(ctx, args, "sort");
     const JmapJsonNode *pnode = jmapd_arg(ctx, args, "position");
     const JmapJsonNode *lnode = jmapd_arg(ctx, args, "limit");
-    QueryFilter q;
+    JmapdQueryFilter q;
     bool desc = true;             /* RFC 8621 4.4.2 default: receivedAt desc */
     uint64_t position = 0, limit = JMAPD_QUERY_DEFAULT_LIMIT;
     size_t window, total = 0, heap_n = 0, i, k;
@@ -278,8 +334,11 @@ int jmapd_method_email_query(JmapdCtx *ctx, const JmapJsonNode *args,
     char why[256];
 
     if (ctx->argerr) { jmapd_jb_method_error(out, ctx->argerr); return 0; }
-    if (filter_parse(fnode, &q) != 0) {
-        jmapd_jb_method_error(out, "unsupportedFilter");
+    if (jmapd_query_filter_parse(fnode, &q, why, sizeof why) != 0) {
+        /* A described refusal, never an empty list: the client's bulk action
+           ("mark all read") must not run over a set it wrongly read as empty. */
+        jmapd_log_ctx(ctx, "query-unsupported-filter", why);
+        jmapd_jb_method_error_desc(out, "unsupportedFilter", why);
         return 0;
     }
     if (snode && snode->type != JMAP_JSON_NULL) {
@@ -363,6 +422,13 @@ int jmapd_method_email_query(JmapdCtx *ctx, const JmapJsonNode *args,
             Imail *m = &mb.msgs[k];
             QueryEntry e;
             bool ok = true;
+            /* Keyword conditions test the maildir flags the SCAN already read
+               off the filename, so they cost no I/O and no scan budget, and
+               they run FIRST: a keyword miss skips the header load below. */
+            if (q.keyword && (m->flags & q.kw_flag) == 0) ok = false;
+            if (ok && q.not_keyword && (m->flags & q.not_kw_flag) != 0)
+                ok = false;
+            if (!ok) continue;
             if (q.from || q.to || q.subject) {
                 /* An unreadable message is counted, not treated as a miss: see
                    the refusal after the scan. */
